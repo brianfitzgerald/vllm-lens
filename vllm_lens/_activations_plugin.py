@@ -196,6 +196,15 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
     return [h if isinstance(h, Hook) else Hook.model_validate(h) for h in value]
 
 
+def _validate_pool(extra: dict[str, Any]) -> None:
+    """Raise ``ValueError`` for an unknown ``output_residual_stream_pool``."""
+    pool = extra.get("output_residual_stream_pool")
+    if pool is not None and pool not in ("last", "mean"):
+        raise ValueError(
+            f"output_residual_stream_pool must be 'last' or 'mean', got {pool!r}"
+        )
+
+
 def _trim_activations(
     activations: dict[str, Any],
     expected_len: int,
@@ -300,6 +309,7 @@ async def _patched_generate(
 
     extra = effective_params.extra_args or {}
     wants_activations = extra.get("output_residual_stream") is not None
+    _validate_pool(extra)
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
     # When arriving via the OpenAI API (vllm_xargs), complex values
@@ -404,6 +414,9 @@ def _prepare_offline_params(
         params_list = [sampling_params]
     else:
         params_list = []
+
+    for sp in params_list:
+        _validate_pool(sp.extra_args or {})
 
     wants_activations = any(
         (sp.extra_args or {}).get("output_residual_stream") is not None
