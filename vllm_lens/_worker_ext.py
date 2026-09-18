@@ -311,23 +311,16 @@ def _hook_inner(
             target = modified_output
             norm_ref = target
 
-        # Retrieve seq_lens for absolute position calculation.
-        # seq_lens may be a tensor or a list depending on vLLM version.
-        seq_lens: Any = getattr(attn_metadata, "seq_lens", None)
-
         for i in range(num_reqs):
             if not per_req_steering[i]:
                 continue
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
-            n_query = end - start
-            # Absolute position of the first token in this forward pass
-            if seq_lens is not None:
-                sl = seq_lens[i]
-                sl_val = sl.item() if isinstance(sl, torch.Tensor) else int(sl)
-                abs_start = int(sl_val - n_query)
-            else:
-                abs_start = 0  # fallback: treat as prefill from position 0
+            req_state = runner.requests.get(req_ids[i])
+            if req_state is None:
+                continue
+            # The absolute position of the first token of this forward pass.
+            abs_start = req_state.num_computed_tokens
             _apply_steering(
                 per_req_steering[i], layer_idx, target, start, end, abs_start, norm_ref
             )
