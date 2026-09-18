@@ -53,7 +53,7 @@ client.clear_hooks()
 
 ## Disabling the plugin
 
-vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` entry point) and forces `enforce_eager=True` (disabling CUDA graphs) so its hooks can fire. To install it alongside another inference server without perturbing that server, set `VLLM_LENS_DISABLE=1` to make the plugin a complete no-op:
+vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` entry point) and forces `enforce_eager=True` (disabling CUDA graphs) so its hooks can fire, unless the [CUDA graphs](#cuda-graphs) mode is on. To install it alongside another inference server without perturbing that server, set `VLLM_LENS_DISABLE=1` to make the plugin a complete no-op:
 
 ```bash
 VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
@@ -66,6 +66,18 @@ vLLM configures only its own `vllm` logger, so the plugin attaches a stderr hand
 ```bash
 VLLM_LENS_LOG_LEVEL=DEBUG vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
+
+## CUDA graphs
+
+The forward hooks do not run under a CUDA graph, so the plugin forces `enforce_eager=True`. Set `VLLM_LENS_CUDAGRAPH=1` to keep compilation and CUDA graphs on:
+
+```bash
+VLLM_LENS_CUDAGRAPH=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+In this mode a request that asks for activation capture, steering or hooks fails with an error, because the hooks would not run. The registration of a persistent hook fails too.
+
+The settings of this mode are stored in `VllmConfig.additional_config`, which is part of vLLM's compile cache key. One cache directory therefore serves engines with different settings, and each gets its own compiled graph.
 
 ## Examples
 
