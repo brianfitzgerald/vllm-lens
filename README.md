@@ -75,7 +75,7 @@ The forward hooks do not run under a CUDA graph, so the plugin forces `enforce_e
 VLLM_LENS_CUDAGRAPH=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
-In this mode a request that asks for hooks fails with an error, because the hooks would not run.
+In this mode the forward hooks of eager mode do not run. A request is served only on the layers that the variables below name, and fails with an error for any other layer.
 
 Activation capture is served for the layers named in `VLLM_LENS_CAPTURE_LAYERS`, which also turns this mode on:
 
@@ -96,6 +96,18 @@ VLLM_LENS_STEER_LAYERS=18 VLLM_LENS_CAPTURE_LAYERS=15,20 vllm serve meta-llama/L
 ```
 
 Each steered layer gets two buffers of shape `(max_num_batched_tokens, hidden_size)`. Before each forward pass the plugin writes the rows of every steered request into them, and an op inside the graph adds them to the residual stream. Zero rows change nothing, so requests with and without steering share a batch and the graph has no extra boundary. `apply_steering_vectors` does not change: `scale`, `norm_match`, `position_indices` and several vectors on one layer work as in eager mode. A vector on a layer that is not in the list fails with an error.
+
+Hooks (`apply_hooks` and persistent hooks) are served for the layers named in `VLLM_LENS_HOOK_LAYERS`, which also turns this mode on:
+
+```bash
+VLLM_LENS_HOOK_LAYERS=18 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+Each hook layer calls the op `vllm_lens::hook`, which the plugin adds to vLLM's `splitting_ops`. vLLM then runs the op body as plain Python between two graph pieces, and the body runs the same code as the eager forward hook. A hook layer therefore also serves capture and steering, so do not name it in the other two lists. Limits:
+
+- `cudagraph_mode` is set to `PIECEWISE`.
+- Each hook layer adds a graph boundary, which costs throughput. Aux capture and buffer steering add none, so use those lists when you do not need arbitrary hooks.
+- Pre-hooks are not served.
 
 ## Examples
 

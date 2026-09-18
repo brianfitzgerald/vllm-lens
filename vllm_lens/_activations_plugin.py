@@ -263,6 +263,7 @@ def _patched_create_engine_config(self, *args, **kwargs):
 
     assert _original_create_engine_config is not None
     config = _original_create_engine_config(self, *args, **kwargs)
+    graph_config.split_at_hook_op(config)
 
     # Fail loudly rather than silently no-op if the V2 runner ended up active anyway
     # (e.g. the user explicitly set VLLM_USE_V2_MODEL_RUNNER=1). getattr keeps this a
@@ -342,7 +343,7 @@ async def _patched_generate(
     LensGraphConfig.from_vllm_config(self.vllm_config).reject_unserved(
         extra.get("output_residual_stream"),
         {layer for sv in steering_vectors or [] for layer in sv.layer_indices},
-        hooks_list is not None or has_persistent,
+        hooks_list or [],
     )
     if needs_hooks or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
@@ -445,7 +446,7 @@ def _prepare_offline_params(
         extra = sp.extra_args or {}
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
         graph_config.reject_unserved(
-            None, {layer for sv in vectors or [] for layer in sv.layer_indices}, False
+            None, {layer for sv in vectors or [] for layer in sv.layer_indices}, []
         )
         if vectors is not None:
             steering_id = f"_steer_{idx}"
@@ -459,6 +460,7 @@ def _prepare_offline_params(
     for idx, sp in enumerate(params_list):
         extra = sp.extra_args or {}
         hooks = _decode_hooks(extra.pop("apply_hooks", None))
+        graph_config.reject_unserved(None, set(), hooks or [])
         if hooks is not None:
             hook_id = f"_hook_{idx}"
             hook_payloads[hook_id] = cloudpickle.dumps(hooks)
@@ -478,9 +480,7 @@ def _prepare_offline_params(
     needs_hooks = wants_activations or has_steering or has_hooks or has_persistent
     for sp in params_list:
         graph_config.reject_unserved(
-            (sp.extra_args or {}).get("output_residual_stream"),
-            set(),
-            has_hooks or has_persistent,
+            (sp.extra_args or {}).get("output_residual_stream"), set(), []
         )
     if needs_hooks or any_skip_kv_cache:
         for sp in params_list:
@@ -717,6 +717,9 @@ def _llm_register_hooks(
     prefetch_params: list[str] | None = None,
 ) -> None:
     """Register persistent hooks that apply to every subsequent request."""
+    LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config).reject_unserved(
+        None, set(), hooks
+    )
     if not getattr(self, "_hooks_installed", False):
         self.collective_rpc("install_hooks")
         self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]

@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Hooks: Added `VLLM_LENS_HOOK_LAYERS`. The named layers run the hook code in an op that is a piecewise split point of the compiled graph, so `apply_hooks`, persistent hooks, steering and capture work on them with CUDA graphs on.
 - Steering: Added `VLLM_LENS_STEER_LAYERS`. `apply_steering_vectors` on the named layers is applied by an op inside the compiled graph that reads buffers the plugin fills before each forward pass, so steering works with compilation and CUDA graphs on.
 - Capture: Added `VLLM_LENS_CAPTURE_LAYERS`. The named layers are captured as auxiliary hidden states of the model, so `output_residual_stream` works with compilation and CUDA graphs on.
 - Plugin: Added the `VLLM_LENS_CUDAGRAPH=1` environment variable. The plugin then does not force `enforce_eager=True`, and a request that needs the forward hooks fails with an error in place of returning nothing.
