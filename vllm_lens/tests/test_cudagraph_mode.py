@@ -49,19 +49,24 @@ def test_plain_generation_works(graph_llm):
 
 
 @pytest.mark.parametrize(
-    "extra_args",
+    ("extra_args", "error"),
     [
-        {"output_residual_stream": [LAYER_IDX]},
-        {
-            "apply_steering_vectors": [
-                SteeringVector(activations=torch.zeros(1, 8), layer_indices=[LAYER_IDX])
-            ]
-        },
+        ({"output_residual_stream": [LAYER_IDX]}, ValueError),
+        (
+            {
+                "apply_steering_vectors": [
+                    SteeringVector(
+                        activations=torch.zeros(1, 8), layer_indices=[LAYER_IDX]
+                    )
+                ]
+            },
+            RuntimeError,
+        ),
     ],
     ids=["capture", "steering"],
 )
-def test_hook_requests_are_rejected(graph_llm, extra_args):
-    """Capture and steering need the forward hooks, so they raise."""
+def test_unserved_requests_are_rejected(graph_llm, extra_args, error):
+    """No capture layer is armed and steering needs the forward hooks, so both raise."""
     params = SamplingParams(max_tokens=1, extra_args=extra_args)
-    with pytest.raises(RuntimeError, match="VLLM_LENS_CUDAGRAPH"):
+    with pytest.raises(error, match="VLLM_LENS_CUDAGRAPH"):
         graph_llm.generate([PROMPT], params)
