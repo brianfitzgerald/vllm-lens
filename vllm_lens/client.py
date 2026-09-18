@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import requests
 
@@ -102,6 +102,7 @@ class VLLMLensClient:
         steering_vectors: list[SteeringVector] | None,
         activations_transport: str | None = None,
         capture_qk: list[int] | bool | None = None,
+        capture_pool: Literal["last", "mean"] | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
@@ -110,6 +111,8 @@ class VLLMLensClient:
             xargs["activations_transport"] = activations_transport
         if capture_qk is not None:
             xargs["output_qk"] = json.dumps(capture_qk)
+        if capture_pool is not None:
+            xargs["output_residual_stream_pool"] = capture_pool
         if hooks is not None:
             xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
         if steering_vectors is not None:
@@ -169,6 +172,7 @@ class VLLMLensClient:
         capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
+        capture_pool: Literal["last", "mean"] | None = None,
         logprobs: int | None = None,
         echo: bool = False,
         **kwargs: Any,
@@ -199,7 +203,12 @@ class VLLMLensClient:
             body["echo"] = True
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
+            hooks,
+            capture_layers,
+            steering_vectors,
+            activations_transport,
+            capture_qk,
+            capture_pool,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -220,6 +229,7 @@ class VLLMLensClient:
         capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
+        capture_pool: Literal["last", "mean"] | None = None,
         **kwargs: Any,
     ) -> GenerateOutput:
         """Generate a chat completion from a list of messages.
@@ -242,7 +252,12 @@ class VLLMLensClient:
         }
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
+            hooks,
+            capture_layers,
+            steering_vectors,
+            activations_transport,
+            capture_qk,
+            capture_pool,
         )
         if xargs:
             body["vllm_xargs"] = xargs
