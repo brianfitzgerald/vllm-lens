@@ -1,6 +1,7 @@
 ## Unreleased
 
 - Steering: Fixed `position_indices` during decode and chunked prefill. The absolute start of each forward pass was always 0, so a position in a later prefill chunk was never steered, and position 0 was steered again on every decode step. The start now comes from the request's computed-token count, which does not depend on the attention backend.
+- Plugin: `register()` now attaches a stderr handler to the `vllm_lens` logger when it has none, so the package's INFO records are no longer dropped. `VLLM_LENS_LOG_LEVEL` sets the level (default `INFO`).
 
 ## v1.2.1 (22 July 2026)
 
