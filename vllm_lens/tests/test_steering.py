@@ -10,6 +10,8 @@ from vllm_lens import SteeringVector
 
 from .conftest import LAYER_IDX, MODEL_NAME, PROMPT
 
+LONG_PROMPT = "The quick brown fox jumps over the lazy dog. " * 20
+
 
 @pytest.fixture(scope="module")
 async def vllm_model():
@@ -17,6 +19,23 @@ async def vllm_model():
         model=MODEL_NAME,
         dtype="auto",
         gpu_memory_utilization=0.3,
+    )
+    engine = AsyncLLMEngine.from_engine_args(engine_args)
+    yield engine
+    engine.shutdown()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
+async def vllm_model_chunked():
+    """Engine that prefills ``LONG_PROMPT`` in 64-token chunks."""
+    engine_args = AsyncEngineArgs(
+        model=MODEL_NAME,
+        dtype="auto",
+        gpu_memory_utilization=0.3,
+        max_num_batched_tokens=64,
+        enable_chunked_prefill=True,
     )
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     yield engine
@@ -162,6 +181,50 @@ async def _assert_norm_match_residual(
         f"norm_match should scale the steering vector to the full residual norm: "
         f"expected ‖R'-R‖/‖R‖ == scale = {scale}, got {ratio:.4f}"
     )
+
+
+async def _steered_rows(
+    engine,
+    prompt: str,
+    request_id: str,
+    position: int,
+    max_tokens: int,
+) -> list[int]:
+    """Steer one absolute position and return the captured rows that moved.
+
+    With ``norm_match=True`` and ``scale=4`` a steered row has cosine ~0.97
+    with the vector; an unsteered row has cosine ~0 with a random vector.
+    """
+    probe = await _generate(
+        engine,
+        prompt,
+        f"{request_id}-probe",
+        max_tokens=1,
+        extra_args={"output_residual_stream": [LAYER_IDX]},
+    )
+    hidden_dim = probe.activations["residual_stream"].shape[-1]  # type: ignore[reportAttributeAccessIssue]
+    vectors = _make_steering_vector(
+        hidden_dim,
+        [LAYER_IDX],
+        scale=4.0,
+        norm_match=True,
+        position_indices=[position],
+        n_positions=1,
+    )
+    steered = await _generate(
+        engine,
+        prompt,
+        request_id,
+        max_tokens=max_tokens,
+        extra_args={
+            "output_residual_stream": [LAYER_IDX],
+            "apply_steering_vectors": vectors,
+        },
+    )
+    rows = steered.activations["residual_stream"][0].float()  # type: ignore[reportAttributeAccessIssue]
+    direction = vectors[0].activations[0, 0].float()
+    cosines = torch.nn.functional.cosine_similarity(rows, direction.unsqueeze(0))
+    return torch.nonzero(cosines > 0.5).flatten().tolist()
 
 
 # ------------------------------------------------------------------
@@ -340,6 +403,13 @@ class TestSteering:
         # propagates through attention, but the direct delta should only
         # be at pos 0.
 
+    async def test_position_steering_is_absolute_during_decode(self, vllm_model):
+        """A vector at position 0 must not be applied to the decode steps."""
+        moved = await _steered_rows(
+            vllm_model, PROMPT, "pos-decode", position=0, max_tokens=8
+        )
+        assert moved == [0], f"Only row 0 should be steered, got rows {moved}"
+
     async def test_norm_match_scales_to_residual_stream(self, vllm_model):
         """``norm_match=True`` must scale the steering vector to the L2 norm of
         the *full residual stream*.
@@ -402,6 +472,15 @@ class TestSteering:
             f"means steering referenced output[0] (hidden_states) instead of the "
             f"full residual output[0]+output[1]."
         )
+
+
+class TestSteeringChunkedPrefill:
+    async def test_position_steering_chunked_prefill(self, vllm_model_chunked):
+        """A position in a later prefill chunk is steered, and only that one."""
+        moved = await _steered_rows(
+            vllm_model_chunked, LONG_PROMPT, "pos-chunked", position=100, max_tokens=1
+        )
+        assert moved == [100], f"Only row 100 should be steered, got rows {moved}"
 
 
 class TestSteeringParallel:

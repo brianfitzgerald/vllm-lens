@@ -269,9 +269,11 @@ def _hook_inner(
     # attention metadata entries — some (like GDNAttentionMetadata) lack
     # query_start_loc.  Find one that has it.
     query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] | None = None  # type: ignore[reportUndefinedVariable]
+    meta_with_qsl: Any = None
     for _meta in attn_metadata.values():
         if hasattr(_meta, "query_start_loc"):
             query_start_loc = getattr(_meta, "query_start_loc")
+            meta_with_qsl = _meta
             break
     if query_start_loc is None:
         logger.warning(
@@ -313,7 +315,9 @@ def _hook_inner(
 
         # Retrieve seq_lens for absolute position calculation.
         # seq_lens may be a tensor or a list depending on vLLM version.
-        seq_lens: Any = getattr(attn_metadata, "seq_lens", None)
+        # attn_metadata is a dict, so read seq_lens from the entry that has
+        # query_start_loc.
+        seq_lens: Any = getattr(meta_with_qsl, "seq_lens", None)
 
         for i in range(num_reqs):
             if not per_req_steering[i]:
