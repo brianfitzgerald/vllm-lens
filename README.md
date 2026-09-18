@@ -75,7 +75,7 @@ The forward hooks do not run under a CUDA graph, so the plugin forces `enforce_e
 VLLM_LENS_CUDAGRAPH=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
-In this mode a request that asks for steering or hooks fails with an error, because the hooks would not run.
+In this mode a request that asks for hooks fails with an error, because the hooks would not run.
 
 Activation capture is served for the layers named in `VLLM_LENS_CAPTURE_LAYERS`, which also turns this mode on:
 
@@ -88,6 +88,14 @@ The model returns these layers as auxiliary hidden states (the interface EAGLE3 
 - The model must implement `set_aux_hidden_state_layers`.
 - Pipeline parallelism is not supported.
 - Each armed layer adds `max_num_batched_tokens x hidden_size` values to the graph output pool, so arm only the layers you read.
+
+Steering is served for the layers named in `VLLM_LENS_STEER_LAYERS`, which also turns this mode on:
+
+```bash
+VLLM_LENS_STEER_LAYERS=18 VLLM_LENS_CAPTURE_LAYERS=15,20 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+Each steered layer gets two buffers of shape `(max_num_batched_tokens, hidden_size)`. Before each forward pass the plugin writes the rows of every steered request into them, and an op inside the graph adds them to the residual stream. Zero rows change nothing, so requests with and without steering share a batch and the graph has no extra boundary. `apply_steering_vectors` does not change: `scale`, `norm_match`, `position_indices` and several vectors on one layer work as in eager mode. A vector on a layer that is not in the list fails with an error.
 
 ## Examples
 

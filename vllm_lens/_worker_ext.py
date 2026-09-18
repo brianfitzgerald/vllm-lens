@@ -316,6 +316,19 @@ def _capture_rows(
         layer_states[layer_idx].append(activation)
 
 
+def _abs_start(meta_with_qsl: Any, i: int, n_query: int) -> int:
+    """Absolute position of the first token of request ``i`` in this forward pass.
+
+    ``attn_metadata`` is a dict, so ``seq_lens`` is read from the entry that has
+    ``query_start_loc``. It is a tensor or a list, depending on the vLLM version.
+    """
+    seq_lens: Any = getattr(meta_with_qsl, "seq_lens", None)
+    if seq_lens is None:
+        return 0  # fallback: treat as prefill from position 0
+    sl = seq_lens[i]
+    return int((sl.item() if isinstance(sl, torch.Tensor) else int(sl)) - n_query)
+
+
 def _batch_layout(runner: Any) -> tuple[torch.Tensor, Any] | None:
     """``query_start_loc`` and the metadata entry that holds it, for this forward.
 
@@ -387,25 +400,12 @@ def _hook_inner(
             target = modified_output
             norm_ref = target
 
-        # Retrieve seq_lens for absolute position calculation.
-        # seq_lens may be a tensor or a list depending on vLLM version.
-        # attn_metadata is a dict, so read seq_lens from the entry that has
-        # query_start_loc.
-        seq_lens: Any = getattr(meta_with_qsl, "seq_lens", None)
-
         for i in range(num_reqs):
             if not per_req_steering[i]:
                 continue
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
-            n_query = end - start
-            # Absolute position of the first token in this forward pass
-            if seq_lens is not None:
-                sl = seq_lens[i]
-                sl_val = sl.item() if isinstance(sl, torch.Tensor) else int(sl)
-                abs_start = int(sl_val - n_query)
-            else:
-                abs_start = 0  # fallback: treat as prefill from position 0
+            abs_start = _abs_start(meta_with_qsl, i, end - start)
             _apply_steering(
                 per_req_steering[i], layer_idx, target, start, end, abs_start, norm_ref
             )

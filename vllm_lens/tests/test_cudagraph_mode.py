@@ -46,13 +46,13 @@ def test_plain_generation_works(graph_llm):
                     )
                 ]
             },
-            RuntimeError,
+            ValueError,
         ),
     ],
     ids=["capture", "steering"],
 )
 def test_unserved_requests_are_rejected(graph_llm, extra_args, error):
-    """No capture layer is armed and steering needs the forward hooks, so both raise."""
+    """No capture layer and no steering layer is armed, so both raise."""
     params = SamplingParams(max_tokens=1, extra_args=extra_args)
     with pytest.raises(error, match="VLLM_LENS_CUDAGRAPH"):
         graph_llm.generate([PROMPT], params)
