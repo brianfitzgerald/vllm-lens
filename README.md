@@ -112,6 +112,16 @@ out = client.generate("Hello world", capture_layers=[15, 20])
 print(out.activations["residual_stream"].shape)
 ```
 
+To get one row per layer in place of every position, also pass `output_residual_stream_pool` (the client's `capture_pool`): `"last"` returns the last prompt position and `"mean"` returns the mean over the prompt positions. The result has shape `(n_layers, 1, hidden_dim)`. Generated positions are not included, and the result is the same with chunked prefill.
+
+```python
+sp = SamplingParams(
+    max_tokens=1,
+    extra_args={"output_residual_stream": [15, 20], "output_residual_stream_pool": "last"},
+)
+acts = llm.generate(["Hello world"], sp)[0].activations["residual_stream"]  # (2, 1, hidden_dim)
+```
+
 Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 only (residual streams are identical across TP ranks after all-reduce).
 
 ### Steering vectors

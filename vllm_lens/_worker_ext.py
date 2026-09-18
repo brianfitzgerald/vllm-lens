@@ -241,6 +241,40 @@ def _apply_hook_delta(
     return modified_output
 
 
+def _accumulate_pooled(
+    extension: HiddenStatesExtension,
+    req_id: str,
+    layer_idx: int,
+    rows: torch.Tensor,
+    first: int,
+    n_prompt: int,
+    pool: str,
+) -> None:
+    """Add the prompt rows of one forward step to a layer's pooled capture.
+
+    ``first`` is the absolute position of ``rows[0]``. A position is pooled
+    once, so the prefill that follows a preemption does not count rows twice.
+    """
+    states = extension._captured_states.setdefault(req_id, {})
+    counts = extension._pooled_counts.setdefault(req_id, {})
+    if pool == "last":
+        at = n_prompt - 1 - first
+        if 0 <= at < rows.shape[0]:
+            states[layer_idx] = [rows[at : at + 1].float().cpu()]
+            counts[layer_idx] = (1, rows.dtype, n_prompt)
+        return
+    count, _, seen_end = counts.get(layer_idx, (0, rows.dtype, 0))
+    low = max(first, seen_end)
+    high = min(first + rows.shape[0], n_prompt)
+    if high <= low:
+        return
+    total = rows[low - first : high - first].float().sum(0, keepdim=True).cpu()
+    if layer_idx in states:
+        total = states[layer_idx][0] + total
+    states[layer_idx] = [total]
+    counts[layer_idx] = (count + high - low, rows.dtype, high)
+
+
 def _hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
@@ -449,6 +483,21 @@ def _hook_inner(
 
             start = query_start_loc[i].item()
             end = query_start_loc[i + 1].item()
+
+            pool = extra.get("output_residual_stream_pool")
+            # The front end validates the value; any other value is not pooled.
+            if pool in ("last", "mean"):
+                _accumulate_pooled(
+                    extension,
+                    req_id,
+                    layer_idx,
+                    hidden_states[start:end],
+                    req_state.num_computed_tokens,
+                    req_state.num_prompt_tokens,
+                    pool,
+                )
+                continue
+
             activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
                 start:end
             ].cpu()
@@ -635,6 +684,11 @@ class HiddenStatesExtension:
         str,
         dict[int, list[Float[torch.Tensor, "seq_len hidden_dim"]]],  # type: ignore[reportUndefinedVariable]
     ] = {}
+    # Pooled capture (``output_residual_stream_pool``): ``_captured_states``
+    # holds one float32 sum row per layer, and this holds its row count, the
+    # capture dtype, and the end of the pooled positions:
+    # internal_req_id → { layer_idx → (count, dtype, seen_end) }
+    _pooled_counts: dict[str, dict[int, tuple[int, torch.dtype, int]]] = {}
     _hooks_installed: bool = False
 
     # Per-request steering configs:
@@ -679,6 +733,7 @@ class HiddenStatesExtension:
         # Do NOT reset _persistent_hooks — they may have been set via
         # set_persistent_hooks() before the first generate call.
         self._captured_states = {}
+        self._pooled_counts = {}
         self._steering_data = {}
         self._hook_data = {}
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
@@ -755,6 +810,7 @@ class HiddenStatesExtension:
         for req_id in list(self._captured_states):
             if req_id.startswith(prefix):
                 del self._captured_states[req_id]
+                self._pooled_counts.pop(req_id, None)
                 logger.debug("Cleared leaked activations for %s", req_id)
 
     def _build_payload(
@@ -763,14 +819,22 @@ class HiddenStatesExtension:
         """Materialise the stacked-tensor payload for one internal request id.
 
         Pops the entry from ``_captured_states`` so successive calls do not
-        re-emit the same data. Shared by :meth:`get_captured_states` and
+        re-emit the same data. A pooled capture is divided by its row count
+        and cast to the capture dtype, which gives one row per layer. Shared by :meth:`get_captured_states` and
         :meth:`get_captured_states_batch`.
         """
         layer_dict = self._captured_states.pop(internal_req_id)
+        pooled_counts = self._pooled_counts.pop(internal_req_id, None)
         sorted_indices = sorted(layer_dict.keys())
         per_layer: list[Float[torch.Tensor, "total_pos hidden_dim"]] = [  # type: ignore[reportUndefinedVariable]
             torch.cat(layer_dict[idx], dim=0) for idx in sorted_indices
         ]
+        if pooled_counts is not None:
+            # Each layer holds one float32 sum row; divide to get the mean.
+            per_layer = [
+                (rows / pooled_counts[idx][0]).to(pooled_counts[idx][1])
+                for idx, rows in zip(sorted_indices, per_layer)
+            ]
         stacked: Float[torch.Tensor, "n_layers total_pos hidden_dim"] = (  # type: ignore[reportUndefinedVariable]
             torch.stack(per_layer, dim=0)
         )
@@ -794,7 +858,8 @@ class HiddenStatesExtension:
 
             {
                 "activations": {
-                    "residual_stream": Tensor,  # (n_layers, total_pos, d_model)
+                    # (n_layers, total_pos, d_model); total_pos is 1 when pooled
+                    "residual_stream": Tensor,
                 }
             }
 
