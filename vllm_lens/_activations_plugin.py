@@ -723,6 +723,28 @@ def _llm_clear_prefetched(self: LLM) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _configure_logging() -> None:
+    """Give the ``vllm_lens`` logger a handler, once.
+
+    vLLM configures only its own ``vllm`` logger tree, so without this the
+    INFO records of this package are dropped.
+    """
+    pkg_logger = logging.getLogger("vllm_lens")
+    if not pkg_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[vllm-lens] %(levelname)s %(message)s"))
+        pkg_logger.addHandler(handler)
+        # The handler prints the record, so a root handler must not print it again.
+        pkg_logger.propagate = False
+        pkg_logger.setLevel(logging.INFO)
+    level = os.environ.get("VLLM_LENS_LOG_LEVEL", "").strip().upper()
+    if level in logging.getLevelNamesMapping():
+        pkg_logger.setLevel(level)
+    elif level:
+        # Not raised: vLLM does not guard register(), so an error stops every process.
+        logger.warning("VLLM_LENS_LOG_LEVEL=%s is not a log level; ignored.", level)
+
+
 def register() -> None:
     """Entry point called by vLLM's plugin system at engine startup.
 
@@ -743,6 +765,7 @@ def register() -> None:
     trainer's inference server (e.g. prime-rl rollouts) without perturbing it.
     Unset => unchanged default-on behaviour.
     """
+    _configure_logging()
     if os.environ.get("VLLM_LENS_DISABLE", "").strip().lower() in (
         "1",
         "true",
