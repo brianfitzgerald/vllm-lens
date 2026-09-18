@@ -41,8 +41,8 @@ async def register_hooks(raw_request: Request):
     try:
         LensGraphConfig.from_vllm_config(
             getattr(engine, "vllm_config", None)
-        ).reject_unserved(None, set(), True)
-    except RuntimeError as error:
+        ).reject_unserved(None, set(), hooks)
+    except ValueError as error:
         raise HTTPException(400, str(error)) from error
     await engine.collective_rpc("set_persistent_hooks", args=(payload,))
     engine._has_persistent_hooks = True

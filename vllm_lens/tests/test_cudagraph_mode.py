@@ -38,7 +38,7 @@ def test_persistent_hook_registration_is_rejected(graph_llm):
     from vllm_lens import Hook
 
     hook = Hook(fn=lambda ctx, hidden: None, layer_indices=[LAYER_IDX])
-    with pytest.raises(RuntimeError, match="VLLM_LENS_CUDAGRAPH"):
+    with pytest.raises(ValueError, match="VLLM_LENS_HOOK_LAYERS"):
         graph_llm.register_hooks([hook])
 
 
@@ -52,6 +52,7 @@ def test_plain_generation_works(graph_llm):
     ("extra_args", "error"),
     [
         ({"output_residual_stream": [LAYER_IDX]}, ValueError),
+        ({"output_residual_stream": []}, ValueError),
         (
             {
                 "apply_steering_vectors": [
@@ -63,7 +64,7 @@ def test_plain_generation_works(graph_llm):
             ValueError,
         ),
     ],
-    ids=["capture", "steering"],
+    ids=["capture", "empty-capture-list", "steering"],
 )
 def test_unserved_requests_are_rejected(graph_llm, extra_args, error):
     """No capture layer and no steering layer is armed, so both raise."""
