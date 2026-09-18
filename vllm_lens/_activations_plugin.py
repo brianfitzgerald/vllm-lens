@@ -723,6 +723,21 @@ def _llm_clear_prefetched(self: LLM) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _configure_logging() -> None:
+    """Give the ``vllm_lens`` logger a handler, once.
+
+    vLLM configures only its own ``vllm`` logger tree, so without this the
+    INFO records of this package are dropped.
+    """
+    pkg_logger = logging.getLogger("vllm_lens")
+    if pkg_logger.handlers:
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[vllm-lens] %(levelname)s %(message)s"))
+    pkg_logger.addHandler(handler)
+    pkg_logger.setLevel(os.environ.get("VLLM_LENS_LOG_LEVEL", "INFO").upper())
+
+
 def register() -> None:
     """Entry point called by vLLM's plugin system at engine startup.
 
@@ -751,6 +766,8 @@ def register() -> None:
     ):
         logger.info("VLLM_LENS_DISABLE set; vllm-lens activation plugin inactive.")
         return
+
+    _configure_logging()
 
     global _original_create_engine_config
     global _original_generate, _original_llm_generate, _original_llm_chat
