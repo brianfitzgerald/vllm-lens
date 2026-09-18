@@ -75,7 +75,7 @@ The forward hooks do not run under a CUDA graph, so the plugin forces `enforce_e
 VLLM_LENS_CUDAGRAPH=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
-In this mode a request that asks for steering or hooks fails with an error, because the hooks would not run. The registration of a persistent hook fails too.
+In this mode a request that asks for hooks fails with an error, because the hooks would not run. The registration of a persistent hook fails too.
 
 Activation capture is served for the layers named in `VLLM_LENS_CAPTURE_LAYERS`, which also turns this mode on:
 
@@ -91,6 +91,14 @@ The model returns these layers as auxiliary hidden states (the interface EAGLE3 
 - vLLM 0.18 or later: earlier versions number the auxiliary layers differently.
 - Each captured step copies its rows to the host after the forward pass.
 - Each armed layer adds `max_num_batched_tokens x hidden_size` values to the graph output pool, so arm only the layers you read.
+
+Steering is served for the layers named in `VLLM_LENS_STEER_LAYERS`, which also turns this mode on:
+
+```bash
+VLLM_LENS_STEER_LAYERS=18 VLLM_LENS_CAPTURE_LAYERS=15,20 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+Each steered layer gets two buffers of shape `(max_num_batched_tokens, hidden_size)` in the model dtype, so the total is `2 x n_layers x max_num_batched_tokens x hidden_size` values. They are allocated when the model loads, before vLLM sizes the KV cache. Before each forward pass the plugin writes the rows of every steered request into them, and an op inside the graph adds them to the residual stream. Zero rows change nothing, so requests with and without steering share a batch and the graph has no extra boundary. `apply_steering_vectors` does not change: `scale`, `norm_match`, `position_indices` and several vectors on one layer work as in eager mode. A vector on a layer that is not in the list fails with an error. One difference: every `norm_match` vector on a layer is scaled to the norm of the unsteered stream. Eager mode does the same for layers that return `(hidden_states, residual)`, but for a layer that returns one tensor it scales a second vector to the norm after the first.
 
 The settings of this mode are stored in `VllmConfig.additional_config`, which is part of vLLM's compile cache key. One cache directory therefore serves engines with different settings, and each gets its own compiled graph.
 
