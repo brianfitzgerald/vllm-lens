@@ -97,3 +97,15 @@ def test_each_steer_layer_set_gets_its_own_graph(tmp_path, eager_rows):
     # Layer 7 shows the steering of layer 5 only if the graph has the op on layer 5.
     assert row_error(steered[0], eager[0]) < 5e-2
     assert row_error(steered[0], eager_rows[7]) > 0.1
+
+
+def test_each_hook_layer_set_gets_its_own_graph(tmp_path, eager_rows):
+    """A graph split at layer 2 is not loaded by an engine that hooks layer 5."""
+    _boot_and_capture(tmp_path, {"VLLM_LENS_HOOK_LAYERS": "2"}, [2], {})
+    after_first = _graph_dirs(tmp_path)
+    second = _boot_and_capture(tmp_path, {"VLLM_LENS_HOOK_LAYERS": "5"}, [5], {})
+
+    # A hook layer serves capture, so layer 5 is captured only by the new graph.
+    assert row_error(second[0], eager_rows[5]) < 5e-2
+    assert row_error(second[0], eager_rows[2]) > 0.1
+    assert len(_graph_dirs(tmp_path)) > len(after_first) > 0

@@ -32,13 +32,18 @@ class LensGraphConfig:
     enabled: bool = False
     capture_layers: tuple[int, ...] = ()
     steer_layers: tuple[int, ...] = ()
+    hook_layers: tuple[int, ...] = ()
 
     @classmethod
     def from_env(cls) -> LensGraphConfig:
         """Read ``VLLM_LENS_CUDAGRAPH`` and the ``VLLM_LENS_*_LAYERS`` lists."""
         flag = os.environ.get("VLLM_LENS_CUDAGRAPH", "").strip().lower()
         layers: dict[str, tuple[int, ...]] = {}
-        for name in ("VLLM_LENS_CAPTURE_LAYERS", "VLLM_LENS_STEER_LAYERS"):
+        for name in (
+            "VLLM_LENS_CAPTURE_LAYERS",
+            "VLLM_LENS_STEER_LAYERS",
+            "VLLM_LENS_HOOK_LAYERS",
+        ):
             parts = [
                 part for part in os.environ.get(name, "").split(",") if part.strip()
             ]
@@ -49,10 +54,24 @@ class LensGraphConfig:
                     f"{name} must be a comma-separated list of layer numbers, "
                     f"got {os.environ[name]!r}."
                 ) from None
+        hook_layers = layers["VLLM_LENS_HOOK_LAYERS"]
+        # A hook layer already captures and steers, so a second path on the
+        # same layer would capture or steer it twice.
+        twice = sorted(
+            set(hook_layers)
+            & set(layers["VLLM_LENS_CAPTURE_LAYERS"] + layers["VLLM_LENS_STEER_LAYERS"])
+        )
+        if twice:
+            raise ValueError(
+                f"Layer(s) {twice} are in VLLM_LENS_HOOK_LAYERS and also in "
+                "VLLM_LENS_CAPTURE_LAYERS or VLLM_LENS_STEER_LAYERS. A hook layer "
+                "serves capture and steering, so name each layer once."
+            )
         return cls(
             enabled=flag in ("1", "true", "yes", "on") or any(layers.values()),
             capture_layers=layers["VLLM_LENS_CAPTURE_LAYERS"],
             steer_layers=layers["VLLM_LENS_STEER_LAYERS"],
+            hook_layers=hook_layers,
         )
 
     @classmethod
@@ -66,6 +85,7 @@ class LensGraphConfig:
             enabled=bool(stored.get("enabled", False)),
             capture_layers=tuple(sorted(stored.get("capture_layers", ()))),
             steer_layers=tuple(sorted(stored.get("steer_layers", ()))),
+            hook_layers=tuple(sorted(stored.get("hook_layers", ()))),
         )
 
     def to_additional_config(
@@ -81,6 +101,44 @@ class LensGraphConfig:
             return others
         return {**others, CONFIG_KEY: {**asdict(self), "graph_version": GRAPH_VERSION}}
 
+    def force_piecewise(self, engine_args: Any) -> None:
+        """Set PIECEWISE on ``engine_args`` before vLLM derives its graph sizes.
+        Under a full graph the whole model replays and the hook op body never runs."""
+        if not self.hook_layers:
+            return
+        from vllm.config.compilation import CUDAGraphMode
+
+        compilation = engine_args.compilation_config
+        if compilation.cudagraph_mode not in (None, CUDAGraphMode.PIECEWISE):
+            logger.warning(
+                "VLLM_LENS_HOOK_LAYERS needs cudagraph_mode PIECEWISE, was %s",
+                compilation.cudagraph_mode,
+            )
+        compilation.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
+    def split_at_hook_op(self, vllm_config: Any) -> None:
+        """Make ``vllm_lens::hook`` a piecewise split point of ``vllm_config``."""
+        if not self.hook_layers:
+            return
+        from vllm.config.compilation import CompilationMode
+
+        compilation = vllm_config.compilation_config
+        # vLLM asserts at engine start without the attention split, so say why.
+        if (
+            compilation.mode != CompilationMode.VLLM_COMPILE
+            or not compilation.splitting_ops
+        ):
+            raise ValueError(
+                "VLLM_LENS_HOOK_LAYERS needs piecewise compilation with the attention "
+                "ops as split points. Remove --enforce-eager, a non-default "
+                "compilation mode, attention and quantization fusion, and sequence "
+                "parallelism, or use VLLM_LENS_CAPTURE_LAYERS / VLLM_LENS_STEER_LAYERS."
+            )
+        # Append: vLLM has already put the attention ops here, and it does not
+        # add them again when the list is set.
+        if "vllm_lens::hook" not in compilation.splitting_ops:
+            compilation.splitting_ops = [*compilation.splitting_ops, "vllm_lens::hook"]
+
     def reject_unserved(
         self,
         residual_stream: Any,
@@ -91,39 +149,53 @@ class LensGraphConfig:
         The arguments are the request's capture value, steering layers and hooks."""
         if not self.enabled:
             return
-        if hooks:
+        if any(hook.pre for hook in hooks):
             raise ValueError(
-                "VLLM_LENS_CUDAGRAPH is set, so the vllm-lens forward hooks do not "
-                "run: hooks are not available. Unset VLLM_LENS_CUDAGRAPH to serve "
-                "this request in eager mode."
+                "Pre-hooks are not served under VLLM_LENS_CUDAGRAPH. Unset it to "
+                "serve this request in eager mode."
             )
-        unsteered = sorted(steering_layers - set(self.steer_layers))
-        if unsteered:
-            raise ValueError(
-                f"apply_steering_vectors names layer(s) {unsteered}, but under "
-                "VLLM_LENS_CUDAGRAPH this server steers only the layers in "
-                f"VLLM_LENS_STEER_LAYERS: {list(self.steer_layers)}."
-            )
-        if residual_stream is None:
-            return
         if isinstance(residual_stream, str):
             try:
                 residual_stream = json.loads(residual_stream)
             except (json.JSONDecodeError, ValueError):
                 pass
         # "All layers" would return only the named ones, with no layer labels.
-        if not isinstance(residual_stream, list):
+        if residual_stream is not None and not isinstance(residual_stream, list):
             raise ValueError(
                 "Under VLLM_LENS_CUDAGRAPH, output_residual_stream must be a list of "
-                f"layers from VLLM_LENS_CAPTURE_LAYERS: {list(self.capture_layers)}."
+                "layers from VLLM_LENS_CAPTURE_LAYERS or VLLM_LENS_HOOK_LAYERS: "
+                f"{sorted({*self.capture_layers, *self.hook_layers})}."
             )
-        outside = sorted(set(residual_stream) - set(self.capture_layers))
-        if outside or not self.capture_layers:
+        if residual_stream is not None and not (
+            self.capture_layers or self.hook_layers
+        ):
             raise ValueError(
-                f"output_residual_stream names layer(s) {outside}, but under "
-                "VLLM_LENS_CUDAGRAPH this server captures only the layers in "
-                f"VLLM_LENS_CAPTURE_LAYERS: {list(self.capture_layers)}."
+                "output_residual_stream is set, but under VLLM_LENS_CUDAGRAPH this "
+                "server captures only the layers in VLLM_LENS_CAPTURE_LAYERS and "
+                "VLLM_LENS_HOOK_LAYERS, which are empty."
             )
+        wanted = {
+            "output_residual_stream": (
+                set(residual_stream or []),
+                ("VLLM_LENS_CAPTURE_LAYERS", self.capture_layers),
+            ),
+            "apply_steering_vectors": (
+                steering_layers,
+                ("VLLM_LENS_STEER_LAYERS", self.steer_layers),
+            ),
+            "apply_hooks": (
+                {layer for hook in hooks for layer in hook.layer_indices},
+                ("VLLM_LENS_HOOK_LAYERS", ()),
+            ),
+        }
+        for option, (layers, (variable, named)) in wanted.items():
+            outside = sorted(layers - set(named) - set(self.hook_layers))
+            if outside:
+                raise ValueError(
+                    f"{option} names layer(s) {outside}, but under VLLM_LENS_CUDAGRAPH "
+                    f"this server serves it only on the layers in {variable}: "
+                    f"{sorted({*named, *self.hook_layers})}."
+                )
 
 
 @dataclass
@@ -266,6 +338,41 @@ def _install_op_hooks(model: Any, op_args: dict[int, int], op: Any) -> None:
         layer.register_forward_hook(_hook)
 
 
+# The worker of this process, for the hook op, which torch dispatches by name.
+_HOOK_STATE: dict[str, Any] = {}
+
+
+@torch.library.custom_op("vllm_lens::hook", mutates_args=("hidden_states",))
+def _split_hook(
+    hidden_states: torch.Tensor, residual: torch.Tensor | None, layer_idx: int
+) -> None:
+    """Run ``_hook_inner`` for one layer and write its result into ``hidden_states``.
+    The op is in ``splitting_ops``, so this body runs as Python between graph pieces."""
+    from vllm_lens._worker_ext import _hook_inner
+
+    extension = _HOOK_STATE.get("extension")
+    if extension is None:
+        return
+    output = hidden_states if residual is None else (hidden_states, residual)
+    try:
+        modified = _hook_inner(extension, layer_idx, output)
+        if isinstance(modified, tuple):
+            modified = modified[0]
+        if modified is not None:
+            hidden_states.copy_(modified)
+    except Exception:
+        # As the eager forward hook does: log, and serve the step unchanged.
+        logger.warning("Split hook failed on layer %s", layer_idx, exc_info=True)
+
+
+@_split_hook.register_fake
+def _split_hook_fake(
+    hidden_states: torch.Tensor, residual: torch.Tensor | None, layer_idx: int
+) -> None:
+    """Shape propagation only."""
+    return None
+
+
 def _enable_buffer_steering(worker: Any, layers: tuple[int, ...]) -> None:
     """Allocate the steering buffers and hook the steer op onto ``layers``."""
     runner = worker.model_runner
@@ -361,7 +468,7 @@ def install_graph_patches() -> None:
         """Load the model, then enable the paths this engine's config names."""
         result = original_load_model(self, *args, **kwargs)
         config = LensGraphConfig.from_vllm_config(self.vllm_config)
-        named = (*config.capture_layers, *config.steer_layers)
+        named = (*config.capture_layers, *config.steer_layers, *config.hook_layers)
         if not named:
             return result
         if not hasattr(self, "_reset_state"):
@@ -380,6 +487,14 @@ def install_graph_patches() -> None:
             _enable_aux_capture(self, config.capture_layers)
         if config.steer_layers:
             _enable_buffer_steering(self, config.steer_layers)
+        if config.hook_layers:
+            _HOOK_STATE["extension"] = self
+            _install_op_hooks(
+                self.model_runner.model,
+                {layer: layer for layer in config.hook_layers},
+                torch.ops.vllm_lens.hook,
+            )
+            logger.info("Split hook enabled for layers %s", list(config.hook_layers))
         self.model_runner._lens_extension = self
         self.model_runner._lens_graph_config = config
         # No request-level forward hooks: they cannot serve requests here.

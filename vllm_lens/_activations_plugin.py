@@ -253,6 +253,7 @@ def _patched_create_engine_config(self, *args, **kwargs):
         self._lens_enforce_eager = self.enforce_eager
     self.enforce_eager = self._lens_enforce_eager or not graph_config.enabled
     self.additional_config = graph_config.to_additional_config(self.additional_config)
+    graph_config.force_piecewise(self)
 
     # Our capture/steering hooks read V1 model-runner internals (input_batch,
     # requests). vLLM's V2 runner — the default for dense models on vLLM 0.23+ —
@@ -263,6 +264,7 @@ def _patched_create_engine_config(self, *args, **kwargs):
 
     assert _original_create_engine_config is not None
     config = _original_create_engine_config(self, *args, **kwargs)
+    graph_config.split_at_hook_op(config)
 
     # Fail loudly rather than silently no-op if the V2 runner ended up active anyway
     # (e.g. the user explicitly set VLLM_USE_V2_MODEL_RUNNER=1). getattr keeps this a
@@ -715,6 +717,7 @@ def _llm_register_hooks(
     prefetch_params: list[str] | None = None,
 ) -> None:
     """Register persistent hooks that apply to every subsequent request."""
+    hooks = _decode_hooks(hooks) or []
     LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config).reject_unserved(
         None, set(), hooks
     )

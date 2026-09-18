@@ -75,7 +75,7 @@ The forward hooks do not run under a CUDA graph, so the plugin forces `enforce_e
 VLLM_LENS_CUDAGRAPH=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
-In this mode a request that asks for hooks fails with an error, because the hooks would not run. The registration of a persistent hook fails too.
+In this mode the forward hooks of eager mode do not run. A request is served only on the layers that the variables below name, and fails with an error for any other layer. The registration of a persistent hook follows the same rule.
 
 Activation capture is served for the layers named in `VLLM_LENS_CAPTURE_LAYERS`, which also turns this mode on:
 
@@ -103,6 +103,18 @@ Before each forward pass the plugin writes the rows of every steered request int
 - A vector on a layer that is not in the list fails with an error.
 - Each layer in the list gets two buffers of shape `(max_num_batched_tokens, hidden_size)` in the model dtype, so the total is `2 x number of steered layers x max_num_batched_tokens x hidden_size` values. They are allocated when the model loads, before vLLM sizes the KV cache.
 - Every `norm_match` vector on a layer is scaled to the norm of the unsteered stream. Eager mode does the same for a layer that returns `(hidden_states, residual)`. For a layer that returns one tensor, eager mode scales a second vector to the norm after the first.
+
+Hooks (`apply_hooks` and persistent hooks) are served for the layers named in `VLLM_LENS_HOOK_LAYERS`, which also turns this mode on:
+
+```bash
+VLLM_LENS_HOOK_LAYERS=18 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+Each hook layer calls the op `vllm_lens::hook`, which the plugin adds to vLLM's `splitting_ops`. vLLM then runs the op body as plain Python between two graph pieces, and the body runs the same code as the eager forward hook. A hook layer therefore also serves capture and steering. The server does not start when a hook layer is also in one of the other two lists. Limits:
+
+- `cudagraph_mode` is set to `PIECEWISE`. The server does not start with options that remove the piecewise attention split: `--enforce-eager`, a compilation mode other than the vLLM default, attention and quantization fusion, or sequence parallelism.
+- Each hook layer adds a graph boundary, which costs throughput. Aux capture and buffer steering add none, so use those lists when you do not need arbitrary hooks.
+- Pre-hooks are not served.
 
 The settings of this mode are stored in `VllmConfig.additional_config`, which is part of vLLM's compile cache key. One cache directory therefore serves engines with different settings, and each gets its own compiled graph.
 

@@ -37,7 +37,7 @@ def test_eager_mode_is_not_forced(graph_llm):
 def test_persistent_hook_registration_is_rejected(graph_llm):
     """A persistent hook would never run, so its registration raises."""
     hook = Hook(fn=lambda ctx, hidden: None, layer_indices=[LAYER_IDX])
-    with pytest.raises(ValueError, match="VLLM_LENS_CUDAGRAPH"):
+    with pytest.raises(ValueError, match="VLLM_LENS_HOOK_LAYERS"):
         graph_llm.register_hooks([hook])
 
 
@@ -51,13 +51,14 @@ def test_plain_generation_works(graph_llm):
     "extra_args",
     [
         {"output_residual_stream": [LAYER_IDX]},
+        {"output_residual_stream": []},
         {
             "apply_steering_vectors": [
                 SteeringVector(activations=torch.zeros(1, 8), layer_indices=[LAYER_IDX])
             ]
         },
     ],
-    ids=["capture", "steering"],
+    ids=["capture", "empty-capture-list", "steering"],
 )
 def test_hook_requests_are_rejected(graph_llm, extra_args):
     """Capture and steering need the forward hooks, so they raise."""
