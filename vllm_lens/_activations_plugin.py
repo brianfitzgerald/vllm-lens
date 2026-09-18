@@ -27,7 +27,7 @@ from vllm_lens._helpers._serialize import (
     serialize_activations,
     serialize_hook_results,
 )
-from vllm_lens._cudagraph import LensGraphConfig
+from vllm_lens._cudagraph import LensGraphConfig, arm
 from vllm_lens._helpers.types import Hook, SteeringVector
 
 logger = logging.getLogger(__name__)
@@ -339,7 +339,10 @@ async def _patched_generate(
         or hooks_list is not None
         or has_persistent
     )
-    LensGraphConfig.from_vllm_config(self.vllm_config).reject_unserved(needs_hooks)
+    LensGraphConfig.from_vllm_config(self.vllm_config).reject_unserved(
+        extra.get("output_residual_stream"),
+        steering_vectors is not None or hooks_list is not None or has_persistent,
+    )
     if needs_hooks or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
         # computation entirely, so force a fresh prefill for this request.
@@ -468,9 +471,12 @@ def _prepare_offline_params(
     has_hooks = len(hook_payloads) > 0
     has_persistent = getattr(self, "_has_persistent_hooks", False)
     needs_hooks = wants_activations or has_steering or has_hooks or has_persistent
-    LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config).reject_unserved(
-        needs_hooks
-    )
+    graph_config = LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config)
+    for sp in params_list:
+        graph_config.reject_unserved(
+            (sp.extra_args or {}).get("output_residual_stream"),
+            has_steering or has_hooks or has_persistent,
+        )
     if needs_hooks or any_skip_kv_cache:
         for sp in params_list:
             sp.skip_reading_prefix_cache = True
@@ -866,3 +872,5 @@ def register() -> None:
         _serve_mod.register_vllm_serve_api_routers = _patched_register_routers
     except Exception:
         pass
+
+    arm()

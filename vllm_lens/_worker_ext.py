@@ -27,7 +27,7 @@ from vllm.model_executor.models.utils import PPMissingLayer
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
-    from jaxtyping import Float, Int
+    from jaxtyping import Float
     from vllm.config import ParallelConfig
 
 logger = logging.getLogger(__name__)
@@ -241,47 +241,121 @@ def _apply_hook_delta(
     return modified_output
 
 
+def _capture_rows(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """Store the rows of ``hidden_states`` that each request asked to capture.
+
+    ``hidden_states`` is the residual stream after layer ``layer_idx`` for the
+    whole batch; ``query_start_loc`` gives each request's ``[start, end)``.
+    """
+    runner = extension.model_runner
+    num_reqs = runner.input_batch.num_reqs
+    req_ids = runner.input_batch.req_ids
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = runner.requests.get(req_id)
+        if req_state is None or req_state.sampling_params is None:
+            continue
+        extra = req_state.sampling_params.extra_args
+        if not extra:
+            continue
+
+        output_residual_stream = extra.get("output_residual_stream")
+        if output_residual_stream is None:
+            continue
+        # vllm_xargs passes values as strings; parse JSON lists.
+        if isinstance(output_residual_stream, str):
+            try:
+                output_residual_stream = json.loads(output_residual_stream)
+            except (json.JSONDecodeError, ValueError):
+                pass  # treat as truthy (capture all layers)
+        if (
+            isinstance(output_residual_stream, list)
+            and layer_idx not in output_residual_stream
+        ):
+            continue
+
+        start = query_start_loc[i].item()
+        end = query_start_loc[i + 1].item()
+
+        pool = extra.get("output_residual_stream_pool")
+        if pool is not None:
+            # Pool the prompt rows of this step; a decode step has none.
+            first = req_state.num_computed_tokens
+            n_rows = min(end - start, req_state.num_prompt_tokens - first)
+            if pool == "last" and first + n_rows < req_state.num_prompt_tokens:
+                continue
+            if n_rows <= 0:
+                continue
+            rows = hidden_states[start : start + n_rows]
+            if pool == "last":
+                rows = rows[-1:]
+            total = rows.float().sum(0, keepdim=True).cpu()
+            pooled_states = extension._captured_states.setdefault(req_id, {})
+            if layer_idx in pooled_states:
+                total = pooled_states[layer_idx][0] + total
+            pooled_states[layer_idx] = [total]
+            counts = extension._pooled_counts.setdefault(req_id, {})
+            count = counts[layer_idx][0] if layer_idx in counts else 0
+            counts[layer_idx] = (count + rows.shape[0], hidden_states.dtype)
+            continue
+
+        activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
+            start:end
+        ].cpu()
+
+        if req_id not in extension._captured_states:
+            extension._captured_states[req_id] = {}
+        layer_states = extension._captured_states[req_id]
+        if layer_idx not in layer_states:
+            layer_states[layer_idx] = []
+        layer_states[layer_idx].append(activation)
+
+
+def _batch_layout(runner: Any) -> tuple[torch.Tensor, Any] | None:
+    """``query_start_loc`` and the metadata entry that holds it, for this forward.
+
+    None when there is nothing to act on: no forward context, an empty batch,
+    or no attention metadata with ``query_start_loc``.
+    """
+    if not is_forward_context_available() or runner.input_batch.num_reqs == 0:
+        return None
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, list):
+        attn_metadata = attn_metadata[0] if attn_metadata else None
+    if attn_metadata is None:
+        return None
+    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
+    # attention metadata entries — some (like GDNAttentionMetadata) lack
+    # query_start_loc.  Find one that has it.
+    for meta in attn_metadata.values():
+        if hasattr(meta, "query_start_loc"):
+            return getattr(meta, "query_start_loc"), meta
+    logger.warning(
+        "No attention metadata with query_start_loc found "
+        "(keys: %s). Skipping hook for this step.",
+        list(attn_metadata.keys()),
+    )
+    return None
+
+
 def _hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
     output: torch.Tensor | tuple[torch.Tensor, ...],
 ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
     """Core hook logic, separated so _make_hook can wrap it in try/except."""
-    if not is_forward_context_available():
+    layout = _batch_layout(extension.model_runner)
+    if layout is None:
         return None
-
+    query_start_loc, meta_with_qsl = layout
     runner = extension.model_runner
     num_reqs = runner.input_batch.num_reqs
-    if num_reqs == 0:
-        return None
-
     req_ids = runner.input_batch.req_ids
-
-    ctx = get_forward_context()
-    attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return None
-    if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return None
-    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
-    # attention metadata entries — some (like GDNAttentionMetadata) lack
-    # query_start_loc.  Find one that has it.
-    query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] | None = None  # type: ignore[reportUndefinedVariable]
-    meta_with_qsl: Any = None
-    for _meta in attn_metadata.values():
-        if hasattr(_meta, "query_start_loc"):
-            query_start_loc = getattr(_meta, "query_start_loc")
-            meta_with_qsl = _meta
-            break
-    if query_start_loc is None:
-        logger.warning(
-            "No attention metadata with query_start_loc found "
-            "(keys: %s). Skipping hook for this step.",
-            list(attn_metadata.keys()),
-        )
-        return None
 
     # --- Phase 1: detect steering requests --------------------------
     per_req_steering: list[list[SteeringVector]] = []
@@ -435,65 +509,7 @@ def _hook_inner(
         else:
             hidden_states = capture_src
 
-        for i in range(num_reqs):
-            req_id = req_ids[i]
-            req_state = runner.requests.get(req_id)
-            if req_state is None or req_state.sampling_params is None:
-                continue
-            extra = req_state.sampling_params.extra_args
-            if not extra:
-                continue
-
-            output_residual_stream = extra.get("output_residual_stream")
-            if output_residual_stream is None:
-                continue
-            # vllm_xargs passes values as strings; parse JSON lists.
-            if isinstance(output_residual_stream, str):
-                try:
-                    output_residual_stream = json.loads(output_residual_stream)
-                except (json.JSONDecodeError, ValueError):
-                    pass  # treat as truthy (capture all layers)
-            if (
-                isinstance(output_residual_stream, list)
-                and layer_idx not in output_residual_stream
-            ):
-                continue
-
-            start = query_start_loc[i].item()
-            end = query_start_loc[i + 1].item()
-
-            pool = extra.get("output_residual_stream_pool")
-            if pool is not None:
-                # Pool the prompt rows of this step; a decode step has none.
-                first = req_state.num_computed_tokens
-                n_rows = min(end - start, req_state.num_prompt_tokens - first)
-                if pool == "last" and first + n_rows < req_state.num_prompt_tokens:
-                    continue
-                if n_rows <= 0:
-                    continue
-                rows = hidden_states[start : start + n_rows]
-                if pool == "last":
-                    rows = rows[-1:]
-                total = rows.float().sum(0, keepdim=True).cpu()
-                pooled_states = extension._captured_states.setdefault(req_id, {})
-                if layer_idx in pooled_states:
-                    total = pooled_states[layer_idx][0] + total
-                pooled_states[layer_idx] = [total]
-                counts = extension._pooled_counts.setdefault(req_id, {})
-                count = counts[layer_idx][0] if layer_idx in counts else 0
-                counts[layer_idx] = (count + rows.shape[0], hidden_states.dtype)
-                continue
-
-            activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
-                start:end
-            ].cpu()
-
-            if req_id not in extension._captured_states:
-                extension._captured_states[req_id] = {}
-            layer_states = extension._captured_states[req_id]
-            if layer_idx not in layer_states:
-                layer_states[layer_idx] = []
-            layer_states[layer_idx].append(activation)
+        _capture_rows(extension, layer_idx, hidden_states, query_start_loc)
 
     return modified_output
 
@@ -700,20 +716,8 @@ class HiddenStatesExtension:
     # Whether this rank should capture activations (only TP rank 0).
     _should_capture: bool = True
 
-    def install_hooks(self) -> None:
-        """Register a forward hook on every decoder layer. Idempotent.
-
-        Hooks are installed on **all** TP ranks because steering must
-        modify hidden states everywhere.  Activation *capture* is gated
-        to rank 0 only via ``_should_capture``.
-
-        Requires ``enforce_eager=True`` in engine args — otherwise
-        ``@support_torch_compile`` would compile the forward graph and
-        hooks won't fire.
-        """
-        if self._hooks_installed:
-            return
-        self._hooks_installed = True
+    def _reset_state(self) -> None:
+        """Create the per-instance state and decide which rank captures."""
         # Reset to instance-level dicts (class-level defaults are shared).
         # Do NOT reset _persistent_hooks — they may have been set via
         # set_persistent_hooks() before the first generate call.
@@ -730,6 +734,22 @@ class HiddenStatesExtension:
         # TP ranks after all-reduce, so the data is identical.
         tp_size = self.parallel_config.tensor_parallel_size
         self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
+
+    def install_hooks(self) -> None:
+        """Register a forward hook on every decoder layer. Idempotent.
+
+        Hooks are installed on **all** TP ranks because steering must
+        modify hidden states everywhere.  Activation *capture* is gated
+        to rank 0 only via ``_should_capture``.
+
+        Requires ``enforce_eager=True`` in engine args — otherwise
+        ``@support_torch_compile`` would compile the forward graph and
+        hooks won't fire.
+        """
+        if self._hooks_installed:
+            return
+        self._hooks_installed = True
+        self._reset_state()
 
         # Hooks must be installed on ALL ranks so steering vectors are
         # applied everywhere (not just rank 0).

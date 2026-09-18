@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Capture: Added `VLLM_LENS_CAPTURE_LAYERS`. The named layers are captured as auxiliary hidden states of the model, so `output_residual_stream` works with compilation and CUDA graphs on.
 - Plugin: Added the `VLLM_LENS_CUDAGRAPH=1` environment variable. The plugin then does not force `enforce_eager=True`, and a request that needs the forward hooks fails with an error in place of returning nothing.
 - Capture: Added `output_residual_stream_pool` (`capture_pool` on the client). `"last"` returns the last prompt position and `"mean"` returns the mean over the prompt positions, as one row per layer, so a long prompt no longer ships every position to the client.
 - Steering: Fixed `position_indices` during decode and chunked prefill. The absolute start of each forward pass was always 0, so a position in a later prefill chunk was never steered, and position 0 was steered again on every decode step.
