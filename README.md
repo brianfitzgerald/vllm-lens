@@ -75,7 +75,22 @@ The forward hooks do not run under a CUDA graph, so the plugin forces `enforce_e
 VLLM_LENS_CUDAGRAPH=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
-In this mode a request that asks for activation capture, steering or hooks fails with an error, because the hooks would not run. The registration of a persistent hook fails too.
+In this mode a request that asks for steering or hooks fails with an error, because the hooks would not run. The registration of a persistent hook fails too.
+
+Activation capture is served for the layers named in `VLLM_LENS_CAPTURE_LAYERS`, which also turns this mode on:
+
+```bash
+VLLM_LENS_CAPTURE_LAYERS=15,20 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+The model returns these layers as auxiliary hidden states (the interface EAGLE3 uses), so they are outputs of the CUDA graph. The response format does not change, and `output_residual_stream_pool` works. A request must name its layers: a layer that is not in the list, or `output_residual_stream=True` (all layers), fails with an error. Limits:
+
+- The model must implement `set_aux_hidden_state_layers`.
+- Pipeline parallelism is not supported for capture.
+- Speculative decoding is not supported: EAGLE3 sets the same auxiliary layers.
+- vLLM 0.18 or later: earlier versions number the auxiliary layers differently.
+- Each captured step copies its rows to the host after the forward pass.
+- Each armed layer adds `max_num_batched_tokens x hidden_size` values to the graph output pool, so arm only the layers you read.
 
 ## Examples
 
