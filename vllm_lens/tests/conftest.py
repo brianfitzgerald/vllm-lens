@@ -8,6 +8,10 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
 
+# vLLM forks the engine core unless CUDA is initialized in this process. A fork
+# of this process after it ran multi-threaded torch CPU ops can deadlock.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 import pytest
 import ray
 import torch
