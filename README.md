@@ -67,6 +67,16 @@ vLLM configures only its own `vllm` logger, so the plugin attaches a stderr hand
 VLLM_LENS_LOG_LEVEL=DEBUG vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
+## CUDA graphs
+
+The forward hooks do not run under a CUDA graph, so the plugin forces `enforce_eager=True`. Set `VLLM_LENS_CUDAGRAPH=1` to keep compilation and CUDA graphs on:
+
+```bash
+VLLM_LENS_CUDAGRAPH=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+In this mode a request that asks for activation capture, steering or hooks fails with an error, because the hooks would not run.
+
 ## Examples
 
 Runnable examples live in [`examples/`](examples/) — each is standalone; run any

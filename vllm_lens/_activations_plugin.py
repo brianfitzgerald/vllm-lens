@@ -27,6 +27,7 @@ from vllm_lens._helpers._serialize import (
     serialize_activations,
     serialize_hook_results,
 )
+from vllm_lens._cudagraph import LensGraphConfig
 from vllm_lens._helpers.types import Hook, SteeringVector
 
 logger = logging.getLogger(__name__)
@@ -236,7 +237,8 @@ def _trim_activations(
 def _patched_create_engine_config(self, *args, **kwargs):
     """Patch for ``EngineArgs.create_engine_config``.
 
-    Injects our worker extension and forces eager mode *before* the
+    Injects our worker extension and forces eager mode (unless
+    ``VLLM_LENS_CUDAGRAPH`` is set) *before* the
     ``VllmConfig`` is built, so the settings propagate through any
     engine creation path (``AsyncLLM.from_engine_args``,
     ``AsyncLLM.from_vllm_config``, ``vllm serve``, etc.) including
@@ -244,7 +246,13 @@ def _patched_create_engine_config(self, *args, **kwargs):
     """
     if not self.worker_extension_cls:
         self.worker_extension_cls = _WORKER_EXT
-    self.enforce_eager = True
+    graph_config = LensGraphConfig.from_env()
+    if graph_config.enabled:
+        self.additional_config = graph_config.to_additional_config(
+            self.additional_config
+        )
+    else:
+        self.enforce_eager = True
 
     # Our capture/steering hooks read V1 model-runner internals (input_batch,
     # requests). vLLM's V2 runner — the default for dense models on vLLM 0.23+ —
@@ -331,6 +339,7 @@ async def _patched_generate(
         or hooks_list is not None
         or has_persistent
     )
+    LensGraphConfig.from_vllm_config(self.vllm_config).reject_unserved(needs_hooks)
     if needs_hooks or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
         # computation entirely, so force a fresh prefill for this request.
@@ -459,6 +468,9 @@ def _prepare_offline_params(
     has_hooks = len(hook_payloads) > 0
     has_persistent = getattr(self, "_has_persistent_hooks", False)
     needs_hooks = wants_activations or has_steering or has_hooks or has_persistent
+    LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config).reject_unserved(
+        needs_hooks
+    )
     if needs_hooks or any_skip_kv_cache:
         for sp in params_list:
             sp.skip_reading_prefix_cache = True
