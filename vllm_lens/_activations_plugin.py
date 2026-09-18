@@ -196,6 +196,15 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
     return [h if isinstance(h, Hook) else Hook.model_validate(h) for h in value]
 
 
+def _validate_pool(extra: dict[str, Any]) -> None:
+    """Raise ``ValueError`` for an unknown ``output_residual_stream_pool``."""
+    pool = extra.get("output_residual_stream_pool")
+    if pool is not None and pool not in ("last", "mean"):
+        raise ValueError(
+            f"output_residual_stream_pool must be 'last' or 'mean', got {pool!r}"
+        )
+
+
 def _trim_activations(
     activations: dict[str, Any],
     expected_len: int,
@@ -211,6 +220,8 @@ def _trim_activations(
     during that extra pass.  This trims the surplus positions so the
     residual stream shape is always deterministic.
     """
+    # A pooled capture has one row, and it is not a surplus decode position.
+    expected_len = max(expected_len, 1)
     rs = activations.get("residual_stream")
     if rs is not None and rs.shape[1] > expected_len:
         activations["residual_stream"] = rs[:, :expected_len, :]
@@ -300,6 +311,7 @@ async def _patched_generate(
 
     extra = effective_params.extra_args or {}
     wants_activations = extra.get("output_residual_stream") is not None
+    _validate_pool(extra)
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
     # When arriving via the OpenAI API (vllm_xargs), complex values
@@ -355,7 +367,7 @@ async def _patched_generate(
                     )
                     activations = _merge_captured_states(states)
                     if activations is not None:
-                        n_prompt = len(output.prompt_token_ids)
+                        n_prompt = len(output.prompt_token_ids or ())
                         n_gen = len(output.outputs[0].token_ids)
                         _trim_activations(activations, n_prompt + n_gen - 1)
                         output.activations = activations
@@ -404,6 +416,9 @@ def _prepare_offline_params(
         params_list = [sampling_params]
     else:
         params_list = []
+
+    for sp in params_list:
+        _validate_pool(sp.extra_args or {})
 
     wants_activations = any(
         (sp.extra_args or {}).get("output_residual_stream") is not None
@@ -494,7 +509,7 @@ def _finalize_offline_outputs(
         for output in outputs:
             activations = activations_by_id.get(output.request_id)
             if activations is not None:
-                n_prompt = len(output.prompt_token_ids)
+                n_prompt = len(output.prompt_token_ids or ())
                 n_gen = len(output.outputs[0].token_ids)
                 _trim_activations(activations, n_prompt + n_gen - 1)
                 output.activations = activations
