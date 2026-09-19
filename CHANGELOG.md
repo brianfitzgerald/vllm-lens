@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Examples: Added a test that runs the activation oracle example in eager mode and under CUDA graphs.
 - Steering: Fixed `position_indices` during decode and chunked prefill. The absolute start of each forward pass was always 0, so a position in a later prefill chunk was never steered, and position 0 was steered again on every decode step. The start now comes from the request's computed-token count, which does not depend on the attention backend.
 - Hooks: Added `VLLM_LENS_HOOK_LAYERS`. The named layers run the hook code in an op that is a piecewise split point of the compiled graph, so `apply_hooks`, persistent hooks, steering and capture work on them with CUDA graphs on.
 - Steering: Added `VLLM_LENS_STEER_LAYERS`. `apply_steering_vectors` on the named layers is applied by an op inside the compiled graph that reads buffers the plugin fills before each forward pass, so steering works with compilation and CUDA graphs on.
