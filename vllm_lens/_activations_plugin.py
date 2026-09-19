@@ -343,7 +343,8 @@ async def _patched_generate(
     )
     LensGraphConfig.from_vllm_config(self.vllm_config).reject_unserved(
         extra.get("output_residual_stream"),
-        steering_vectors is not None or hooks_list is not None or has_persistent,
+        {layer for sv in steering_vectors or [] for layer in sv.layer_indices},
+        hooks_list is not None or has_persistent,
     )
     if needs_hooks or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
@@ -429,6 +430,7 @@ def _prepare_offline_params(
     else:
         params_list = []
 
+    graph_config = LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config)
     for sp in params_list:
         _validate_pool(sp.extra_args or {})
 
@@ -444,6 +446,9 @@ def _prepare_offline_params(
     for idx, sp in enumerate(params_list):
         extra = sp.extra_args or {}
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
+        graph_config.reject_unserved(
+            None, {layer for sv in vectors or [] for layer in sv.layer_indices}, False
+        )
         if vectors is not None:
             steering_id = f"_steer_{idx}"
             steering_payloads[steering_id] = pickle.dumps(vectors)
@@ -473,11 +478,11 @@ def _prepare_offline_params(
     has_hooks = len(hook_payloads) > 0
     has_persistent = getattr(self, "_has_persistent_hooks", False)
     needs_hooks = wants_activations or has_steering or has_hooks or has_persistent
-    graph_config = LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config)
     for sp in params_list:
         graph_config.reject_unserved(
             (sp.extra_args or {}).get("output_residual_stream"),
-            has_steering or has_hooks or has_persistent,
+            set(),
+            has_hooks or has_persistent,
         )
     if needs_hooks or any_skip_kv_cache:
         for sp in params_list:
@@ -715,7 +720,7 @@ def _llm_register_hooks(
 ) -> None:
     """Register persistent hooks that apply to every subsequent request."""
     LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config).reject_unserved(
-        None, True
+        None, set(), True
     )
     if not getattr(self, "_hooks_installed", False):
         self.collective_rpc("install_hooks")
