@@ -8,6 +8,8 @@ import pytest
 import torch
 from vllm import SamplingParams
 
+from vllm_lens import SteeringVector
+
 from .conftest import make_llm, row_error
 
 LONG_PROMPT = "The quick brown fox jumps over the lazy dog. " * 20
@@ -74,3 +76,24 @@ def test_the_same_layer_set_reuses_its_graph(tmp_path, eager_rows):
     # The second boot loads the graph of the first, so the rows are the same.
     assert row_error(second[0], first[0]) < 1e-4
     assert row_error(second[0], eager_rows[2]) < 5e-2
+
+
+def test_each_steer_layer_set_gets_its_own_graph(tmp_path, eager_rows):
+    """A graph with the steer op on layer 2 is not loaded by an engine that steers layer 5."""
+    hidden = eager_rows[7].shape[-1]
+    vector = SteeringVector(
+        activations=torch.randn(1, hidden, generator=torch.Generator().manual_seed(0)),
+        layer_indices=[5],
+        scale=4.0,
+        norm_match=True,
+    )
+    steering = {"apply_steering_vectors": [vector]}
+    eager = _boot_and_capture(tmp_path / "eager", {}, [7], steering)
+    first_env = {"VLLM_LENS_STEER_LAYERS": "2", "VLLM_LENS_CAPTURE_LAYERS": "7"}
+    _boot_and_capture(tmp_path, first_env, [7], {})
+    second_env = {"VLLM_LENS_STEER_LAYERS": "5", "VLLM_LENS_CAPTURE_LAYERS": "7"}
+    steered = _boot_and_capture(tmp_path, second_env, [7], steering)
+
+    # Layer 7 shows the steering of layer 5 only if the graph has the op on layer 5.
+    assert row_error(steered[0], eager[0]) < 5e-2
+    assert row_error(steered[0], eager_rows[7]) > 0.1
