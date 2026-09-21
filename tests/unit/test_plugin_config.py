@@ -24,7 +24,10 @@ def patched(monkeypatch):
 
     def run(dtype):
         args = SimpleNamespace(
-            worker_extension_cls=None, enforce_eager=False, _cfg=_fake_config(dtype)
+            worker_extension_cls=None,
+            enforce_eager=False,
+            additional_config=None,
+            _cfg=_fake_config(dtype),
         )
         plugin._patched_create_engine_config(args)
         return args
