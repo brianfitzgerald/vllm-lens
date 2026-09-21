@@ -12,6 +12,7 @@ import cloudpickle
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from vllm_lens._cudagraph import LensGraphConfig
 from vllm_lens._helpers._serialize import serialize_hook_results
 from vllm_lens._helpers.types import Hook
 
@@ -35,8 +36,14 @@ async def register_hooks(raw_request: Request):
     ):
         raise HTTPException(400, "'hooks' must be a list of objects")
     hooks = [Hook.model_validate(h) for h in hooks_raw]
-    payload = cloudpickle.dumps(hooks)
     engine = _engine_client(raw_request)
+    try:
+        LensGraphConfig.from_vllm_config(
+            getattr(engine, "vllm_config", None)
+        ).reject_unserved(None, set(), hooks)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+    payload = cloudpickle.dumps(hooks)
     await engine.collective_rpc("set_persistent_hooks", args=(payload,))
     engine._has_persistent_hooks = True
     prefetch = body.get("prefetch_params")

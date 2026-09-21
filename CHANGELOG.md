@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Plugin: Added the `VLLM_LENS_CUDAGRAPH=1` environment variable. The plugin then does not force `enforce_eager=True`, and a request that needs the forward hooks fails with an error in place of returning nothing.
+- Plugin: `register()` now attaches a stderr handler to the `vllm_lens` logger when it has none, so the package's INFO records are no longer dropped. `VLLM_LENS_LOG_LEVEL` sets the level (default `INFO`).
 - Capture: Added `output_residual_stream_pool` (`capture_pool` on the client). `"last"` returns the last prompt position and `"mean"` returns the mean over the prompt positions, as one row per layer, so a long prompt no longer ships every position to the client.
 - Steering: Fixed `position_indices` during decode and chunked prefill. The absolute start of each forward pass was always 0, so a position in a later prefill chunk was never steered, and position 0 was steered again on every decode step. The start now comes from the request's computed-token count, which does not depend on the attention backend.
 - Tests: The comparison with Transformers now checks the largest per-row relative error (limit 3%) in place of a mean absolute difference of 0.01. One prompt of the batch test had a mean absolute difference of 0.0105 at a per-row error of 1.6%, the same as the other prompts.
