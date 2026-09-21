@@ -4,6 +4,7 @@
 - Steering: Fixed `position_indices` during decode and chunked prefill. The absolute start of each forward pass was always 0, so a position in a later prefill chunk was never steered, and position 0 was steered again on every decode step. The start now comes from the request's computed-token count, which does not depend on the attention backend.
 - Plugin: Added the `VLLM_LENS_CUDAGRAPH=1` environment variable. The plugin then does not force `enforce_eager=True`, and a request that needs the forward hooks fails with an error in place of returning nothing.
 - Plugin: `register()` now attaches a stderr handler to the `vllm_lens` logger when it has none, so the package's INFO records are no longer dropped. `VLLM_LENS_LOG_LEVEL` sets the level (default `INFO`).
+- Capture: Added `VLLM_LENS_CAPTURE_LAYERS`. The named layers are captured as auxiliary hidden states of the model, so `output_residual_stream` works with compilation and CUDA graphs on.
 
 ## v1.3.0 (2 October 2026)
 

@@ -24,7 +24,7 @@ import cloudpickle
 import torch
 import zstandard as zstd
 
-from vllm_lens._cudagraph import LensGraphConfig
+from vllm_lens._cudagraph import LensGraphConfig, install_graph_patches
 from vllm_lens._helpers._serialize import (
     serialize_activations,
     serialize_activations_binary,
@@ -1112,3 +1112,5 @@ def register() -> None:
         _serve_mod.register_vllm_serve_api_routers = _patched_register_routers
     except Exception as error:
         _report_integration_failure("hook and activation HTTP routes", error)
+
+    install_graph_patches()
