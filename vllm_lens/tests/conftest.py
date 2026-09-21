@@ -47,6 +47,32 @@ def hf_model():
     torch.cuda.empty_cache()
 
 
+def make_llm(env: dict[str, str], **kwargs):
+    """Start an offline engine with ``env`` set while its config is created."""
+    from vllm import LLM
+
+    kwargs.setdefault("gpu_memory_utilization", 0.2)
+    with pytest.MonkeyPatch.context() as patch:
+        for name, value in env.items():
+            patch.setenv(name, value)
+        return LLM(model=MODEL_NAME, dtype="auto", **kwargs)
+
+
+def row_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    """The largest per-row ``||actual - expected|| / ||expected||``."""
+    return ((actual - expected).norm(dim=-1) / expected.norm(dim=-1)).max().item()
+
+
+@pytest.fixture(scope="module")
+def eager_llm():
+    """The reference of the CUDA-graph tests: forward hooks in eager mode."""
+    engine = make_llm({}, enable_prefix_caching=False)
+    yield engine
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_vllm():
     yield

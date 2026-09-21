@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Capture: Added `VLLM_LENS_CAPTURE_LAYERS`. The named layers are captured as auxiliary hidden states of the model, so `output_residual_stream` works with compilation and CUDA graphs on.
 - Plugin: Added the `VLLM_LENS_CUDAGRAPH=1` environment variable. The plugin then does not force `enforce_eager=True`, and a request that needs the forward hooks fails with an error in place of returning nothing.
 - Plugin: `register()` now attaches a stderr handler to the `vllm_lens` logger when it has none, so the package's INFO records are no longer dropped. `VLLM_LENS_LOG_LEVEL` sets the level (default `INFO`).
 - Capture: Added `output_residual_stream_pool` (`capture_pool` on the client). `"last"` returns the last prompt position and `"mean"` returns the mean over the prompt positions, as one row per layer, so a long prompt no longer ships every position to the client.
