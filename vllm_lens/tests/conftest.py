@@ -63,6 +63,12 @@ def row_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return ((actual - expected).norm(dim=-1) / expected.norm(dim=-1)).max().item()
 
 
+def prompt_rows(output) -> torch.Tensor:
+    """The captured prompt rows of the first layer, which no sampled token changes."""
+    acts = output.activations["residual_stream"]  # type: ignore[reportAttributeAccessIssue]
+    return acts[0, : len(output.prompt_token_ids)].float()
+
+
 @pytest.fixture(scope="module")
 def eager_llm():
     """The reference of the CUDA-graph tests: forward hooks in eager mode."""
@@ -71,6 +77,12 @@ def eager_llm():
     del engine
     gc.collect()
     torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
+def hidden(eager_llm) -> int:
+    """The hidden size of the test model."""
+    return eager_llm.llm_engine.vllm_config.model_config.get_hidden_size()
 
 
 @pytest.fixture(autouse=True, scope="module")

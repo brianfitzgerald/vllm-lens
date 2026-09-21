@@ -9,6 +9,8 @@ import os
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
+import torch
+
 if TYPE_CHECKING:
     from vllm_lens._helpers.types import Hook
 
@@ -29,13 +31,14 @@ class LensGraphConfig:
 
     enabled: bool = False
     capture_layers: tuple[int, ...] = ()
+    steer_layers: tuple[int, ...] = ()
 
     @classmethod
     def from_env(cls) -> LensGraphConfig:
         """Read ``VLLM_LENS_CUDAGRAPH`` and the ``VLLM_LENS_*_LAYERS`` lists."""
         flag = os.environ.get("VLLM_LENS_CUDAGRAPH", "").strip().lower()
         layers: dict[str, tuple[int, ...]] = {}
-        for name in ("VLLM_LENS_CAPTURE_LAYERS",):
+        for name in ("VLLM_LENS_CAPTURE_LAYERS", "VLLM_LENS_STEER_LAYERS"):
             parts = [
                 part for part in os.environ.get(name, "").split(",") if part.strip()
             ]
@@ -49,6 +52,7 @@ class LensGraphConfig:
         return cls(
             enabled=flag in ("1", "true", "yes", "on") or any(layers.values()),
             capture_layers=layers["VLLM_LENS_CAPTURE_LAYERS"],
+            steer_layers=layers["VLLM_LENS_STEER_LAYERS"],
         )
 
     @classmethod
@@ -61,6 +65,7 @@ class LensGraphConfig:
         return cls(
             enabled=bool(stored.get("enabled", False)),
             capture_layers=tuple(sorted(stored.get("capture_layers", ()))),
+            steer_layers=tuple(sorted(stored.get("steer_layers", ()))),
         )
 
     def to_additional_config(
@@ -86,11 +91,18 @@ class LensGraphConfig:
         The arguments are the request's capture value, steering layers and hooks."""
         if not self.enabled:
             return
-        if steering_layers or hooks:
+        if hooks:
             raise ValueError(
                 "VLLM_LENS_CUDAGRAPH is set, so the vllm-lens forward hooks do not "
-                "run: steering and hooks are not available. Unset "
-                "VLLM_LENS_CUDAGRAPH to serve this request in eager mode."
+                "run: hooks are not available. Unset VLLM_LENS_CUDAGRAPH to serve "
+                "this request in eager mode."
+            )
+        unsteered = sorted(steering_layers - set(self.steer_layers))
+        if unsteered:
+            raise ValueError(
+                f"apply_steering_vectors names layer(s) {unsteered}, but under "
+                "VLLM_LENS_CUDAGRAPH this server steers only the layers in "
+                f"VLLM_LENS_STEER_LAYERS: {list(self.steer_layers)}."
             )
         if residual_stream is None:
             return
@@ -112,6 +124,179 @@ class LensGraphConfig:
                 "VLLM_LENS_CUDAGRAPH this server captures only the layers in "
                 f"VLLM_LENS_CAPTURE_LAYERS: {list(self.capture_layers)}."
             )
+
+
+@dataclass
+class _SteerBuffers:
+    """The steering buffers of one worker, ``[n_steered, max_tokens, hidden]`` each.
+    ``add`` rows are added as they are; ``norm`` rows are unit rows for ``norm_match``."""
+
+    add: torch.Tensor
+    norm: torch.Tensor
+    slots: dict[int, int]
+    # Rows below this index can be nonzero; all other rows are zero.
+    dirty: int = 0
+
+
+# torch dispatches a custom op by name, so the op finds the buffers here.
+# One worker process holds one model, so there is one entry.
+_STEER_STATE: dict[str, _SteerBuffers] = {}
+
+
+@torch.library.custom_op("vllm_lens::steer", mutates_args=("hidden_states",))
+def _steer(
+    hidden_states: torch.Tensor, residual: torch.Tensor | None, slot: int
+) -> None:
+    """Add this layer's buffer rows to the stream. Zero rows change nothing.
+    The op has no branch, so it is traced into the graph with no graph boundary."""
+    state = _STEER_STATE.get("buffers")
+    if state is None:
+        return
+    n = hidden_states.shape[0]
+    if n > state.add.shape[1]:
+        raise RuntimeError(
+            f"{n} tokens in one forward pass, but the steering buffers hold "
+            f"max_num_batched_tokens = {state.add.shape[1]}."
+        )
+    # norm_match references the full stream, which for a fused-residual layer
+    # is the sum of the two outputs.
+    stream = hidden_states + residual if residual is not None else hidden_states
+    stream_norm = torch.linalg.vector_norm(
+        stream, dim=-1, keepdim=True, dtype=torch.float32
+    )
+    delta = state.add[slot, :n] + state.norm[slot, :n] * stream_norm
+    hidden_states += delta.to(hidden_states.dtype)
+
+
+@_steer.register_fake
+def _steer_fake(
+    hidden_states: torch.Tensor, residual: torch.Tensor | None, slot: int
+) -> None:
+    """Shape propagation only."""
+    return None
+
+
+def _fill_steer_buffers(extension: Any) -> None:
+    """Write the steering rows of each request, before the forward pass reads them.
+    Rows of the last step are zeroed first, so no stale row steers another request."""
+    from vllm_lens._worker_ext import (
+        _apply_steering,
+        _batch_layout,
+        _find_steering_configs,
+    )
+
+    state = _STEER_STATE["buffers"]
+    state.add[:, : state.dirty].zero_()
+    state.norm[:, : state.dirty].zero_()
+    state.dirty = 0
+    runner = extension.model_runner
+    query_start_loc = _batch_layout(runner, warn=False)
+    if query_start_loc is None:
+        return
+
+    for i in range(runner.input_batch.num_reqs):
+        req_id = runner.input_batch.req_ids[i]
+        req_state = runner.requests.get(req_id)
+        if req_state is None or req_state.sampling_params is None:
+            continue
+        extra = req_state.sampling_params.extra_args
+        configs = _find_steering_configs(extension, req_id, extra)
+        if not configs:
+            continue
+        start = int(query_start_loc[i].item())
+        end = int(query_start_loc[i + 1].item())
+        state.dirty = max(state.dirty, end)
+        try:
+            for cfg in configs:
+                target = state.add
+                if cfg.norm_match:
+                    # The op multiplies by the stream norm, so store v / ||v||.
+                    # Cached on the vector: this runs on every forward pass.
+                    if not hasattr(cfg, "_unit_copy"):
+                        unit = cfg.activations.float()
+                        unit = unit / (unit.norm(dim=-1, keepdim=True) + 1e-6)
+                        unit_copy = cfg.model_copy(
+                            update={"activations": unit, "norm_match": False}
+                        )
+                        object.__setattr__(cfg, "_unit_copy", unit_copy)
+                    cfg = cfg._unit_copy  # type: ignore[reportAttributeAccessIssue]
+                    target = state.norm
+                for layer_idx, slot in state.slots.items():
+                    # _apply_steering adds to the rows, so vectors on one layer sum.
+                    _apply_steering(
+                        [cfg],
+                        layer_idx,
+                        target[slot],
+                        start,
+                        end,
+                        req_state.num_computed_tokens,
+                        target[slot],
+                    )
+        except Exception:
+            # As in eager mode: a bad vector must not stop the engine.
+            logger.warning("Steering failed for request %s", req_id, exc_info=True)
+            state.add[:, start:end].zero_()
+            state.norm[:, start:end].zero_()
+
+
+def _install_op_hooks(model: Any, op_args: dict[int, int], op: Any) -> None:
+    """Give each layer in ``op_args`` a forward hook that calls ``op`` with its value."""
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    from vllm_lens._worker_ext import _get_layers
+
+    for layer_idx, layer in enumerate(_get_layers(model)):
+        if layer_idx not in op_args or isinstance(layer, PPMissingLayer):
+            continue
+        # A second load_model must not add a second hook.
+        hooked = layer.__dict__.setdefault("_lens_ops", set())
+        if str(op) in hooked:
+            continue
+        hooked.add(str(op))
+
+        # Dynamo traces the hook body, so it is one op call and nothing else.
+        def _hook(
+            module: Any, args: Any, output: Any, op_arg: int = op_args[layer_idx]
+        ) -> None:
+            if isinstance(output, tuple):
+                op(output[0], output[1], op_arg)
+            else:
+                op(output, None, op_arg)
+
+        layer.register_forward_hook(_hook)
+
+
+def _enable_buffer_steering(worker: Any, layers: tuple[int, ...]) -> None:
+    """Allocate the steering buffers and hook the steer op onto ``layers``."""
+    runner = worker.model_runner
+    model = runner.model
+    shape = (
+        len(layers),
+        runner.scheduler_config.max_num_batched_tokens,
+        runner.model_config.get_hidden_size(),
+    )
+    dtype = runner.model_config.dtype
+    device = next(model.parameters()).device
+    slots = {layer: slot for slot, layer in enumerate(layers)}
+    existing = _STEER_STATE.get("buffers")
+    # Kept on a second load_model: a captured CUDA graph reads this address.
+    if (
+        existing is None
+        or existing.slots != slots
+        or existing.add.shape != shape
+        or existing.add.dtype != dtype
+        or existing.add.device != device
+    ):
+        _STEER_STATE["buffers"] = _SteerBuffers(
+            add=torch.zeros(shape, dtype=dtype, device=device),
+            norm=torch.zeros(shape, dtype=dtype, device=device),
+            slots=slots,
+        )
+    _install_op_hooks(model, _STEER_STATE["buffers"].slots, torch.ops.vllm_lens.steer)
+    megabytes = 2 * shape[0] * shape[1] * shape[2] * dtype.itemsize / 2**20
+    logger.info(
+        "Buffer steering enabled for layers %s, %.0f MB", list(layers), megabytes
+    )
 
 
 def _enable_aux_capture(worker: Any, layers: tuple[int, ...]) -> None:
@@ -176,23 +361,25 @@ def install_graph_patches() -> None:
         """Load the model, then enable the paths this engine's config names."""
         result = original_load_model(self, *args, **kwargs)
         config = LensGraphConfig.from_vllm_config(self.vllm_config)
-        if not config.capture_layers:
+        named = (*config.capture_layers, *config.steer_layers)
+        if not named:
             return result
         if not hasattr(self, "_reset_state"):
             raise RuntimeError(
-                "VLLM_LENS_CAPTURE_LAYERS needs the vllm-lens worker extension, but "
-                "worker_extension_cls names another class."
+                "The VLLM_LENS_*_LAYERS variables need the vllm-lens worker extension, "
+                "but worker_extension_cls names another class."
             )
         n_layers = len(_get_layers(self.model_runner.model))
-        outside = [
-            layer for layer in config.capture_layers if not 0 <= layer < n_layers
-        ]
+        outside = [layer for layer in named if not 0 <= layer < n_layers]
         if outside:
             raise ValueError(
-                f"VLLM_LENS_CAPTURE_LAYERS names layer(s) {outside}, but the model "
-                f"has layers 0..{n_layers - 1}."
+                f"The VLLM_LENS_*_LAYERS variables name layer(s) {outside}, but the "
+                f"model has layers 0..{n_layers - 1}."
             )
-        _enable_aux_capture(self, config.capture_layers)
+        if config.capture_layers:
+            _enable_aux_capture(self, config.capture_layers)
+        if config.steer_layers:
+            _enable_buffer_steering(self, config.steer_layers)
         self.model_runner._lens_extension = self
         self.model_runner._lens_graph_config = config
         # No request-level forward hooks: they cannot serve requests here.
@@ -201,12 +388,15 @@ def install_graph_patches() -> None:
         return result
 
     def _model_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
-        """Run the forward pass, then store the rows the requests asked for."""
-        out = original_model_forward(self, *args, **kwargs)
+        """Fill the steering buffers, run the forward pass, store the captured rows."""
         extension = getattr(self, "_lens_extension", None)
+        if extension is None:
+            return original_model_forward(self, *args, **kwargs)
+        if self._lens_graph_config.steer_layers:
+            _fill_steer_buffers(extension)
+        out = original_model_forward(self, *args, **kwargs)
         if (
-            extension is None
-            or not extension._should_capture
+            not extension._should_capture
             or not isinstance(out, tuple)
             or len(out) != 2
             or not isinstance(out[1], list)

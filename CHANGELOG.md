@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Examples: Added a test that runs the activation oracle example in eager mode and under CUDA graphs.
+- Steering: Added `VLLM_LENS_STEER_LAYERS`. `apply_steering_vectors` on the named layers is applied by an op inside the compiled graph that reads buffers the plugin fills before each forward pass, so steering works with compilation and CUDA graphs on.
 - Capture: Added `VLLM_LENS_CAPTURE_LAYERS`. The named layers are captured as auxiliary hidden states of the model, so `output_residual_stream` works with compilation and CUDA graphs on.
 - Plugin: Added the `VLLM_LENS_CUDAGRAPH=1` environment variable. The plugin then does not force `enforce_eager=True`, and a request that needs the forward hooks fails with an error in place of returning nothing.
 - Plugin: `register()` now attaches a stderr handler to the `vllm_lens` logger when it has none, so the package's INFO records are no longer dropped. `VLLM_LENS_LOG_LEVEL` sets the level (default `INFO`).
