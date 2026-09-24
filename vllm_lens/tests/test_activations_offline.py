@@ -4,7 +4,7 @@ import pytest
 import torch
 from vllm import LLM, SamplingParams
 
-from .conftest import LAYER_IDX, MODEL_NAME, NUM_LAYERS, PROMPT, PROMPTS
+from .conftest import LAYER_IDX, MODEL_NAME, NUM_LAYERS, PROMPT, PROMPTS, row_error
 
 # Layers straddling the PP=2 stage boundary (stage 0 = [0, NUM_LAYERS//2)),
 # so the per-request cross-rank concat in _merge_captured_states_batch is
@@ -78,11 +78,12 @@ def _get_vllm_acts(llm: LLM, prompts: list[str], max_tokens: int) -> list[torch.
 
 
 def _assert_close(vllm_acts: torch.Tensor, hf_acts: torch.Tensor):
+    """The bf16 kernels of vLLM and Transformers differ by up to 1.6% per row on PROMPTS."""
     assert vllm_acts.shape == hf_acts.shape, (
         f"Shape mismatch: vLLM {vllm_acts.shape} vs HF {hf_acts.shape}"
     )
-    mean_abs_diff = (vllm_acts - hf_acts.to(vllm_acts.device)).abs().mean().item()
-    assert mean_abs_diff < 1e-2, f"Mean abs diff too large: {mean_abs_diff:.6f}"
+    error = row_error(vllm_acts, hf_acts.to(vllm_acts.device))
+    assert error < 3e-2, f"Largest per-row relative error too large: {error:.6f}"
 
 
 class TestOfflineMatchesTransformers:
