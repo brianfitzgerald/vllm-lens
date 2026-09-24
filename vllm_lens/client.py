@@ -33,15 +33,19 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import requests
 
 from vllm_lens._helpers._serialize import (
     decode_activations,
     deserialize_hook_results,
+    serialize_tensor,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -103,6 +107,7 @@ class VLLMLensClient:
         activations_transport: str | None = None,
         capture_qk: list[int] | bool | None = None,
         capture_pool: Literal["last", "mean"] | None = None,
+        capture_project: torch.Tensor | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
@@ -113,6 +118,10 @@ class VLLMLensClient:
             xargs["output_qk"] = json.dumps(capture_qk)
         if capture_pool is not None:
             xargs["output_residual_stream_pool"] = capture_pool
+        if capture_project is not None:
+            xargs["output_residual_stream_project"] = json.dumps(
+                serialize_tensor(capture_project.float())
+            )
         if hooks is not None:
             xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
         if steering_vectors is not None:
@@ -173,6 +182,7 @@ class VLLMLensClient:
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         capture_pool: Literal["last", "mean"] | None = None,
+        capture_project: torch.Tensor | None = None,
         logprobs: int | None = None,
         echo: bool = False,
         **kwargs: Any,
@@ -209,6 +219,7 @@ class VLLMLensClient:
             activations_transport,
             capture_qk,
             capture_pool,
+            capture_project,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -230,6 +241,7 @@ class VLLMLensClient:
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         capture_pool: Literal["last", "mean"] | None = None,
+        capture_project: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> GenerateOutput:
         """Generate a chat completion from a list of messages.
@@ -258,6 +270,7 @@ class VLLMLensClient:
             activations_transport,
             capture_qk,
             capture_pool,
+            capture_project,
         )
         if xargs:
             body["vllm_xargs"] = xargs

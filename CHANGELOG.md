@@ -7,6 +7,7 @@
 - Capture: Added `VLLM_LENS_CAPTURE_LAYERS`. The named layers are captured as auxiliary hidden states of the model, so `output_residual_stream` works with compilation and CUDA graphs on.
 - Examples: Added a test that runs the activation oracle example in eager mode and under CUDA graphs.
 - Steering: Added `VLLM_LENS_STEER_LAYERS`. `apply_steering_vectors` on the named layers is applied by an op inside the compiled graph that reads buffers the plugin fills before each forward pass, so steering works with compilation and CUDA graphs on.
+- Capture: Added `output_residual_stream_project` (`capture_project` on the client). The worker returns the projection of every position onto `(N, hidden)` directions and the norm of every position, in float32, in place of the residual, so a long prompt ships N + 1 values per position in place of `hidden`.
 
 ## v1.3.0 (2 October 2026)
 

@@ -86,16 +86,17 @@ class LensGraphConfig:
         residual_stream: Any,
         steering_layers: set[int],
         hooks: list[Hook],
+        qk: bool = False,
     ) -> None:
         """Raise ``ValueError`` for a request that this CUDA-graph server cannot serve.
-        The arguments are the request's capture value, steering layers and hooks."""
+        The arguments are the request's capture value, steering layers, hooks, Q/K flag."""
         if not self.enabled:
             return
-        if hooks:
+        if hooks or qk:
             raise ValueError(
                 "VLLM_LENS_CUDAGRAPH is set, so the vllm-lens forward hooks do not "
-                "run: hooks are not available. Unset VLLM_LENS_CUDAGRAPH to serve "
-                "this request in eager mode."
+                "run: hooks and Q/K capture are not available. Unset "
+                "VLLM_LENS_CUDAGRAPH to serve this request in eager mode."
             )
         unsteered = sorted(steering_layers - set(self.steer_layers))
         if unsteered:

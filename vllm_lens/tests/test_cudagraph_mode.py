@@ -56,11 +56,12 @@ def test_plain_generation_works(graph_llm):
                 SteeringVector(activations=torch.zeros(1, 8), layer_indices=[LAYER_IDX])
             ]
         },
+        {"output_qk": [LAYER_IDX]},
     ],
-    ids=["capture", "steering"],
+    ids=["capture", "steering", "qk"],
 )
 def test_hook_requests_are_rejected(graph_llm, extra_args):
-    """Capture and steering need the forward hooks, so they raise."""
+    """Capture, steering and Q/K capture need the forward hooks, so they raise."""
     params = SamplingParams(max_tokens=1, extra_args=extra_args)
     with pytest.raises(ValueError, match="VLLM_LENS_CUDAGRAPH"):
         graph_llm.generate([PROMPT], params)
