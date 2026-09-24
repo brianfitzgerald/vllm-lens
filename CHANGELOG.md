@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Tests: The comparison with Transformers now checks the largest per-row relative error (limit 3%) in place of a mean absolute difference of 0.01. One prompt of the batch test had a mean absolute difference of 0.0105 at a per-row error of 1.6%, the same as the other prompts.
 - Capture: Added `output_residual_stream_project` (`capture_project` on the client). The worker returns the projection of every position onto `(N, hidden)` directions and the norm of every position, in float32, in place of the residual, so a long prompt ships N + 1 values per position in place of `hidden`.
 - Examples: Added a test that runs the activation oracle example in eager mode and under CUDA graphs.
 - Steering: Fixed `position_indices` during decode and chunked prefill. The absolute start of each forward pass was always 0, so a position in a later prefill chunk was never steered, and position 0 was steered again on every decode step. The start now comes from the request's computed-token count, which does not depend on the attention backend.

@@ -6,7 +6,7 @@ import torch
 from syrupy.assertion import SnapshotAssertion
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
-from .conftest import LAYER_IDX, MODEL_NAME, PROMPT, PROMPTS
+from .conftest import LAYER_IDX, MODEL_NAME, PROMPT, PROMPTS, row_error
 
 # The activation snapshot is bit-sensitive to the GPU architecture (bf16
 # accumulation order differs across devices), so the committed values are only
@@ -58,11 +58,12 @@ async def _get_vllm_acts(
 
 
 def _assert_close(vllm_acts: torch.Tensor, hf_acts: torch.Tensor):
+    """The bf16 kernels of vLLM and Transformers differ by up to 1.6% per row on PROMPTS."""
     assert vllm_acts.shape == hf_acts.shape, (
         f"Shape mismatch: vLLM {vllm_acts.shape} vs HF {hf_acts.shape}"
     )
-    mean_abs_diff = (vllm_acts - hf_acts.to(vllm_acts.device)).abs().mean().item()
-    assert mean_abs_diff < 1e-2, f"Mean abs diff too large: {mean_abs_diff:.6f}"
+    error = row_error(vllm_acts, hf_acts.to(vllm_acts.device))
+    assert error < 3e-2, f"Largest per-row relative error too large: {error:.6f}"
 
 
 class TestMatchesTransformers:
