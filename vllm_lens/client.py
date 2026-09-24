@@ -41,6 +41,7 @@ import torch
 from vllm_lens._helpers._serialize import (
     deserialize_hook_results,
     deserialize_tensor,
+    serialize_tensor,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
 
@@ -102,12 +103,17 @@ class VLLMLensClient:
         capture_layers: list[int] | None,
         steering_vectors: list[SteeringVector] | None,
         capture_pool: Literal["last", "mean"] | None,
+        capture_project: torch.Tensor | None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
             xargs["output_residual_stream"] = json.dumps(capture_layers)
         if capture_pool is not None:
             xargs["output_residual_stream_pool"] = capture_pool
+        if capture_project is not None:
+            xargs["output_residual_stream_project"] = json.dumps(
+                serialize_tensor(capture_project.float())
+            )
         if hooks is not None:
             xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
         if steering_vectors is not None:
@@ -156,6 +162,7 @@ class VLLMLensClient:
         capture_layers: list[int] | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         capture_pool: Literal["last", "mean"] | None = None,
+        capture_project: torch.Tensor | None = None,
         logprobs: int | None = None,
         echo: bool = False,
         **kwargs: Any,
@@ -176,7 +183,9 @@ class VLLMLensClient:
         if echo:
             body["echo"] = True
 
-        xargs = self._build_xargs(hooks, capture_layers, steering_vectors, capture_pool)
+        xargs = self._build_xargs(
+            hooks, capture_layers, steering_vectors, capture_pool, capture_project
+        )
         if xargs:
             body["vllm_xargs"] = xargs
 
@@ -195,6 +204,7 @@ class VLLMLensClient:
         capture_layers: list[int] | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         capture_pool: Literal["last", "mean"] | None = None,
+        capture_project: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> GenerateOutput:
         """Generate a chat completion from a list of messages.
@@ -215,7 +225,9 @@ class VLLMLensClient:
             **kwargs,
         }
 
-        xargs = self._build_xargs(hooks, capture_layers, steering_vectors, capture_pool)
+        xargs = self._build_xargs(
+            hooks, capture_layers, steering_vectors, capture_pool, capture_project
+        )
         if xargs:
             body["vllm_xargs"] = xargs
 

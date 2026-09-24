@@ -1,10 +1,13 @@
 """Tests for capture under CUDA graphs via ``VLLM_LENS_CAPTURE_LAYERS``."""
 
 import gc
+import json
 
 import pytest
 import torch
 from vllm import LLM, SamplingParams
+
+from vllm_lens._helpers._serialize import serialize_tensor
 
 from .conftest import NUM_LAYERS, PROMPT, make_llm
 
@@ -41,14 +44,32 @@ def graph_llm(request):
 
 
 def _capture(engine: LLM, layers: list[int] | bool, pool: str | None, max_tokens: int):
-    """Capture ``layers`` for the short and the long prompt."""
+    """Capture ``layers`` for the short and the long prompt. With ``pool="project"`` each
+    position is its projection on two fixed directions and its norm."""
     extra_args: dict = {"output_residual_stream": layers}
-    if pool is not None:
+    if pool == "project":
+        hidden = engine.llm_engine.vllm_config.model_config.get_hidden_size()
+        directions = torch.randn(2, hidden, generator=torch.Generator().manual_seed(0))
+        extra_args["output_residual_stream_project"] = json.dumps(
+            serialize_tensor(directions)
+        )
+    elif pool is not None:
         extra_args["output_residual_stream_pool"] = pool
     params = SamplingParams(
         temperature=0.0, max_tokens=max_tokens, extra_args=extra_args
     )
     outputs = engine.generate([PROMPT, LONG_PROMPT], params)
+    if pool == "project":
+        return [
+            torch.cat(
+                [
+                    out.activations["residual_stream_projection"],  # type: ignore[reportAttributeAccessIssue]
+                    out.activations["residual_stream_norm"].unsqueeze(-1),  # type: ignore[reportAttributeAccessIssue]
+                ],
+                dim=-1,
+            )
+            for out in outputs
+        ]
     return [out.activations["residual_stream"] for out in outputs]  # type: ignore[reportAttributeAccessIssue]
 
 
@@ -65,7 +86,7 @@ def _relative_errors(actual: torch.Tensor, expected: torch.Tensor) -> list[float
     return (diff / expected.float().flatten(1).norm(dim=1)).tolist()
 
 
-@pytest.mark.parametrize("pool", [None, "last", "mean"])
+@pytest.mark.parametrize("pool", [None, "last", "mean", "project"])
 def test_aux_capture_matches_the_forward_hooks(eager_llm, aux_eager_llm, pool):
     """With the same kernels, aux capture returns the rows the forward hooks return."""
     hooks = _capture(eager_llm, CAPTURE_LAYERS, pool, 4)
@@ -85,6 +106,22 @@ def test_graph_capture_matches_eager_capture(eager_llm, graph_llm, pool, max_tok
     for eager_acts, graph_acts in zip(eager, graph):
         errors = _relative_errors(graph_acts, eager_acts)
         assert max(errors) < 5e-2, f"relative error per layer: {errors}"
+
+
+@pytest.mark.parametrize("max_tokens", [1, 4])
+def test_graph_projection_matches_the_graph_capture(graph_llm, max_tokens):
+    """Under CUDA graphs the projected capture is the projection of the full capture."""
+    hidden = graph_llm.llm_engine.vllm_config.model_config.get_hidden_size()
+    directions = torch.randn(2, hidden, generator=torch.Generator().manual_seed(0))
+    full = _capture(graph_llm, CAPTURE_LAYERS, None, max_tokens)
+    projected = _capture(graph_llm, CAPTURE_LAYERS, "project", max_tokens)
+    for full_acts, projected_acts in zip(full, projected):
+        rows = full_acts.float()
+        expected = torch.cat(
+            [rows @ directions.T, rows.norm(dim=-1, keepdim=True)], dim=-1
+        )
+        errors = _relative_errors(projected_acts, expected)
+        assert max(errors) < 1e-4, f"relative error per layer: {errors}"
 
 
 def test_a_subset_of_the_capture_layers(eager_llm, graph_llm):

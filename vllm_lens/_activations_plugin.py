@@ -25,6 +25,7 @@ import zstandard as zstd
 
 from vllm_lens._cudagraph import LensGraphConfig, install_graph_patches
 from vllm_lens._helpers._serialize import (
+    deserialize_directions,
     serialize_activations,
     serialize_hook_results,
 )
@@ -122,8 +123,10 @@ def _merge_captured_states(
         return None
     if len(parts) == 1:
         return parts[0]["activations"]
-    merged = torch.cat([p["activations"]["residual_stream"] for p in parts], dim=0)
-    return {"residual_stream": merged}
+    return {
+        key: torch.cat([p["activations"][key] for p in parts], dim=0)
+        for key in parts[0]["activations"]
+    }
 
 
 def _merge_captured_states_batch(
@@ -159,11 +162,10 @@ def _merge_captured_states_batch(
         if len(per_rank) == 1:
             out[req_id] = per_rank[0]["activations"]
         else:
-            merged = torch.cat(
-                [p["activations"]["residual_stream"] for p in per_rank],
-                dim=0,
-            )
-            out[req_id] = {"residual_stream": merged}
+            out[req_id] = {
+                key: torch.cat([p["activations"][key] for p in per_rank], dim=0)
+                for key in per_rank[0]["activations"]
+            }
     return out
 
 
@@ -197,12 +199,31 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
     return [h if isinstance(h, Hook) else Hook.model_validate(h) for h in value]
 
 
-def _validate_pool(extra: dict[str, Any]) -> None:
-    """Raise ``ValueError`` for an unknown ``output_residual_stream_pool``."""
+def _validate_capture(extra: dict[str, Any], hidden: int) -> None:
+    """Raise ``ValueError`` for an unknown ``output_residual_stream_pool``, or for
+    ``output_residual_stream_project`` directions that are not finite ``(N, hidden)``."""
     pool = extra.get("output_residual_stream_pool")
     if pool is not None and pool not in ("last", "mean"):
         raise ValueError(
             f"output_residual_stream_pool must be 'last' or 'mean', got {pool!r}"
+        )
+    project = extra.get("output_residual_stream_project")
+    if project is None:
+        return
+    if pool is not None:
+        raise ValueError(
+            "output_residual_stream_project cannot be combined with "
+            "output_residual_stream_pool"
+        )
+    directions = deserialize_directions(project)
+    if (
+        directions.ndim != 2
+        or directions.shape[1] != hidden
+        or not torch.isfinite(directions).all()
+    ):
+        raise ValueError(
+            f"output_residual_stream_project must be finite (N, {hidden}), "
+            f"got {tuple(directions.shape)}"
         )
 
 
@@ -221,9 +242,14 @@ def _trim_activations(
     during that extra pass.  This trims the surplus positions so the
     residual stream shape is always deterministic.
     """
-    rs = activations.get("residual_stream")
-    if rs is not None and rs.shape[1] > expected_len:
-        activations["residual_stream"] = rs[:, :expected_len, :]
+    for key in (
+        "residual_stream",
+        "residual_stream_projection",
+        "residual_stream_norm",
+    ):
+        rs = activations.get(key)
+        if rs is not None and rs.shape[1] > expected_len:
+            activations[key] = rs[:, :expected_len]
     ids = activations.get("input_ids")
     if ids is not None and len(ids) > expected_len:
         activations["input_ids"] = ids[:expected_len]
@@ -317,7 +343,7 @@ async def _patched_generate(
 
     extra = effective_params.extra_args or {}
     wants_activations = extra.get("output_residual_stream") is not None
-    _validate_pool(extra)
+    _validate_capture(extra, self.vllm_config.model_config.get_hidden_size())
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
     # When arriving via the OpenAI API (vllm_xargs), complex values
@@ -428,8 +454,9 @@ def _prepare_offline_params(
     else:
         params_list = []
 
+    hidden = self.llm_engine.vllm_config.model_config.get_hidden_size()
     for sp in params_list:
-        _validate_pool(sp.extra_args or {})
+        _validate_capture(sp.extra_args or {}, hidden)
 
     wants_activations = any(
         (sp.extra_args or {}).get("output_residual_stream") is not None
