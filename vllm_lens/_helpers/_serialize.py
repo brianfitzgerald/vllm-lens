@@ -81,6 +81,13 @@ def deserialize_tensor(d: dict[str, Any]) -> torch.Tensor:
     return t
 
 
+def deserialize_directions(value: str | dict[str, Any]) -> torch.Tensor:
+    """Decode an ``output_residual_stream_project`` value to float32 directions."""
+    return deserialize_tensor(
+        json.loads(value) if isinstance(value, str) else value
+    ).float()
+
+
 def serialize_activations(tensor_dict: dict[str, Any]) -> dict[str, Any]:
     """Convert a flat dict of torch tensors to a JSON-serializable form.
 

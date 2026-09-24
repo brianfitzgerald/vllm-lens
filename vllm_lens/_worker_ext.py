@@ -24,6 +24,7 @@ import zstandard as zstd
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.models.utils import PPMissingLayer
 
+from vllm_lens._helpers._serialize import deserialize_directions
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
@@ -356,9 +357,20 @@ def _capture_rows(
             )
             continue
 
-        activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
-            start:end
-        ].cpu()
+        rows = hidden_states[start:end]
+        project = extra.get("output_residual_stream_project")
+        if project is None:
+            activation = rows.cpu()
+        else:
+            # Each position is stored as its N projections and its norm, in float32.
+            directions = extension._projections.get(req_id)
+            if directions is None:
+                directions = deserialize_directions(project).to(rows.device)
+                extension._projections[req_id] = directions
+            rows = rows.float()
+            activation = torch.cat(
+                [rows @ directions.T, rows.norm(dim=-1, keepdim=True)], dim=1
+            ).cpu()
 
         if req_id not in extension._captured_states:
             extension._captured_states[req_id] = {}
@@ -686,6 +698,8 @@ class HiddenStatesExtension:
     # Pooled capture: ``_captured_states`` holds one float32 sum row per layer.
     # internal_req_id -> { layer_idx -> (row count, capture dtype, end of pooled positions) }
     _pooled_counts: dict[str, dict[int, tuple[int, torch.dtype, int]]] = {}
+    # Projected capture: internal_req_id -> float32 directions (N, hidden) on the device.
+    _projections: dict[str, torch.Tensor] = {}
     _hooks_installed: bool = False
 
     # Per-request steering configs:
@@ -719,6 +733,7 @@ class HiddenStatesExtension:
         # set_persistent_hooks() before the first generate call.
         self._captured_states = {}
         self._pooled_counts = {}
+        self._projections = {}
         self._steering_data = {}
         self._hook_data = {}
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
@@ -812,6 +827,7 @@ class HiddenStatesExtension:
             if req_id.startswith(prefix):
                 del self._captured_states[req_id]
                 self._pooled_counts.pop(req_id, None)
+                self._projections.pop(req_id, None)
                 logger.debug("Cleared leaked activations for %s", req_id)
 
     def _build_payload(
@@ -821,7 +837,8 @@ class HiddenStatesExtension:
 
         Pops the entry from ``_captured_states`` so successive calls do not
         re-emit the same data. A pooled capture is divided by its row count
-        and cast to the capture dtype, which gives one row per layer. Shared
+        and cast to the capture dtype, which gives one row per layer. A projected
+        capture is split into its projections and norms. Shared
         by :meth:`get_captured_states` and :meth:`get_captured_states_batch`.
         """
         layer_dict = self._captured_states.pop(internal_req_id)
@@ -841,6 +858,13 @@ class HiddenStatesExtension:
         )
         if stacked.is_cuda:
             stacked = stacked.cpu()
+        if self._projections.pop(internal_req_id, None) is not None:
+            return {
+                "activations": {
+                    "residual_stream_projection": stacked[..., :-1].clone(),
+                    "residual_stream_norm": stacked[..., -1].clone(),
+                }
+            }
         return {"activations": {"residual_stream": stacked}}
 
     def get_captured_states(self, external_req_id: str) -> bytes | None:
@@ -861,6 +885,15 @@ class HiddenStatesExtension:
                 "activations": {
                     # (n_layers, total_pos, d_model); total_pos is 1 when pooled
                     "residual_stream": Tensor,
+                }
+            }
+
+        or, with ``output_residual_stream_project``::
+
+            {
+                "activations": {
+                    "residual_stream_projection": Tensor,  # (n_layers, total_pos, N)
+                    "residual_stream_norm": Tensor,  # (n_layers, total_pos)
                 }
             }
 
