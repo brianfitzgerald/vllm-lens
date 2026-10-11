@@ -15,13 +15,14 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 import pytest
 import ray
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+# VLLM_TEST_MODEL runs the suite on another model, such as google/gemma-2-2b-it.
+MODEL_NAME = os.environ.get("VLLM_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 # Compare implementations in FP32; functional/intervention tests retain BF16.
 REFERENCE_DTYPE = "float32"
 LAYER_IDX = 2
-NUM_LAYERS = 24
+NUM_LAYERS = AutoConfig.from_pretrained(MODEL_NAME).num_hidden_layers
 PROMPT = "The future of AI is"
 PROMPTS = [
     "The future of AI is",

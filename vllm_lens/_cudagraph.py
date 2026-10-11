@@ -343,12 +343,14 @@ def install_graph_patches() -> None:
     if getattr(Worker.load_model, "_lens_patched", False):
         return
 
+    from vllm_lens._aux_models import install_gemma2_aux_hidden_states
     from vllm_lens._worker_ext import (
         _batch_layout,
         _capture_rows,
         _get_total_num_layers,
     )
 
+    install_gemma2_aux_hidden_states()
     original_load_model = Worker.load_model
     original_model_forward = GPUModelRunner._model_forward
 

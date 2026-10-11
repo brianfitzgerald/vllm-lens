@@ -92,7 +92,7 @@ VLLM_LENS_CAPTURE_LAYERS=15,20 vllm serve meta-llama/Llama-3.1-8B-Instruct
 
 The model returns these layers as auxiliary hidden states (the interface EAGLE3 uses), so they are outputs of the CUDA graph. The response format does not change, and `output_residual_stream_pool` and `output_residual_stream_project` work. A request must name its layers: a layer that is not in the list, or `output_residual_stream=True` (all layers), fails with an error. Limits:
 
-- The model must implement `set_aux_hidden_state_layers`.
+- The model must implement `set_aux_hidden_state_layers` (vLLM's Llama, Qwen2 and Qwen3 do). The plugin adds it to Gemma2.
 - Pipeline parallelism is not supported for capture through `VLLM_LENS_CAPTURE_LAYERS`.
 - Speculative decoding is not supported: EAGLE3 sets the same auxiliary layers.
 - vLLM 0.18 or later: earlier versions number the auxiliary layers differently.
