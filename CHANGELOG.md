@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Capture: Gemma2 returns auxiliary hidden states, so `VLLM_LENS_CAPTURE_LAYERS` serves it. vLLM's `Gemma2Model` has no `set_aux_hidden_state_layers`; the plugin adds the method and the aux outputs to the class at register, before the model is built and compiled. The unit tests read `VLLM_TEST_MODEL`.
 - Capture: Added `output_residual_stream_project` (`capture_project` on the client). The worker returns the projection of every position onto `(N, hidden)` directions and the norm of every position, in float32, in place of the residual, so a long prompt ships N + 1 values per position in place of `hidden`.
 - Examples: Added a test that runs the activation oracle example in eager mode and under CUDA graphs.
 - Steering: Added `VLLM_LENS_STEER_LAYERS`. `apply_steering_vectors` on the named layers is applied by an op inside the compiled graph that reads buffers the plugin fills before each forward pass, so steering works with compilation and CUDA graphs on.
