@@ -137,10 +137,11 @@ class _SteerBuffers:
     slots: dict[int, int]
     # Rows below this index can be nonzero; all other rows are zero.
     dirty: int = 0
-    # The table row of every token of the step, ``[max_tokens]``: a pinned staging copy
-    # and its device copy, so the fill never waits for the stream.
+    # The table row of every token of the step, ``[max_tokens]``: a pinned staging copy and
+    # its device copy; the event marks the copy, so the next step does not overwrite it early.
     index_cpu: torch.Tensor | None = None
     index_gpu: torch.Tensor | None = None
+    index_event: torch.cuda.Event | None = None
     # ``[capacity, n_steered, hidden]`` each, grown by doubling; ``free`` holds released rows.
     table_add: torch.Tensor | None = None
     table_norm: torch.Tensor | None = None
@@ -254,41 +255,31 @@ def _fill_steer_buffers(extension: Any) -> None:
     else:
         bounds = np.asarray(query_start_loc[: num_reqs + 1].tolist(), dtype=np.int64)
 
-    # The table row of each request, cached by request id: a request resolves its key
-    # once and the per-step loop is one dictionary lookup per request.
-    cache: dict[str, int] = extension._req_rows
+    # Each request resolves its key and row by dictionary lookups every step, so a request
+    # id that vLLM reuses, or a key whose vectors were replaced, never keeps a stale row.
     rows: list[int] = []
     positional: list[int] = []
     for i in range(num_reqs):
         req_id = runner.input_batch.req_ids[i]
-        row = cache.get(req_id)
-        if row is None:
-            row = 0
-            req_state = runner.requests.get(req_id)
-            if req_state is not None and req_state.sampling_params is not None:
-                key = _steering_key(
-                    extension, req_id, req_state.sampling_params.extra_args
-                )
-                if key is not None and key not in extension._steer_rows:
+        row = 0
+        req_state = runner.requests.get(req_id)
+        if req_state is not None and req_state.sampling_params is not None:
+            key = _steering_key(extension, req_id, req_state.sampling_params.extra_args)
+            if key is not None:
+                row = extension._steer_rows.get(key)
+                if row is None:
                     try:
-                        extension._steer_rows[key] = state.allocate(
-                            extension._steering_data[key]
-                        )
+                        row = state.allocate(extension._steering_data[key])
                     except Exception:
                         # As in eager mode: a bad vector must not stop the engine.
                         logger.warning(
                             "Steering failed for request %s", req_id, exc_info=True
                         )
-                        extension._steer_rows[key] = 0
-                if key is not None:
-                    row = extension._steer_rows[key]
-            cache[req_id] = row
+                        row = 0
+                    extension._steer_rows[key] = row
         rows.append(row)
         if row < 0:
             positional.append(i)
-    if len(cache) > 4 * max(num_reqs, 1024):
-        for req_id in [r for r in cache if r not in runner.requests]:
-            del cache[req_id]
 
     n_tokens = int(bounds[-1])
     if any(row > 0 for row in rows):
@@ -298,11 +289,17 @@ def _fill_steer_buffers(extension: Any) -> None:
         if state.index_cpu is None or state.index_gpu is None:
             index = torch.from_numpy(token_rows).to(state.add.device)
         else:
-            # A pageable copy would wait for every kernel queued before it.
+            # A pageable copy would wait for every kernel queued before it; the event
+            # waits only for the last step's copy, which may still be queued under
+            # async scheduling, before the pinned rows are overwritten.
+            if state.index_event is not None:
+                state.index_event.synchronize()
             state.index_cpu[:n_tokens].numpy()[:] = token_rows
             state.index_gpu[:n_tokens].copy_(
                 state.index_cpu[:n_tokens], non_blocking=True
             )
+            if state.index_event is not None:
+                state.index_event.record()
             index = state.index_gpu[:n_tokens]
         # (n_tokens, n_slots, hidden) -> (n_slots, n_tokens, hidden)
         state.add[:, :n_tokens] = state.table_add[index].permute(1, 0, 2)
@@ -402,6 +399,7 @@ def _enable_buffer_steering(worker: Any, layers: tuple[int, ...]) -> None:
             slots=slots,
             index_cpu=torch.zeros(shape[1], dtype=torch.int64, pin_memory=pinned),
             index_gpu=torch.zeros(shape[1], dtype=torch.int64, device=device),
+            index_event=torch.cuda.Event() if pinned else None,
         )
     _install_op_hooks(model, _STEER_STATE["buffers"].slots, torch.ops.vllm_lens.steer)
     megabytes = 2 * shape[0] * shape[1] * shape[2] * dtype.itemsize / 2**20
