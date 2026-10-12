@@ -79,8 +79,9 @@ def test_projected_capture_matches_the_full_capture(llm, max_tokens):
         assert ((norms - full.norm(dim=-1)).norm() / full.norm()).item() < 1e-4
 
 
-def _extension(extra: dict, first: int) -> SimpleNamespace:
-    """A worker with one request whose next forward step starts at ``first``."""
+def _extension(extra: dict, first: int, directions: torch.Tensor) -> SimpleNamespace:
+    """A worker holding ``directions`` under the id ``dirs``, with one request whose next
+    forward step starts at ``first``."""
     request = SimpleNamespace(
         sampling_params=SimpleNamespace(extra_args=extra),
         num_computed_tokens=first,
@@ -91,7 +92,11 @@ def _extension(extra: dict, first: int) -> SimpleNamespace:
         requests={"req": request},
     )
     return SimpleNamespace(
-        model_runner=runner, _captured_states={}, _pooled_counts={}, _projections={}
+        model_runner=runner,
+        _captured_states={},
+        _pooled_counts={},
+        _projections={},
+        _direction_tables={"dirs": directions},
     )
 
 
@@ -106,11 +111,7 @@ def test_each_step_is_projected_in_order(schedule):
     stream = torch.randn(11, 8, generator=generator).to(torch.bfloat16)
     directions = torch.randn(2, 8, generator=generator)
     extension = _extension(
-        {
-            "output_residual_stream": [LAYER_IDX],
-            "output_residual_stream_project": _encode(directions),
-        },
-        0,
+        {"output_residual_stream": [LAYER_IDX], "_projection_id": "dirs"}, 0, directions
     )
     for first, n_rows in schedule:
         extension.model_runner.requests["req"].num_computed_tokens = first
@@ -129,6 +130,62 @@ def test_each_step_is_projected_in_order(schedule):
         payload["residual_stream_norm"][0], stream.float().norm(dim=-1)
     )
     assert extension._projections == {}
+
+
+def test_direction_tables_are_shared_and_released():
+    """Two requests with one payload hold one tensor; the last release drops it. No GPU."""
+    worker = HiddenStatesExtension.__new__(HiddenStatesExtension)
+    worker.model_runner = SimpleNamespace(model=torch.nn.Linear(2, 2))  # type: ignore[reportAttributeAccessIssue]
+    worker._direction_tables = {}
+    worker._direction_refs = {}
+    first = _encode(torch.randn(2, 8))
+    second = _encode(torch.randn(3, 8))
+    worker.set_projection_directions("a", first)
+    worker.set_projection_directions_batch({"a": first, "b": second})
+    assert set(worker._direction_tables) == {"a", "b"}
+    assert worker._direction_refs == {"a": 2, "b": 1}
+    assert worker._direction_tables["b"].shape == (3, 8)
+    worker.clear_projection_directions("a")
+    assert set(worker._direction_tables) == {"a", "b"}
+    worker.clear_projection_directions_batch(["a", "b"])
+    assert worker._direction_tables == {} and worker._direction_refs == {}
+    assert worker._debug_direction_table_count() == 0
+
+
+def test_two_direction_sets_share_one_batch(llm):
+    """Many requests with two direction sets project with their own set, and the worker holds
+    no directions after the batch."""
+    hidden = llm.llm_engine.vllm_config.model_config.get_hidden_size()
+    generator = torch.Generator().manual_seed(1)
+    sets = [torch.randn(2, hidden, generator=generator) for _ in range(2)]
+    prompts = [PROMPT, LONG_PROMPT] * 12
+    params = [
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            extra_args={
+                "output_residual_stream": [LAYER_IDX],
+                "output_residual_stream_project": _encode(sets[i % 2]),
+            },
+        )
+        for i in range(len(prompts))
+    ]
+    full = llm.generate(
+        [PROMPT, LONG_PROMPT],
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            extra_args={"output_residual_stream": [LAYER_IDX]},
+        ),
+    )
+    outputs = llm.generate(prompts, params)
+    for i, out in enumerate(outputs):
+        expected = full[i % 2].activations["residual_stream"].float() @ sets[i % 2].T  # type: ignore[reportAttributeAccessIssue]
+        scores = out.activations["residual_stream_projection"]  # type: ignore[reportAttributeAccessIssue]
+        assert ((scores - expected).norm() / expected.norm()).item() < 1e-4, (
+            f"request {i}"
+        )
+    assert llm.collective_rpc("_debug_direction_table_count") == [0]
 
 
 @pytest.mark.parametrize(
