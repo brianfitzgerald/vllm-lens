@@ -129,9 +129,8 @@ class LensGraphConfig:
 
 @dataclass
 class _SteerBuffers:
-    """The steering buffers of one worker, ``[n_steered, max_tokens, hidden]`` each.
-    ``add`` rows are added as they are; ``norm`` rows are unit rows for ``norm_match``.
-    Each stored request owns a row of ``table_add`` and ``table_norm``; row 0 is zero."""
+    """The per-token steering buffers of one worker, ``[n_steered, max_tokens, hidden]`` each,
+    and the per-request tables they are gathered from; ``norm`` holds unit rows, row 0 is zero."""
 
     add: torch.Tensor
     norm: torch.Tensor
@@ -204,8 +203,8 @@ _STEER_STATE: dict[str, _SteerBuffers] = {}
 def _steer(
     hidden_states: torch.Tensor, residual: torch.Tensor | None, slot: int
 ) -> None:
-    """Add this layer's buffer rows to the stream. Zero rows change nothing.
-    The op has no branch, so it is traced into the graph with no graph boundary."""
+    """Add this layer's buffer rows to the stream; zero rows change nothing. The op is opaque
+    to the compiler, so it sits inside the graph without a graph boundary."""
     state = _STEER_STATE.get("buffers")
     if state is None:
         return
@@ -234,9 +233,8 @@ def _steer_fake(
 
 
 def _fill_steer_buffers(extension: Any) -> None:
-    """Write the steering rows of each request, before the forward pass reads them.
-    Every token of the step takes its request's table row (row 0 steers nothing), in one
-    gather per buffer; position-specific vectors are written after it, per request."""
+    """Write every token's steering rows before the forward pass: one gather per buffer from
+    the request table (row 0 steers nothing), then the position-specific vectors per request."""
     from vllm_lens._worker_ext import _apply_steering, _batch_layout, _steering_key
 
     state = _STEER_STATE["buffers"]
@@ -248,8 +246,8 @@ def _fill_steer_buffers(extension: Any) -> None:
     if query_start_loc is None or not extension._steering_data:
         return
     num_reqs = runner.input_batch.num_reqs
-    # vLLM fills a pinned CPU copy of the layout before the forward pass, so
-    # reading it needs no host sync; an older runner costs one sync per step.
+    # vLLM 0.21 fills a pinned CPU copy of the layout before the forward pass, so
+    # reading it needs no host sync; a runner without it costs one sync per step.
     layout = getattr(runner, "query_start_loc", None)
     if layout is not None and hasattr(layout, "np"):
         bounds = layout.np[: num_reqs + 1].astype(np.int64)
