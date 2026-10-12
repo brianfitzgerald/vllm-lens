@@ -986,8 +986,7 @@ class HiddenStatesExtension:
     # Pooled capture: ``_captured_states`` holds one float32 sum row per layer.
     # internal_req_id -> { layer_idx -> (row count, capture dtype, end of pooled positions) }
     _pooled_counts: dict[str, dict[int, tuple[int, torch.dtype, int]]] = {}
-    # Projected capture: internal_req_id -> its float32 directions (N, hidden) on the device,
-    # a reference into ``_direction_tables``.
+    # Projected capture: internal_req_id -> its (N, hidden) directions, shared from the tables.
     _projections: dict[str, torch.Tensor] = {}
     # Direction sets by payload hash, and the number of requests holding each.
     _direction_tables: dict[str, torch.Tensor] = {}
@@ -1201,14 +1200,8 @@ class HiddenStatesExtension:
     def _build_payload(
         self, internal_req_id: str
     ) -> dict[str, dict[str, "Float[torch.Tensor, 'n_layers total_pos hidden_dim']"]]:  # type: ignore[reportUndefinedVariable]
-        """Materialise the stacked-tensor payload for one internal request id.
-
-        Pops the entry from ``_captured_states`` so successive calls do not
-        re-emit the same data. A pooled capture is divided by its row count
-        and cast to the capture dtype, which gives one row per layer. A projected
-        capture is split into its projections and norms. Shared
-        by :meth:`get_captured_states` and :meth:`get_captured_states_batch`.
-        """
+        """Pop one internal request id's capture as stacked tensors: a pooled capture becomes one
+        row per layer in the capture dtype, a projected capture its projections and norms."""
         layer_dict = self._captured_states.pop(internal_req_id)
         pooled_counts = self._pooled_counts.pop(internal_req_id, None)
         sorted_indices = sorted(layer_dict.keys())
