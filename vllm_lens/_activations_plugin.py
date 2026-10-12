@@ -408,25 +408,21 @@ async def _patched_generate(
         await self.collective_rpc("install_hooks")
         setattr(self, "_hooks_installed", True)
 
-    # Send steering data to workers before the forward pass begins.
-    if steering_vectors is not None:
-        await self.collective_rpc(
-            "set_steering_data",
-            args=(request_id, pickle.dumps(_compact_vectors(steering_vectors))),
-        )
-
-    if projection is not None:
-        await self.collective_rpc("set_projection_directions", args=projection)
-
-    # Send hook data to workers before the forward pass begins.
-    if hooks_list is not None:
-        await self.collective_rpc(
-            "set_hook_data",
-            args=(request_id, cloudpickle.dumps(hooks_list)),
-        )
-
     assert _original_generate is not None
+    # The set RPCs run inside the try, so a failure among them still releases the rest.
     try:
+        if steering_vectors is not None:
+            await self.collective_rpc(
+                "set_steering_data",
+                args=(request_id, pickle.dumps(_compact_vectors(steering_vectors))),
+            )
+        if projection is not None:
+            await self.collective_rpc("set_projection_directions", args=projection)
+        if hooks_list is not None:
+            await self.collective_rpc(
+                "set_hook_data",
+                args=(request_id, cloudpickle.dumps(hooks_list)),
+            )
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):

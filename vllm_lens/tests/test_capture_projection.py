@@ -132,6 +132,20 @@ def test_each_step_is_projected_in_order(schedule):
     assert extension._projections == {}
 
 
+def test_a_released_direction_set_skips_the_capture():
+    """A request whose directions are gone is skipped and the step goes on. No GPU."""
+    extension = _extension(
+        {"output_residual_stream": [LAYER_IDX], "_projection_id": "gone"}, 0, torch.zeros(2, 8)
+    )
+    _capture_rows(
+        extension,  # type: ignore[reportArgumentType]
+        LAYER_IDX,
+        torch.zeros(4, 8, dtype=torch.bfloat16),
+        torch.tensor([0, 4]),
+    )
+    assert extension._captured_states == {} and extension._projections == {}
+
+
 def test_direction_tables_are_shared_and_released():
     """Two requests with one payload hold one tensor; the last release drops it. No GPU."""
     worker = HiddenStatesExtension.__new__(HiddenStatesExtension)
