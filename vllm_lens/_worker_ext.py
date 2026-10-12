@@ -999,9 +999,10 @@ class HiddenStatesExtension:
     # Per-request steering configs:
     # key (external_req_id or _steering_id) → list of SteeringVector
     _steering_data: dict[str, list[SteeringVector]] = {}
-    # The CUDA-graph path's precomputed buffer rows per key, ``(add, norm)`` of
-    # ``(n_slots, hidden)`` each; None for a key with position-specific vectors.
-    _steer_rows: dict[str, tuple[torch.Tensor, torch.Tensor] | None] = {}
+    # The CUDA-graph path's table row per key (0 steers nothing, -1 marks
+    # position-specific vectors), and the row of each internal request id seen.
+    _steer_rows: dict[str, int] = {}
+    _req_rows: dict[str, int] = {}
 
     # Per-request hook definitions:
     # key (external_req_id or _hook_id) → list of Hook
@@ -1043,6 +1044,7 @@ class HiddenStatesExtension:
         self._projections = {}
         self._steering_data = {}
         self._steer_rows = {}
+        self._req_rows = {}
         self._hook_data = {}
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
             self._persistent_hooks = []
@@ -1114,23 +1116,32 @@ class HiddenStatesExtension:
             )
 
         self._steering_data[key] = vectors
-        self._steer_rows.pop(key, None)
+        self._release_steer_row(key)
 
     def set_steering_data_batch(self, items: dict[str, bytes]) -> None:
         """``set_steering_data`` for many requests in one RPC (the offline path)."""
         for key, pickled_data in items.items():
             self.set_steering_data(key, pickled_data)
 
+    def _release_steer_row(self, key: str) -> None:
+        """Give the key's table row back to the CUDA-graph buffers, if it has one."""
+        from vllm_lens._cudagraph import _STEER_STATE
+
+        row = self._steer_rows.pop(key, None)
+        buffers = _STEER_STATE.get("buffers")
+        if row is not None and row > 0 and buffers is not None:
+            buffers.free.append(row)
+
     def clear_steering_data(self, key: str) -> None:
         """Remove steering data for a completed request."""
         self._steering_data.pop(key, None)
-        self._steer_rows.pop(key, None)
+        self._release_steer_row(key)
 
     def clear_steering_data_batch(self, keys: list[str]) -> None:
         """``clear_steering_data`` for many requests in one RPC (the offline path)."""
         for key in keys:
             self._steering_data.pop(key, None)
-            self._steer_rows.pop(key, None)
+            self._release_steer_row(key)
 
     def clear_captured_states(self, external_req_id: str) -> None:
         """Remove captured activations without returning them.

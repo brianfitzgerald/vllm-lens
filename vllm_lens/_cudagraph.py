@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -131,31 +131,57 @@ class LensGraphConfig:
 @dataclass
 class _SteerBuffers:
     """The steering buffers of one worker, ``[n_steered, max_tokens, hidden]`` each.
-    ``add`` rows are added as they are; ``norm`` rows are unit rows for ``norm_match``."""
+    ``add`` rows are added as they are; ``norm`` rows are unit rows for ``norm_match``.
+    Each stored request owns a row of ``table_add`` and ``table_norm``; row 0 is zero."""
 
     add: torch.Tensor
     norm: torch.Tensor
     slots: dict[int, int]
     # Rows below this index can be nonzero; all other rows are zero.
     dirty: int = 0
-    # The step's token positions and their row in the stacked requests, ``[2, max_tokens]``:
-    # a pinned staging copy and its device copy, so the fill never waits for the stream.
+    # The table row of every token of the step, ``[max_tokens]``: a pinned staging copy
+    # and its device copy, so the fill never waits for the stream.
     index_cpu: torch.Tensor | None = None
     index_gpu: torch.Tensor | None = None
+    # ``[capacity, n_steered, hidden]`` each, grown by doubling; ``free`` holds released rows.
+    table_add: torch.Tensor | None = None
+    table_norm: torch.Tensor | None = None
+    used: int = 1
+    free: list[int] = field(default_factory=list)
 
-    def rows(
-        self, configs: list[SteeringVector]
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """The ``add`` and ``norm`` row of one request, ``(n_slots, hidden)`` each, with
-        ``scale`` folded in; None when a vector is position-specific."""
+    def allocate(self, configs: list[SteeringVector]) -> int:
+        """Store the ``add`` and ``norm`` row of one request, with ``scale`` folded in, and
+        return its table row; -1 when a vector is position-specific."""
         if any(cfg.activations.dim() != 2 for cfg in configs):
-            return None
-        add = torch.zeros(
-            (self.add.shape[0], self.add.shape[2]),
-            dtype=self.add.dtype,
-            device=self.add.device,
-        )
-        norm = torch.zeros_like(add)
+            return -1
+        n_slots, _, hidden = self.add.shape
+        table_add, table_norm = self.table_add, self.table_norm
+        if table_add is None or table_norm is None:
+            table_add = torch.zeros(
+                (1024, n_slots, hidden), dtype=self.add.dtype, device=self.add.device
+            )
+            table_norm = torch.zeros_like(table_add)
+        if not self.free and self.used == table_add.shape[0]:
+            grown = torch.zeros(
+                (2 * self.used, n_slots, hidden),
+                dtype=self.add.dtype,
+                device=self.add.device,
+            )
+            grown[: self.used] = table_add
+            table_add = grown
+            grown = torch.zeros_like(grown)
+            grown[: self.used] = table_norm
+            table_norm = grown
+        self.table_add, self.table_norm = table_add, table_norm
+        if self.free:
+            row = self.free.pop()
+        else:
+            row = self.used
+            self.used += 1
+        add = table_add[row]
+        norm = table_norm[row]
+        add.zero_()
+        norm.zero_()
         for cfg in configs:
             for layer_idx, slot in self.slots.items():
                 if layer_idx not in cfg.layer_index_map:
@@ -167,7 +193,7 @@ class _SteerBuffers:
                     norm[slot] += (vec * cfg.scale).to(norm.dtype)
                 else:
                     add[slot] += (vec * cfg.scale).to(add.dtype)
-        return add, norm
+        return row
 
 
 # torch dispatches a custom op by name, so the op finds the buffers here.
@@ -210,7 +236,8 @@ def _steer_fake(
 
 def _fill_steer_buffers(extension: Any) -> None:
     """Write the steering rows of each request, before the forward pass reads them.
-    Rows of the last step are zeroed first, so no stale row steers another request."""
+    Every token of the step takes its request's table row (row 0 steers nothing), in one
+    gather per buffer; position-specific vectors are written after it, per request."""
     from vllm_lens._worker_ext import _apply_steering, _batch_layout, _steering_key
 
     state = _STEER_STATE["buffers"]
@@ -230,33 +257,67 @@ def _fill_steer_buffers(extension: Any) -> None:
     else:
         bounds = np.asarray(query_start_loc[: num_reqs + 1].tolist(), dtype=np.int64)
 
-    # The 2D requests of this step: their rows and their token spans, gathered
-    # into the buffers in one indexed copy per table after the loop.
-    gathered: list[tuple[torch.Tensor, torch.Tensor]] = []
-    spans: list[tuple[int, int]] = []
+    # The table row of each request, cached by request id: a request resolves its key
+    # once and the per-step loop is one dictionary lookup per request.
+    cache: dict[str, int] = extension._req_rows
+    rows: list[int] = []
+    positional: list[int] = []
     for i in range(num_reqs):
         req_id = runner.input_batch.req_ids[i]
-        req_state = runner.requests.get(req_id)
-        if req_state is None or req_state.sampling_params is None:
-            continue
+        row = cache.get(req_id)
+        if row is None:
+            row = 0
+            req_state = runner.requests.get(req_id)
+            if req_state is not None and req_state.sampling_params is not None:
+                key = _steering_key(
+                    extension, req_id, req_state.sampling_params.extra_args
+                )
+                if key is not None and key not in extension._steer_rows:
+                    try:
+                        extension._steer_rows[key] = state.allocate(
+                            extension._steering_data[key]
+                        )
+                    except Exception:
+                        # As in eager mode: a bad vector must not stop the engine.
+                        logger.warning(
+                            "Steering failed for request %s", req_id, exc_info=True
+                        )
+                        extension._steer_rows[key] = 0
+                if key is not None:
+                    row = extension._steer_rows[key]
+            cache[req_id] = row
+        rows.append(row)
+        if row < 0:
+            positional.append(i)
+    if len(cache) > 4 * max(num_reqs, 1024):
+        for req_id in [r for r in cache if r not in runner.requests]:
+            del cache[req_id]
+
+    n_tokens = int(bounds[-1])
+    if any(row > 0 for row in rows):
+        assert state.table_add is not None and state.table_norm is not None
+        state.dirty = n_tokens
+        token_rows = np.repeat(np.maximum(np.asarray(rows), 0), np.diff(bounds))
+        if state.index_cpu is None or state.index_gpu is None:
+            index = torch.from_numpy(token_rows).to(state.add.device)
+        else:
+            # A pageable copy would wait for every kernel queued before it.
+            state.index_cpu[:n_tokens].numpy()[:] = token_rows
+            state.index_gpu[:n_tokens].copy_(
+                state.index_cpu[:n_tokens], non_blocking=True
+            )
+            index = state.index_gpu[:n_tokens]
+        # (n_tokens, n_slots, hidden) -> (n_slots, n_tokens, hidden)
+        state.add[:, :n_tokens] = state.table_add[index].permute(1, 0, 2)
+        state.norm[:, :n_tokens] = state.table_norm[index].permute(1, 0, 2)
+
+    for i in positional:
+        req_id = runner.input_batch.req_ids[i]
+        req_state = runner.requests[req_id]
         key = _steering_key(extension, req_id, req_state.sampling_params.extra_args)
-        if key is None:
-            continue
         start = int(bounds[i])
         end = int(bounds[i + 1])
         state.dirty = max(state.dirty, end)
-        if key not in extension._steer_rows:
-            try:
-                extension._steer_rows[key] = state.rows(extension._steering_data[key])
-            except Exception:
-                # As in eager mode: a bad vector must not stop the engine.
-                logger.warning("Steering failed for request %s", req_id, exc_info=True)
-                extension._steer_rows[key] = state.rows([])
-        rows = extension._steer_rows[key]
-        if rows is not None:
-            gathered.append(rows)
-            spans.append((start, end))
-            continue
         try:
             for cfg in extension._steering_data[key]:
                 target = state.add
@@ -287,34 +348,6 @@ def _fill_steer_buffers(extension: Any) -> None:
             logger.warning("Steering failed for request %s", req_id, exc_info=True)
             state.add[:, start:end].zero_()
             state.norm[:, start:end].zero_()
-
-    if not gathered:
-        return
-    index = np.stack(
-        [
-            np.concatenate([np.arange(start, end) for start, end in spans]),
-            np.repeat(np.arange(len(gathered)), [end - start for start, end in spans]),
-        ]
-    )
-    n_tokens = index.shape[1]
-    if state.index_cpu is None or state.index_gpu is None:
-        index_gpu = torch.from_numpy(index).to(state.add.device)
-    else:
-        # A pageable copy would wait for every kernel queued before it.
-        state.index_cpu[:, :n_tokens].numpy()[:] = index
-        state.index_gpu[:, :n_tokens].copy_(
-            state.index_cpu[:, :n_tokens], non_blocking=True
-        )
-        index_gpu = state.index_gpu[:, :n_tokens]
-    positions = index_gpu[0]
-    token_rows = index_gpu[1]
-    # (n_tokens, n_slots, hidden) -> (n_slots, n_tokens, hidden)
-    state.add[:, positions] = torch.stack([add for add, _ in gathered])[
-        token_rows
-    ].permute(1, 0, 2)
-    state.norm[:, positions] = torch.stack([norm for _, norm in gathered])[
-        token_rows
-    ].permute(1, 0, 2)
 
 
 def _install_op_hooks(worker: Any, op_args: dict[int, int], op: Any) -> None:
@@ -368,8 +401,8 @@ def _enable_buffer_steering(worker: Any, layers: tuple[int, ...]) -> None:
             add=torch.zeros(shape, dtype=dtype, device=device),
             norm=torch.zeros(shape, dtype=dtype, device=device),
             slots=slots,
-            index_cpu=torch.zeros((2, shape[1]), dtype=torch.int64, pin_memory=pinned),
-            index_gpu=torch.zeros((2, shape[1]), dtype=torch.int64, device=device),
+            index_cpu=torch.zeros(shape[1], dtype=torch.int64, pin_memory=pinned),
+            index_gpu=torch.zeros(shape[1], dtype=torch.int64, device=device),
         )
     _install_op_hooks(worker, _STEER_STATE["buffers"].slots, torch.ops.vllm_lens.steer)
     megabytes = 2 * shape[0] * shape[1] * shape[2] * dtype.itemsize / 2**20
