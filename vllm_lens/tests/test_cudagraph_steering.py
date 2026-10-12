@@ -108,6 +108,25 @@ def test_several_requests_share_one_forward_pass(eager_llm, graph_llm, hidden):
     assert row_error(prompt_rows(graph[0]), prompt_rows(unsteered[0])) > 0.1
 
 
+def test_interleaved_requests_match_eager(eager_llm, graph_llm, hidden):
+    """Six prompts in one step: two 2D vectors, a norm-match vector, a positional vector
+    and two unsteered requests, each row equal to eager's."""
+    vectors = [
+        [_vector(11, hidden, scale=8.0)],
+        [],
+        [_vector(12, hidden, scale=4.0, norm_match=True)],
+        [_vector(13, hidden, scale=6.0)],
+        [_vector(14, hidden, scale=4.0, norm_match=True, position_indices=[1])],
+        [],
+    ]
+    prompts = SHORT_PROMPTS * 2
+    eager = _run(eager_llm, vectors, prompts=prompts)
+    graph = _run(graph_llm, vectors, prompts=prompts)
+    for index, (eager_out, graph_out) in enumerate(zip(eager, graph)):
+        error = row_error(prompt_rows(graph_out), prompt_rows(eager_out))
+        assert error < 5e-2, f"request {index}: largest row error {error:.4f}"
+
+
 def test_a_decode_position_is_steered_alone(graph_llm, hidden):
     """A position in the generated part is steered in its decode step, and only there."""
     n_prompt = len(_run(graph_llm, [[]], max_tokens=1)[0].prompt_token_ids)
@@ -171,8 +190,8 @@ def wide_graph_llm():
 
 
 def test_many_requests_steer_within_a_bound(wide_graph_llm, hidden):
-    """Steering 256 requests in flight costs at most twice the unsteered pass: the per-step
-    work is a dictionary lookup per request, not a scan over every stored request."""
+    """Steering 256 requests in flight costs at most half again the unsteered pass: the
+    per-step work is a dictionary lookup per request and one gather per buffer."""
     import time
 
     prompts = (SHORT_PROMPTS * 86)[:256]
@@ -192,6 +211,7 @@ def test_many_requests_steer_within_a_bound(wide_graph_llm, hidden):
     start = time.perf_counter()
     wide_graph_llm.generate(prompts, steered)
     steered_s = time.perf_counter() - start
-    assert steered_s < 2.0 * unsteered_s, (
+    print(f"steered {steered_s:.2f}s, unsteered {unsteered_s:.2f}s")
+    assert steered_s < 1.5 * unsteered_s, (
         f"steered {steered_s:.2f}s, unsteered {unsteered_s:.2f}s"
     )
