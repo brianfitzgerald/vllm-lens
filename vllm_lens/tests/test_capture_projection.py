@@ -182,7 +182,9 @@ def test_two_direction_sets_share_one_batch(llm):
     for i, out in enumerate(outputs):
         expected = full[i % 2].activations["residual_stream"].float() @ sets[i % 2].T  # type: ignore[reportAttributeAccessIssue]
         scores = out.activations["residual_stream_projection"]  # type: ignore[reportAttributeAccessIssue]
-        assert ((scores - expected).norm() / expected.norm()).item() < 1e-4, (
+        # The batch of 24 prefills in other chunks than the pair, so bf16 rows differ a
+        # little; the wrong direction set would differ by order 1.
+        assert ((scores - expected).norm() / expected.norm()).item() < 1e-2, (
             f"request {i}"
         )
     assert llm.collective_rpc("_debug_direction_table_count") == [0]
