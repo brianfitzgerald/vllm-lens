@@ -223,9 +223,8 @@ def _projection_payload(extra: dict[str, Any]) -> tuple[str, str] | None:
 
 
 def _validate_capture(extra: dict[str, Any], hidden: int, decode: bool = True) -> None:
-    """Raise ``ValueError`` for an unknown ``output_residual_stream_pool``, or for
-    ``output_residual_stream_project`` directions that are not finite ``(N, hidden)``.
-    Without ``decode`` the directions are not decoded, for a payload already validated."""
+    """Raise ``ValueError`` for an unknown ``output_residual_stream_pool`` or for directions that
+    are not finite ``(N, hidden)``; ``decode=False`` skips decoding a payload validated before."""
     pool = extra.get("output_residual_stream_pool")
     if pool is not None and pool not in ("last", "mean"):
         raise ValueError(
