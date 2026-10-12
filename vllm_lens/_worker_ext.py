@@ -228,12 +228,12 @@ def _get_total_num_layers(worker: Any) -> int:
     return int(worker.model_config.get_total_num_hidden_layers())
 
 
-def _find_steering_configs(
+def _steering_key(
     extension: HiddenStatesExtension,
     internal_req_id: str,
     extra_args: dict[str, Any] | None,
-) -> list[SteeringVector]:
-    """The steering configs of an internal request id, by dictionary lookup.
+) -> str | None:
+    """The ``_steering_data`` key of an internal request id, or None without vectors.
 
     The offline path stores a ``_steering_id`` sentinel in ``extra_args``. The
     async path keys by the external id, to which vLLM appends ``"-{suffix}"``,
@@ -242,15 +242,27 @@ def _find_steering_configs(
     """
     data = extension._steering_data
     if not data:
-        return []
+        return None
     if extra_args:
         steering_id = extra_args.get("_steering_id")
         if steering_id is not None:
-            return list(data.get(steering_id, ()))
+            return steering_id if steering_id in data else None
     if internal_req_id in data:
-        return list(data[internal_req_id])
+        return internal_req_id
     external_id, _, _ = internal_req_id.rpartition("-")
-    return list(data.get(external_id, ()))
+    return external_id if external_id in data else None
+
+
+def _find_steering_configs(
+    extension: HiddenStatesExtension,
+    internal_req_id: str,
+    extra_args: dict[str, Any] | None,
+) -> list[SteeringVector]:
+    """The steering configs of an internal request id; see :func:`_steering_key`."""
+    key = _steering_key(extension, internal_req_id, extra_args)
+    if key is None:
+        return []
+    return list(extension._steering_data[key])
 
 
 def _find_hook_configs(
@@ -987,6 +999,9 @@ class HiddenStatesExtension:
     # Per-request steering configs:
     # key (external_req_id or _steering_id) → list of SteeringVector
     _steering_data: dict[str, list[SteeringVector]] = {}
+    # The CUDA-graph path's precomputed buffer rows per key, ``(add, norm)`` of
+    # ``(n_slots, hidden)`` each; None for a key with position-specific vectors.
+    _steer_rows: dict[str, tuple[torch.Tensor, torch.Tensor] | None] = {}
 
     # Per-request hook definitions:
     # key (external_req_id or _hook_id) → list of Hook
@@ -1027,6 +1042,7 @@ class HiddenStatesExtension:
         self._pooled_counts = {}
         self._projections = {}
         self._steering_data = {}
+        self._steer_rows = {}
         self._hook_data = {}
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
             self._persistent_hooks = []
@@ -1098,6 +1114,7 @@ class HiddenStatesExtension:
             )
 
         self._steering_data[key] = vectors
+        self._steer_rows.pop(key, None)
 
     def set_steering_data_batch(self, items: dict[str, bytes]) -> None:
         """``set_steering_data`` for many requests in one RPC (the offline path)."""
@@ -1107,11 +1124,13 @@ class HiddenStatesExtension:
     def clear_steering_data(self, key: str) -> None:
         """Remove steering data for a completed request."""
         self._steering_data.pop(key, None)
+        self._steer_rows.pop(key, None)
 
     def clear_steering_data_batch(self, keys: list[str]) -> None:
         """``clear_steering_data`` for many requests in one RPC (the offline path)."""
         for key in keys:
             self._steering_data.pop(key, None)
+            self._steer_rows.pop(key, None)
 
     def clear_captured_states(self, external_req_id: str) -> None:
         """Remove captured activations without returning them.
