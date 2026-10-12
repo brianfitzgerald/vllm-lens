@@ -233,22 +233,24 @@ def _find_steering_configs(
     internal_req_id: str,
     extra_args: dict[str, Any] | None,
 ) -> list[SteeringVector]:
-    """Find all steering configs that apply to an internal request ID.
+    """The steering configs of an internal request id, by dictionary lookup.
 
-    Matches by ``"{external_id}-"`` prefix (async path: vLLM appends
-    ``"-{random_suffix}"`` to external IDs) and by ``_steering_id``
-    sentinel in ``extra_args`` (offline path).
+    The offline path stores a ``_steering_id`` sentinel in ``extra_args``. The
+    async path keys by the external id, to which vLLM appends ``"-{suffix}"``,
+    so the id before the last ``-`` is looked up. This runs for every request
+    in the batch on every forward pass, so it must not scan the stored keys.
     """
-    results: list[SteeringVector] = []
-    for external_id, configs in extension._steering_data.items():
-        if internal_req_id.startswith(f"{external_id}-"):
-            results.extend(configs)
-    # Offline path stores a lightweight string key in extra_args
+    data = extension._steering_data
+    if not data:
+        return []
     if extra_args:
         steering_id = extra_args.get("_steering_id")
-        if steering_id and steering_id in extension._steering_data:
-            results.extend(extension._steering_data[steering_id])
-    return results
+        if steering_id is not None:
+            return list(data.get(steering_id, ()))
+    if internal_req_id in data:
+        return list(data[internal_req_id])
+    external_id, _, _ = internal_req_id.rpartition("-")
+    return list(data.get(external_id, ()))
 
 
 def _find_hook_configs(
@@ -1097,9 +1099,19 @@ class HiddenStatesExtension:
 
         self._steering_data[key] = vectors
 
+    def set_steering_data_batch(self, items: dict[str, bytes]) -> None:
+        """``set_steering_data`` for many requests in one RPC (the offline path)."""
+        for key, pickled_data in items.items():
+            self.set_steering_data(key, pickled_data)
+
     def clear_steering_data(self, key: str) -> None:
         """Remove steering data for a completed request."""
         self._steering_data.pop(key, None)
+
+    def clear_steering_data_batch(self, keys: list[str]) -> None:
+        """``clear_steering_data`` for many requests in one RPC (the offline path)."""
+        for key in keys:
+            self._steering_data.pop(key, None)
 
     def clear_captured_states(self, external_req_id: str) -> None:
         """Remove captured activations without returning them.

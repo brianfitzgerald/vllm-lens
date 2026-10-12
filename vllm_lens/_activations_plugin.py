@@ -662,9 +662,9 @@ def _prepare_offline_params(
         self.collective_rpc("install_qk_hooks")
         self._qk_hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
 
-    # Send steering data to workers before generation.
-    for sid, payload in steering_payloads.items():
-        self.collective_rpc("set_steering_data", args=(sid, payload))
+    # Send every request's steering data to the workers in one RPC.
+    if steering_payloads:
+        self.collective_rpc("set_steering_data_batch", args=(steering_payloads,))
 
     # Send hook data to workers before generation.
     for hid, payload in hook_payloads.items():
@@ -732,8 +732,10 @@ def _finalize_offline_outputs(
                 output.hook_results = merged
 
     # Clean up steering data.
-    for sid in steering_payloads:
-        self.collective_rpc("clear_steering_data", args=(sid,))
+    if steering_payloads:
+        self.collective_rpc(
+            "clear_steering_data_batch", args=(list(steering_payloads),)
+        )
 
     # Clean up hook data and contexts.
     for hid in hook_payloads:

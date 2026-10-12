@@ -192,10 +192,13 @@ def _fill_steer_buffers(extension: Any) -> None:
     state.dirty = 0
     runner = extension.model_runner
     query_start_loc = _batch_layout(runner, warn=False)
-    if query_start_loc is None:
+    if query_start_loc is None or not extension._steering_data:
         return
+    num_reqs = runner.input_batch.num_reqs
+    # One host sync per step: the row range of every request in the batch.
+    bounds = query_start_loc[: num_reqs + 1].tolist()
 
-    for i in range(runner.input_batch.num_reqs):
+    for i in range(num_reqs):
         req_id = runner.input_batch.req_ids[i]
         req_state = runner.requests.get(req_id)
         if req_state is None or req_state.sampling_params is None:
@@ -204,8 +207,8 @@ def _fill_steer_buffers(extension: Any) -> None:
         configs = _find_steering_configs(extension, req_id, extra)
         if not configs:
             continue
-        start = int(query_start_loc[i].item())
-        end = int(query_start_loc[i + 1].item())
+        start = int(bounds[i])
+        end = int(bounds[i + 1])
         state.dirty = max(state.dirty, end)
         try:
             for cfg in configs:
