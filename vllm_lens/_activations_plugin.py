@@ -12,6 +12,7 @@ per-request activations for both online (async) and offline (sync) usage.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -211,9 +212,20 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
     return [h if isinstance(h, Hook) else Hook.model_validate(h) for h in value]
 
 
-def _validate_capture(extra: dict[str, Any], hidden: int) -> None:
+def _projection_payload(extra: dict[str, Any]) -> tuple[str, str] | None:
+    """The hash and the wire string of ``output_residual_stream_project``, or None when
+    the request projects nothing. The hash is the key the workers hold the directions under."""
+    project = extra.get("output_residual_stream_project")
+    if project is None:
+        return None
+    payload = project if isinstance(project, str) else json.dumps(project)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16], payload
+
+
+def _validate_capture(extra: dict[str, Any], hidden: int, decode: bool = True) -> None:
     """Raise ``ValueError`` for an unknown ``output_residual_stream_pool``, or for
-    ``output_residual_stream_project`` directions that are not finite ``(N, hidden)``."""
+    ``output_residual_stream_project`` directions that are not finite ``(N, hidden)``.
+    Without ``decode`` the directions are not decoded, for a payload already validated."""
     pool = extra.get("output_residual_stream_pool")
     if pool is not None and pool not in ("last", "mean"):
         raise ValueError(
@@ -227,6 +239,8 @@ def _validate_capture(extra: dict[str, Any], hidden: int) -> None:
             "output_residual_stream_project cannot be combined with "
             "output_residual_stream_pool"
         )
+    if not decode:
+        return
     directions = deserialize_directions(project)
     if (
         directions.ndim != 2
@@ -356,6 +370,11 @@ async def _patched_generate(
     extra = effective_params.extra_args or {}
     wants_activations = extra.get("output_residual_stream") is not None
     _validate_capture(extra, self.vllm_config.model_config.get_hidden_size())
+    # The directions go to the workers by hash, not into the engine with the request.
+    projection = _projection_payload(extra)
+    if projection is not None:
+        extra.pop("output_residual_stream_project")
+        extra["_projection_id"] = projection[0]
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
     # When arriving via the OpenAI API (vllm_xargs), complex values
@@ -397,6 +416,9 @@ async def _patched_generate(
             args=(request_id, pickle.dumps(_compact_vectors(steering_vectors))),
         )
 
+    if projection is not None:
+        await self.collective_rpc("set_projection_directions", args=projection)
+
     # Send hook data to workers before the forward pass begins.
     if hooks_list is not None:
         await self.collective_rpc(
@@ -431,6 +453,10 @@ async def _patched_generate(
     finally:
         if steering_vectors is not None:
             await self.collective_rpc("clear_steering_data", args=(request_id,))
+        if projection is not None:
+            await self.collective_rpc(
+                "clear_projection_directions", args=(projection[0],)
+            )
         if wants_activations:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
         if hooks_list is not None:
@@ -467,8 +493,20 @@ def _prepare_offline_params(
         params_list = []
 
     hidden = self.llm_engine.vllm_config.model_config.get_hidden_size()
+    # Each distinct direction set is decoded, validated and shipped once, by its hash.
+    projection_payloads: dict[str, str] = {}
     for sp in params_list:
-        _validate_capture(sp.extra_args or {}, hidden)
+        extra = sp.extra_args or {}
+        projection = _projection_payload(extra)
+        if projection is None:
+            _validate_capture(extra, hidden)
+            continue
+        _validate_capture(
+            extra, hidden, decode=projection[0] not in projection_payloads
+        )
+        projection_payloads[projection[0]] = projection[1]
+        extra.pop("output_residual_stream_project")
+        extra["_projection_id"] = projection[0]
 
     wants_activations = any(
         (sp.extra_args or {}).get("output_residual_stream") is not None
@@ -530,6 +568,10 @@ def _prepare_offline_params(
     # Send every request's steering data to the workers in one RPC.
     if steering_payloads:
         self.collective_rpc("set_steering_data_batch", args=(steering_payloads,))
+    if projection_payloads:
+        self.collective_rpc(
+            "set_projection_directions_batch", args=(projection_payloads,)
+        )
 
     # Send hook data to workers before generation.
     for hid, payload in hook_payloads.items():
@@ -538,6 +580,7 @@ def _prepare_offline_params(
     return {
         "wants_activations": wants_activations,
         "steering_payloads": steering_payloads,
+        "projection_ids": list(projection_payloads),
         "hook_payloads": hook_payloads,
     }
 
@@ -584,6 +627,10 @@ def _finalize_offline_outputs(
     if steering_payloads:
         self.collective_rpc(
             "clear_steering_data_batch", args=(list(steering_payloads),)
+        )
+    if state["projection_ids"]:
+        self.collective_rpc(
+            "clear_projection_directions_batch", args=(state["projection_ids"],)
         )
 
     # Clean up hook data and contexts.

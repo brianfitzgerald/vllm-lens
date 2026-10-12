@@ -372,15 +372,14 @@ def _capture_rows(
             continue
 
         rows = hidden_states[start:end]
-        project = extra.get("output_residual_stream_project")
-        if project is None:
+        projection_id = extra.get("_projection_id")
+        if projection_id is None:
             activation = rows.cpu()
         else:
             # Each position is stored as its N projections and its norm, in float32.
-            directions = extension._projections.get(req_id)
-            if directions is None:
-                directions = deserialize_directions(project).to(rows.device)
-                extension._projections[req_id] = directions
+            # The directions are shared by every request that sent the same payload.
+            directions = extension._direction_tables[projection_id]
+            extension._projections[req_id] = directions
             rows = rows.float()
             activation = torch.cat(
                 [rows @ directions.T, rows.norm(dim=-1, keepdim=True)], dim=1
@@ -712,8 +711,12 @@ class HiddenStatesExtension:
     # Pooled capture: ``_captured_states`` holds one float32 sum row per layer.
     # internal_req_id -> { layer_idx -> (row count, capture dtype, end of pooled positions) }
     _pooled_counts: dict[str, dict[int, tuple[int, torch.dtype, int]]] = {}
-    # Projected capture: internal_req_id -> float32 directions (N, hidden) on the device.
+    # Projected capture: internal_req_id -> its float32 directions (N, hidden) on the device,
+    # a reference into ``_direction_tables``.
     _projections: dict[str, torch.Tensor] = {}
+    # Direction sets by payload hash, and the number of requests holding each.
+    _direction_tables: dict[str, torch.Tensor] = {}
+    _direction_refs: dict[str, int] = {}
     _hooks_installed: bool = False
 
     # Per-request steering configs:
@@ -752,6 +755,8 @@ class HiddenStatesExtension:
         self._captured_states = {}
         self._pooled_counts = {}
         self._projections = {}
+        self._direction_tables = {}
+        self._direction_refs = {}
         self._steering_data = {}
         self._steer_rows = {}
         self._req_rows = {}
@@ -854,6 +859,41 @@ class HiddenStatesExtension:
         for key in keys:
             self._steering_data.pop(key, None)
             self._release_steer_row(key)
+
+    # ------------------------------------------------------------------
+    # Projection directions (called via collective_rpc)
+    # ------------------------------------------------------------------
+
+    def set_projection_directions(self, key: str, payload: str) -> None:
+        """Hold the ``output_residual_stream_project`` directions of one request under
+        ``key``; a payload already held is not decoded again."""
+        if key not in self._direction_tables:
+            device = next(self.model_runner.model.parameters()).device
+            self._direction_tables[key] = deserialize_directions(payload).to(device)
+        self._direction_refs[key] = self._direction_refs.get(key, 0) + 1
+
+    def set_projection_directions_batch(self, items: dict[str, str]) -> None:
+        """``set_projection_directions`` for many keys in one RPC (the offline path)."""
+        for key, payload in items.items():
+            self.set_projection_directions(key, payload)
+
+    def clear_projection_directions(self, key: str) -> None:
+        """Release one request's hold on ``key``; the last release drops the tensor."""
+        remaining = self._direction_refs.get(key, 0) - 1
+        if remaining > 0:
+            self._direction_refs[key] = remaining
+        else:
+            self._direction_refs.pop(key, None)
+            self._direction_tables.pop(key, None)
+
+    def clear_projection_directions_batch(self, keys: list[str]) -> None:
+        """``clear_projection_directions`` for many keys in one RPC (the offline path)."""
+        for key in keys:
+            self.clear_projection_directions(key)
+
+    def _debug_direction_table_count(self) -> int:
+        """Return the number of direction sets held (for testing)."""
+        return len(self._direction_tables)
 
     def clear_captured_states(self, external_req_id: str) -> None:
         """Remove captured activations without returning them.
