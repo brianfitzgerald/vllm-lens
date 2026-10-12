@@ -233,13 +233,8 @@ def _steering_key(
     internal_req_id: str,
     extra_args: dict[str, Any] | None,
 ) -> str | None:
-    """The ``_steering_data`` key of an internal request id, or None without vectors.
-
-    The offline path stores a ``_steering_id`` sentinel in ``extra_args``. The
-    async path keys by the external id, to which vLLM appends ``"-{suffix}"``,
-    so the id before the last ``-`` is looked up. This runs for every request
-    in the batch on every forward pass, so it must not scan the stored keys.
-    """
+    """The ``_steering_data`` key of an internal request id, or None without vectors: the
+    offline ``_steering_id`` sentinel, else the external id (the internal id before its last ``-``)."""
     data = extension._steering_data
     if not data:
         return None
@@ -999,8 +994,7 @@ class HiddenStatesExtension:
     # Per-request steering configs:
     # key (external_req_id or _steering_id) → list of SteeringVector
     _steering_data: dict[str, list[SteeringVector]] = {}
-    # The CUDA-graph path's table row per key (0 steers nothing, -1 marks
-    # position-specific vectors), and the row of each internal request id seen.
+    # The CUDA-graph table row per key (0 none, -1 position-specific) and per internal request id.
     _steer_rows: dict[str, int] = {}
     _req_rows: dict[str, int] = {}
 
