@@ -34,7 +34,7 @@ def _step(
     step: int = 0,
 ) -> None:
     """Run one fill with ``keys[i]`` as request i's sentinel and ``bounds`` as its layout.
-    Request ids carry ``step``: vLLM never reuses an id, and the fill caches by id."""
+    Request ids carry ``step``, as vLLM's do; the fill must not depend on it."""
     layout = torch.tensor(bounds, dtype=torch.int32)
     requests = {
         f"req-{step}-{i}": SimpleNamespace(
@@ -70,7 +70,6 @@ def test_rows_land_on_their_requests(monkeypatch: pytest.MonkeyPatch, cpu_layout
     extension = SimpleNamespace(
         _steering_data={"_steer_0": [added], "_steer_2": [matched]},
         _steer_rows={},
-        _req_rows={},
     )
 
     _step(
@@ -93,6 +92,31 @@ def test_rows_land_on_their_requests(monkeypatch: pytest.MonkeyPatch, cpu_layout
     assert state.dirty == 0
 
 
+def test_a_reused_request_id_takes_its_new_vector(monkeypatch: pytest.MonkeyPatch):
+    """The same request id steers with the vector set last, and with none once it is cleared."""
+    state = _SteerBuffers(
+        add=torch.zeros(1, MAX_TOKENS, HIDDEN),
+        norm=torch.zeros(1, MAX_TOKENS, HIDDEN),
+        slots={LAYER: 0},
+    )
+    monkeypatch.setitem(_STEER_STATE, "buffers", state)
+    first, second = _vector(0, scale=1.0), _vector(1, scale=1.0)
+    extension = SimpleNamespace(_steering_data={"_steer_0": [first]}, _steer_rows={})
+    _step(monkeypatch, extension, [0, 2], ["_steer_0"], True)
+    torch.testing.assert_close(state.add[0, 0:2], first.activations.expand(2, -1))
+
+    # What set_steering_data does: new vectors under the key, and its row released.
+    extension._steering_data["_steer_0"] = [second]
+    state.free.append(extension._steer_rows.pop("_steer_0"))
+    _step(monkeypatch, extension, [0, 2], ["_steer_0"], True)
+    torch.testing.assert_close(state.add[0, 0:2], second.activations.expand(2, -1))
+
+    extension._steering_data.clear()
+    state.free.append(extension._steer_rows.pop("_steer_0"))
+    _step(monkeypatch, extension, [0, 2], ["_steer_0"], True)
+    assert state.add.abs().sum() == 0
+
+
 def test_a_bad_vector_steers_nothing(monkeypatch: pytest.MonkeyPatch):
     """A vector of the wrong width is logged once and its request gets zero rows."""
     state = _SteerBuffers(
@@ -102,9 +126,7 @@ def test_a_bad_vector_steers_nothing(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setitem(_STEER_STATE, "buffers", state)
     bad = SteeringVector(activations=torch.ones(1, HIDDEN + 1), layer_indices=[LAYER])
-    extension = SimpleNamespace(
-        _steering_data={"_steer_0": [bad]}, _steer_rows={}, _req_rows={}
-    )
+    extension = SimpleNamespace(_steering_data={"_steer_0": [bad]}, _steer_rows={})
     _step(monkeypatch, extension, [0, 3], ["_steer_0"], True)
     assert state.add.abs().sum() == 0 and state.norm.abs().sum() == 0
     assert extension._steer_rows["_steer_0"] == 0

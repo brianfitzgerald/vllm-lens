@@ -994,9 +994,8 @@ class HiddenStatesExtension:
     # Per-request steering configs:
     # key (external_req_id or _steering_id) → list of SteeringVector
     _steering_data: dict[str, list[SteeringVector]] = {}
-    # The CUDA-graph table row per key (0 none, -1 position-specific) and per internal request id.
+    # The CUDA-graph table row per key (0 none, -1 position-specific).
     _steer_rows: dict[str, int] = {}
-    _req_rows: dict[str, int] = {}
 
     # Per-request hook definitions:
     # key (external_req_id or _hook_id) → list of Hook
@@ -1038,12 +1037,18 @@ class HiddenStatesExtension:
         self._projections = {}
         self._steering_data = {}
         self._steer_rows = {}
-        self._req_rows = {}
         self._hook_data = {}
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
             self._persistent_hooks = []
         self._hook_contexts = {}
         self._persistent_hook_contexts = {}
+        # The CUDA-graph table rows belong to the dropped keys.
+        from vllm_lens._cudagraph import _STEER_STATE
+
+        buffers = _STEER_STATE.get("buffers")
+        if buffers is not None:
+            buffers.used = 1
+            buffers.free.clear()
 
         # Only rank 0 captures — residual streams are replicated across
         # TP ranks after all-reduce, so the data is identical.
@@ -1134,8 +1139,7 @@ class HiddenStatesExtension:
     def clear_steering_data_batch(self, keys: list[str]) -> None:
         """``clear_steering_data`` for many requests in one RPC (the offline path)."""
         for key in keys:
-            self._steering_data.pop(key, None)
-            self._release_steer_row(key)
+            self.clear_steering_data(key)
 
     def clear_captured_states(self, external_req_id: str) -> None:
         """Remove captured activations without returning them.
