@@ -496,7 +496,14 @@ def _capture_rows(
         else:
             # Each position is stored as its N projections and its norm, in float32.
             # The directions are shared by every request that sent the same payload.
-            directions = extension._direction_tables[projection_id]
+            directions = extension._direction_tables.get(projection_id)
+            if directions is None:
+                # An aborted request can run one step after its directions were released.
+                logger.warning(
+                    "No projection directions for request %s; its capture is skipped",
+                    req_id,
+                )
+                continue
             extension._projections[req_id] = directions
             rows = rows.float()
             activation = torch.cat(
