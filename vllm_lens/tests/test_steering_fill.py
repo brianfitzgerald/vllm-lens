@@ -31,11 +31,13 @@ def _step(
     bounds: list[int],
     keys: list[str | None],
     cpu_layout: bool,
+    step: int = 0,
 ) -> None:
-    """Run one fill with ``keys[i]`` as request i's sentinel and ``bounds`` as its layout."""
+    """Run one fill with ``keys[i]`` as request i's sentinel and ``bounds`` as its layout.
+    Request ids carry ``step``: vLLM never reuses an id, and the fill caches by id."""
     layout = torch.tensor(bounds, dtype=torch.int32)
     requests = {
-        f"req-{i}": SimpleNamespace(
+        f"req-{step}-{i}": SimpleNamespace(
             sampling_params=SimpleNamespace(
                 extra_args={"_steering_id": key} if key else {}
             ),
@@ -66,7 +68,9 @@ def test_rows_land_on_their_requests(monkeypatch: pytest.MonkeyPatch, cpu_layout
     added = _vector(0, scale=8.0)
     matched = _vector(1, scale=4.0, norm_match=True)
     extension = SimpleNamespace(
-        _steering_data={"_steer_0": [added], "_steer_2": [matched]}, _steer_rows={}
+        _steering_data={"_steer_0": [added], "_steer_2": [matched]},
+        _steer_rows={},
+        _req_rows={},
     )
 
     _step(
@@ -84,7 +88,7 @@ def test_rows_land_on_their_requests(monkeypatch: pytest.MonkeyPatch, cpu_layout
     assert set(extension._steer_rows) == {"_steer_0", "_steer_2"}
 
     # The next step steers nothing, so the rows of the last step are zero again.
-    _step(monkeypatch, extension, [0, 1], [None], cpu_layout)
+    _step(monkeypatch, extension, [0, 1], [None], cpu_layout, step=1)
     assert state.add.abs().sum() == 0 and state.norm.abs().sum() == 0
     assert state.dirty == 0
 
@@ -98,7 +102,9 @@ def test_a_bad_vector_steers_nothing(monkeypatch: pytest.MonkeyPatch):
     )
     monkeypatch.setitem(_STEER_STATE, "buffers", state)
     bad = SteeringVector(activations=torch.ones(1, HIDDEN + 1), layer_indices=[LAYER])
-    extension = SimpleNamespace(_steering_data={"_steer_0": [bad]}, _steer_rows={})
+    extension = SimpleNamespace(
+        _steering_data={"_steer_0": [bad]}, _steer_rows={}, _req_rows={}
+    )
     _step(monkeypatch, extension, [0, 3], ["_steer_0"], True)
     assert state.add.abs().sum() == 0 and state.norm.abs().sum() == 0
-    assert extension._steer_rows["_steer_0"] is not None
+    assert extension._steer_rows["_steer_0"] == 0
