@@ -137,6 +137,10 @@ class _SteerBuffers:
     slots: dict[int, int]
     # Rows below this index can be nonzero; all other rows are zero.
     dirty: int = 0
+    # The step's token positions and their row in the stacked requests, ``[2, max_tokens]``:
+    # a pinned staging copy and its device copy, so the fill never waits for the stream.
+    index_cpu: torch.Tensor | None = None
+    index_gpu: torch.Tensor | None = None
 
     def rows(
         self, configs: list[SteeringVector]
@@ -285,13 +289,24 @@ def _fill_steer_buffers(extension: Any) -> None:
 
     if not gathered:
         return
-    device = state.add.device
-    positions = torch.from_numpy(
-        np.concatenate([np.arange(start, end) for start, end in spans])
-    ).to(device)
-    token_rows = torch.from_numpy(
-        np.repeat(np.arange(len(gathered)), [end - start for start, end in spans])
-    ).to(device)
+    index = np.stack(
+        [
+            np.concatenate([np.arange(start, end) for start, end in spans]),
+            np.repeat(np.arange(len(gathered)), [end - start for start, end in spans]),
+        ]
+    )
+    n_tokens = index.shape[1]
+    if state.index_cpu is None or state.index_gpu is None:
+        index_gpu = torch.from_numpy(index).to(state.add.device)
+    else:
+        # A pageable copy would wait for every kernel queued before it.
+        state.index_cpu[:, :n_tokens].numpy()[:] = index
+        state.index_gpu[:, :n_tokens].copy_(
+            state.index_cpu[:, :n_tokens], non_blocking=True
+        )
+        index_gpu = state.index_gpu[:, :n_tokens]
+    positions = index_gpu[0]
+    token_rows = index_gpu[1]
     # (n_tokens, n_slots, hidden) -> (n_slots, n_tokens, hidden)
     state.add[:, positions] = torch.stack([add for add, _ in gathered])[
         token_rows
@@ -349,10 +364,13 @@ def _enable_buffer_steering(worker: Any, layers: tuple[int, ...]) -> None:
         or existing.add.dtype != dtype
         or existing.add.device != device
     ):
+        pinned = device.type == "cuda"
         _STEER_STATE["buffers"] = _SteerBuffers(
             add=torch.zeros(shape, dtype=dtype, device=device),
             norm=torch.zeros(shape, dtype=dtype, device=device),
             slots=slots,
+            index_cpu=torch.zeros((2, shape[1]), dtype=torch.int64, pin_memory=pinned),
+            index_gpu=torch.zeros((2, shape[1]), dtype=torch.int64, device=device),
         )
     _install_op_hooks(model, _STEER_STATE["buffers"].slots, torch.ops.vllm_lens.steer)
     megabytes = 2 * shape[0] * shape[1] * shape[2] * dtype.itemsize / 2**20
