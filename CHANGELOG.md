@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Steering: The per-step lookup of a request's steering vectors is a dictionary lookup (the `_steering_id` sentinel offline, the external id before vLLM's `-suffix` online) in place of a prefix scan over every stored request, and the buffer fill reads the batch layout with one host sync per step. The offline path ships and clears all requests' vectors in one RPC each. With 2,800 steered requests the scan cost grew with in-flight times total requests and made the steered pass 11 to 16 times slower than the unsteered one.
 - Capture: Gemma2 returns auxiliary hidden states, so `VLLM_LENS_CAPTURE_LAYERS` serves it. vLLM's `Gemma2Model` has no `set_aux_hidden_state_layers`; the plugin adds the method and the aux outputs to the class at register, before the model is built and compiled. The unit tests read `VLLM_TEST_MODEL`.
 - Capture: Added `output_residual_stream_project` (`capture_project` on the client). The worker returns the projection of every position onto `(N, hidden)` directions and the norm of every position, in float32, in place of the residual, so a long prompt ships N + 1 values per position in place of `hidden`.
 - Examples: Added a test that runs the activation oracle example in eager mode and under CUDA graphs.

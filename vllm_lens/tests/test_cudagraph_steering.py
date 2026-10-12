@@ -155,3 +155,43 @@ def test_a_layer_outside_the_list_is_rejected(graph_llm, hidden):
     )
     with pytest.raises(ValueError, match="VLLM_LENS_STEER_LAYERS"):
         _run(graph_llm, [[vector]])
+
+
+@pytest.fixture(scope="module")
+def wide_graph_llm():
+    """CUDA graphs on with room for hundreds of requests in one step."""
+    env = {"VLLM_LENS_STEER_LAYERS": str(STEER_LAYER)}
+    engine = make_llm(
+        env, max_num_batched_tokens=8192, max_num_seqs=256, enable_prefix_caching=False
+    )
+    yield engine
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def test_many_requests_steer_within_a_bound(wide_graph_llm, hidden):
+    """Steering 256 requests in flight costs at most twice the unsteered pass: the per-step
+    work is a dictionary lookup per request, not a scan over every stored request."""
+    import time
+
+    prompts = (SHORT_PROMPTS * 86)[:256]
+    vector = _vector(0, hidden, scale=4.0)
+    steered = [
+        SamplingParams(
+            temperature=0.0,
+            max_tokens=16,
+            extra_args={"apply_steering_vectors": [vector]},
+        )
+    ] * 256
+    plain = [SamplingParams(temperature=0.0, max_tokens=16)] * 256
+    wide_graph_llm.generate(prompts, plain)  # warm the graphs
+    start = time.perf_counter()
+    wide_graph_llm.generate(prompts, plain)
+    unsteered_s = time.perf_counter() - start
+    start = time.perf_counter()
+    wide_graph_llm.generate(prompts, steered)
+    steered_s = time.perf_counter() - start
+    assert steered_s < 2.0 * unsteered_s, (
+        f"steered {steered_s:.2f}s, unsteered {unsteered_s:.2f}s"
+    )
