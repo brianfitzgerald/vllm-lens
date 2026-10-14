@@ -248,13 +248,9 @@ def _fill_steer_buffers(extension: Any) -> None:
     if query_start_loc is None or not extension._steering_data:
         return
     num_reqs = runner.input_batch.num_reqs
-    # vLLM 0.21 fills a pinned CPU copy of the layout before the forward pass, so
-    # reading it needs no host sync; a runner without it costs one sync per step.
-    layout = getattr(runner, "query_start_loc", None)
-    if layout is not None and hasattr(layout, "np"):
-        bounds = layout.np[: num_reqs + 1].astype(np.int64)
-    else:
-        bounds = np.asarray(query_start_loc[: num_reqs + 1].tolist(), dtype=np.int64)
+    # The runner fills a pinned CPU copy of the layout before the forward pass, so
+    # reading it needs no host sync.
+    bounds = runner.query_start_loc.np[: num_reqs + 1].astype(np.int64)
 
     # Each request resolves its key and row by dictionary lookups every step, so a request
     # id that vLLM reuses, or a key whose vectors were replaced, never keeps a stale row.

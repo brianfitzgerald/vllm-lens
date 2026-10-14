@@ -30,7 +30,6 @@ def _step(
     extension: SimpleNamespace,
     bounds: list[int],
     keys: list[str | None],
-    cpu_layout: bool,
     step: int = 0,
 ) -> None:
     """Run one fill with ``keys[i]`` as request i's sentinel and ``bounds`` as its layout.
@@ -48,16 +47,14 @@ def _step(
     runner = SimpleNamespace(
         input_batch=SimpleNamespace(num_reqs=len(keys), req_ids=list(requests)),
         requests=requests,
+        query_start_loc=SimpleNamespace(np=np.array(bounds, dtype=np.int32)),
     )
-    if cpu_layout:
-        runner.query_start_loc = SimpleNamespace(np=np.array(bounds, dtype=np.int32))
     extension.model_runner = runner
     monkeypatch.setattr(worker_ext, "_batch_layout", lambda runner, warn: layout)
     _fill_steer_buffers(extension)
 
 
-@pytest.mark.parametrize("cpu_layout", [True, False], ids=["cpu-layout", "host-sync"])
-def test_rows_land_on_their_requests(monkeypatch: pytest.MonkeyPatch, cpu_layout: bool):
+def test_rows_land_on_their_requests(monkeypatch: pytest.MonkeyPatch):
     """Two steered requests around an unsteered one fill their own rows and no other."""
     state = _SteerBuffers(
         add=torch.zeros(1, MAX_TOKENS, HIDDEN),
@@ -72,9 +69,7 @@ def test_rows_land_on_their_requests(monkeypatch: pytest.MonkeyPatch, cpu_layout
         _steer_rows={},
     )
 
-    _step(
-        monkeypatch, extension, [0, 4, 6, 7], ["_steer_0", None, "_steer_2"], cpu_layout
-    )
+    _step(monkeypatch, extension, [0, 4, 6, 7], ["_steer_0", None, "_steer_2"])
     direction = matched.activations[0]
     unit = direction / (direction.norm() + 1e-6)
     torch.testing.assert_close(
@@ -87,7 +82,7 @@ def test_rows_land_on_their_requests(monkeypatch: pytest.MonkeyPatch, cpu_layout
     assert set(extension._steer_rows) == {"_steer_0", "_steer_2"}
 
     # The next step steers nothing, so the rows of the last step are zero again.
-    _step(monkeypatch, extension, [0, 1], [None], cpu_layout, step=1)
+    _step(monkeypatch, extension, [0, 1], [None], step=1)
     assert state.add.abs().sum() == 0 and state.norm.abs().sum() == 0
     assert state.dirty == 0
 
@@ -102,18 +97,18 @@ def test_a_reused_request_id_takes_its_new_vector(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setitem(_STEER_STATE, "buffers", state)
     first, second = _vector(0, scale=1.0), _vector(1, scale=1.0)
     extension = SimpleNamespace(_steering_data={"_steer_0": [first]}, _steer_rows={})
-    _step(monkeypatch, extension, [0, 2], ["_steer_0"], True)
+    _step(monkeypatch, extension, [0, 2], ["_steer_0"])
     torch.testing.assert_close(state.add[0, 0:2], first.activations.expand(2, -1))
 
     # What set_steering_data does: new vectors under the key, and its row released.
     extension._steering_data["_steer_0"] = [second]
     state.free.append(extension._steer_rows.pop("_steer_0"))
-    _step(monkeypatch, extension, [0, 2], ["_steer_0"], True)
+    _step(monkeypatch, extension, [0, 2], ["_steer_0"])
     torch.testing.assert_close(state.add[0, 0:2], second.activations.expand(2, -1))
 
     extension._steering_data.clear()
     state.free.append(extension._steer_rows.pop("_steer_0"))
-    _step(monkeypatch, extension, [0, 2], ["_steer_0"], True)
+    _step(monkeypatch, extension, [0, 2], ["_steer_0"])
     assert state.add.abs().sum() == 0
 
 
@@ -127,6 +122,6 @@ def test_a_bad_vector_steers_nothing(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setitem(_STEER_STATE, "buffers", state)
     bad = SteeringVector(activations=torch.ones(1, HIDDEN + 1), layer_indices=[LAYER])
     extension = SimpleNamespace(_steering_data={"_steer_0": [bad]}, _steer_rows={})
-    _step(monkeypatch, extension, [0, 3], ["_steer_0"], True)
+    _step(monkeypatch, extension, [0, 3], ["_steer_0"])
     assert state.add.abs().sum() == 0 and state.norm.abs().sum() == 0
     assert extension._steer_rows["_steer_0"] == 0
