@@ -348,3 +348,51 @@ For serving validation, set `VLLM_LENS_STRICT_COMPATIBILITY=1`: a missing HTTP
 integration raises during plugin registration instead of only warning. The
 compatibility script sets this automatically. `VLLM_LENS_DISABLE=1` still makes
 the plugin a complete no-op, including in strict mode.
+
+
+## Fork consolidation paused — 2026-10-15
+
+The seven-PR fork stack is #16 → #3 → #17 → #19 → #21 → #22 → #24 (GitHub
+stack #23). Runtime candidate `04cb0d52bebdb28436971f763c263c47365e7d7a` adds the
+capture-transport work on #24; its production package tree is identical to `1ef7964`.
+The later commit changes only HTTP test model discovery. These measurements concern
+this fork stack, separately from the upstream compatibility matrix above.
+
+| Completed check | Revision | Result |
+| --- | --- | --- |
+| CPU unit suite | `1ef7964` / `04cb0d5` | 147 passed |
+| Broad CPU/GPU suite | `1ef7964` | 310 passed, 29 skipped |
+| Gemma2 targeted suite | `1ef7964` | 92 passed, 1 skipped |
+| Examples | `1ef7964` | 33 passed, 1 skipped |
+| HTTP suite, Llama-3.1-8B | `04cb0d5` | 159 passed |
+| Beachfinding live client | `1ef7964` | 10 passed |
+| Gemma2 graph smoke, candidate/repeat | `1ef7964` | 6 passed, 2 skipped each |
+
+Ruff 0.15.0 lint/format and Linux Pyright passed. The transfer-failure regressions
+cover zero-progress writes, failed reads/writes and partially opened shared shards.
+Earlier HTTP attempts against Qwen encountered test assumptions about model names and
+4096-wide hidden states; the final intended-model Llama suite passed.
+
+In one H200, graph full capture took 2.793 / 2.714 s versus 6.834 s on `a959270`;
+pooled capture took 2.063 / 2.060 s versus 2.530 s. Candidate projected capture took
+2.195 / 2.218 s, and steering was 1.00–1.03 times generation time. The old baseline
+failed reused-projection payload correctness; its projected and steering performance
+must not be used. Baseline metadata was corrected to the actually installed old SHA.
+
+Eager JSONs at `04cb0d5` contain all six workloads (full capture 3.501 / 3.776 s,
+old baseline 8.028 s), but the local runner was stopped before the repeat pytest
+summary was collected. The baseline failed projected-payload correctness. A fresh
+20-concept AxBench graph capture completed; probe/steering and full serving-throughput
+validation did not. A custom-model client test used the wrong steering input type;
+its corrected form is saved in Beachfinding and still needs live validation.
+
+Work was paused at the user's request. Temporary Modal apps and the local orchestrator
+were stopped; the canonical endpoint stays at `a959270`, scaled to zero. No candidate
+release pin or deployment promotion was made. Resume bounded validation before promotion:
+confirm eager completion, the corrected custom-model test, 20-/100-concept AxBench
+comparisons, and the serving-throughput gates. Historical judge results remain historical.
+
+The [Beachfinding handoff](https://github.com/brianfitzgerald/beachfinding/blob/bf/fork-pin/docs/experiment_logs/lens_bench.md#consolidation-paused--2026-10-15)
+records PR ownership, cleanup and validation gaps; raw smoke JSONs are in its
+`docs/data/lens_bench/consolidated-*` files. The AxBench report and fresh capture are
+on Beachfinding PR #88. No additional GPU or paid judge work is scheduled.
