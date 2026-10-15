@@ -558,6 +558,30 @@ def _capture_rows(
             ).append(piece)
 
 
+def _step_needs(extension: HiddenStatesExtension) -> tuple[bool, bool]:
+    """Whether this forward pass has a request that captures, and whether any steering or hook
+    is stored; computed on the first layer of the pass and kept for its other layers."""
+    context = get_forward_context()
+    cached = extension.__dict__.get("_step_needs_cache")
+    if cached is not None and cached[0] is context:
+        return cached[1]
+    runner = extension.model_runner
+    capture = False
+    for req_id in runner.input_batch.req_ids[: runner.input_batch.num_reqs]:
+        req_state = runner.requests.get(req_id)
+        params = req_state.sampling_params if req_state is not None else None
+        extra = params.extra_args if params is not None else None
+        if extra and extra.get("output_residual_stream") is not None:
+            capture = True
+            break
+    other = bool(
+        extension._steering_data or extension._hook_data or extension._persistent_hooks
+    )
+    # The context is held, so a later pass cannot reuse its id.
+    extension._step_needs_cache = (context, (capture, other))
+    return capture, other
+
+
 def _hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
@@ -567,14 +591,18 @@ def _hook_inner(
     query_start_loc = _batch_layout(extension.model_runner, warn=True)
     if query_start_loc is None:
         return None
+    capture, other = _step_needs(extension)
+    # A pass with no capture, steering or hook leaves the layer untouched.
+    if not (capture or other):
+        return None
     runner = extension.model_runner
     num_reqs = runner.input_batch.num_reqs
     req_ids = runner.input_batch.req_ids
 
     # --- Phase 1: detect steering requests --------------------------
-    per_req_steering: list[list[SteeringVector]] = []
+    per_req_steering: list[list[SteeringVector]] = [[] for _ in range(num_reqs)]
     needs_steering = False
-    for i in range(num_reqs):
+    for i in range(num_reqs if other else 0):
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
         extra = (
@@ -583,7 +611,7 @@ def _hook_inner(
             else None
         )
         configs = _find_steering_configs(extension, req_id, extra)
-        per_req_steering.append(configs)
+        per_req_steering[i] = configs
         if configs:
             needs_steering = True
 
@@ -625,10 +653,10 @@ def _hook_inner(
     # returned result index ("0", "1", ...) is stable regardless of how
     # many pre/post hooks a request mixes.  Pre-hooks are handled in
     # _pre_hook_inner using the same position keys.
-    per_req_hooks: list[list[Hook]] = []
+    per_req_hooks: list[list[Hook]] = [[] for _ in range(num_reqs)]
     needs_hooks = False
     persistent_hooks = extension._persistent_hooks
-    for i in range(num_reqs):
+    for i in range(num_reqs if other else 0):
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
         extra = (
@@ -637,7 +665,7 @@ def _hook_inner(
             else None
         )
         hooks = _find_hook_configs_no_persistent(extension, req_id, extra)
-        per_req_hooks.append(hooks)
+        per_req_hooks[i] = hooks
         if hooks or persistent_hooks:
             needs_hooks = True
 
@@ -704,7 +732,7 @@ def _hook_inner(
             )
 
     # --- Phase 3: capture activations (rank 0 only) -----------------
-    if getattr(extension, "_should_capture", True):
+    if capture and getattr(extension, "_should_capture", True):
         capture_src = modified_output if modified_output is not None else output
         hidden_states: Float[torch.Tensor, "total_tokens hidden_dim"]  # type: ignore[reportUndefinedVariable]
         if isinstance(capture_src, tuple):
@@ -730,6 +758,8 @@ def _pre_hook_inner(
     Only runs generic hooks — steering and activation capture are
     post-hook operations and are not affected.
     """
+    if not (extension._hook_data or extension._persistent_hooks):
+        return None
     query_start_loc = _batch_layout(extension.model_runner, warn=False)
     if query_start_loc is None:
         return None
