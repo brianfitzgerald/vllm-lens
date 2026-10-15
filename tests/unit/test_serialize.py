@@ -179,17 +179,25 @@ def test_packed_chunks_fill_each_tensor_in_order() -> None:
     assert all(start % 64 == 0 for *_, start, _ in packed["packed_index"])
 
 
-@pytest.mark.parametrize("entries", [1, 20])
-def test_packed_chunks_through_shared_files(tmp_path: Path, entries: int) -> None:
-    """Packed entries written to files travel as paths, and unpacking removes the files."""
-    tensors = [torch.randn(2, 4, 8).to(torch.bfloat16) for _ in range(entries)]
+@pytest.mark.parametrize(
+    ("entries", "shape"),
+    [(1, [2, 4, 8]), (20, [2, 4, 8]), (3, [2, 128, 512])],
+    ids=["one-small", "many-small", "large"],
+)
+def test_packed_chunks_through_shared_files(
+    tmp_path: Path, entries: int, shape: list[int]
+) -> None:
+    """Packed entries written to files travel as paths, small ones as byte ranges and large
+    ones entry by entry, and unpacking removes the files."""
+    tensors = [torch.randn(shape).to(torch.bfloat16) for _ in range(entries)]
     packed = pack_chunks(
         [
-            (str(n), "residual_stream", t.dtype, [2, 4, 8], [t])
+            (str(n), "residual_stream", t.dtype, shape, [t])
             for n, t in enumerate(tensors)
         ],
         str(tmp_path / "packed"),
     )
+    assert ("packed_shards" in packed) == (shape[1] == 128)
     assert "packed_buffer" not in packed and any(tmp_path.iterdir())
     recovered = unpack_payloads(pickle.loads(pickle.dumps(packed)))
     for n, tensor in enumerate(tensors):

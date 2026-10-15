@@ -57,6 +57,8 @@ _PACK_ALIGN = 64
 # Threads for the shared file: pwrite and preadv release the GIL, and one thread is bound by
 # its own memory copy, not by the file system.
 _IO_THREADS = 8
+# Entries at least this large on average go to the shared files straight from their chunks.
+_DIRECT_ENTRY_BYTES = 256 * 1024
 
 
 def _pwrite_all(fd: int, chunks: list[torch.Tensor], start: int) -> None:
@@ -87,13 +89,15 @@ def pack_chunks(
     path: str | None = None,
 ) -> dict[str, Any]:
     """Pack ``(id, key, dtype, shape, chunks)`` entries as one uint8 buffer and an index; each
-    entry's chunks, flattened in order, fill its tensor. With ``path`` the buffer goes to
-    ``_IO_THREADS`` shared-memory files ``path.<n>``, one byte range each, written in
-    parallel, and only the paths travel."""
+    entry's chunks, flattened in order, fill its tensor. With ``path`` the bytes go to
+    ``_IO_THREADS`` shared-memory files ``path.<n>``, written in parallel, and only the paths
+    travel: large entries straight from their chunks, small ones as byte ranges of a buffer."""
+    sizes = [math.prod(shape) * dtype.itemsize for _, _, dtype, shape, _ in entries]
+    if path is not None and sum(sizes) >= _DIRECT_ENTRY_BYTES * max(len(entries), 1):
+        return _pack_entries_to_files(entries, sizes, path)
     index: list[tuple[str, str, str, list[int], int, int]] = []
     offset = 0
-    for req_id, key, dtype, shape, _ in entries:
-        size = math.prod(shape) * dtype.itemsize
+    for (req_id, key, dtype, shape, _), size in zip(entries, sizes):
         index.append((req_id, key, str(dtype), shape, offset, size))
         offset += -(-size // _PACK_ALIGN) * _PACK_ALIGN
     buffer = torch.empty(offset, dtype=torch.uint8)
@@ -116,6 +120,39 @@ def pack_chunks(
         ]:
             write.result()
     return {"packed_index": index, "packed_path": path, "packed_size": offset}
+
+
+def _pack_entries_to_files(
+    entries: list[tuple[str, str, torch.dtype, list[int], list[torch.Tensor]]],
+    sizes: list[int],
+    path: str,
+) -> dict[str, Any]:
+    """Write each entry's chunks straight to one of ``_IO_THREADS`` files, entries dealt round
+    the files: for large entries, the copy into a buffer would cost more than the calls."""
+    index: list[tuple[str, str, str, list[int], int, int]] = []
+    shard_of: list[int] = []
+    ends = [0] * _IO_THREADS
+    for number, ((req_id, key, dtype, shape, _), size) in enumerate(
+        zip(entries, sizes)
+    ):
+        shard = number % _IO_THREADS
+        index.append((req_id, key, str(dtype), shape, ends[shard], size))
+        shard_of.append(shard)
+        ends[shard] += -(-size // _PACK_ALIGN) * _PACK_ALIGN
+
+    def _write_shard(shard: int) -> None:
+        fd = os.open(f"{path}.{shard}", os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        try:
+            for (*_, chunks), (*_, start, _), owner in zip(entries, index, shard_of):
+                if owner == shard:
+                    _pwrite_all(fd, chunks, start)
+        finally:
+            os.close(fd)
+
+    with ThreadPoolExecutor(_IO_THREADS) as pool:
+        for write in [pool.submit(_write_shard, shard) for shard in range(_IO_THREADS)]:
+            write.result()
+    return {"packed_index": index, "packed_path": path, "packed_shards": shard_of}
 
 
 def _byte_ranges(size: int) -> list[tuple[int, int]]:
@@ -165,6 +202,8 @@ def unpack_payloads(
     """Rebuild :func:`pack_chunks` input. Each tensor is copied out of the shared buffer, so
     pickling one later does not carry the others; the shared-memory files are removed."""
     path = packed.get("packed_path")
+    if path is not None and "packed_shards" in packed:
+        return _unpack_entries_from_files(packed)
     if path is None:
         buffer = torch.from_numpy(packed["packed_buffer"])
     else:
@@ -185,6 +224,33 @@ def unpack_payloads(
             .clone()
         )
         out.setdefault(req_id, {"activations": {}})["activations"][key] = tensor
+    return out
+
+
+def _unpack_entries_from_files(
+    packed: dict[str, Any],
+) -> dict[str, dict[str, dict[str, torch.Tensor]]]:
+    """Read each entry of :func:`_pack_entries_to_files` straight into its own tensor, then
+    remove the files."""
+    path = packed["packed_path"]
+    fds = [os.open(f"{path}.{shard}", os.O_RDONLY) for shard in range(_IO_THREADS)]
+    out: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
+    try:
+        with ThreadPoolExecutor(_IO_THREADS) as pool:
+            reads = []
+            entries = zip(packed["packed_index"], packed["packed_shards"])
+            for (req_id, key, dtype, shape, offset, _), shard in entries:
+                tensor = torch.empty(
+                    shape, dtype=getattr(torch, dtype.removeprefix("torch."))
+                )
+                reads.append(pool.submit(_pread_all, fds[shard], tensor, offset))
+                out.setdefault(req_id, {"activations": {}})["activations"][key] = tensor
+            for read in reads:
+                read.result()
+    finally:
+        for shard, fd in enumerate(fds):
+            os.close(fd)
+            os.unlink(f"{path}.{shard}")
     return out
 
 
