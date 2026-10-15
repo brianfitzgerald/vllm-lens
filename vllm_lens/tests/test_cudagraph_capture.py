@@ -19,7 +19,7 @@ CAPTURE_LAYERS = [0, 2, NUM_LAYERS - 1]
 def op_eager_llm():
     """The lens op with ``enforce_eager``: the kernels of ``eager_llm``."""
     env = {"VLLM_LENS_CAPTURE_LAYERS": ",".join(map(str, CAPTURE_LAYERS))}
-    engine = make_llm(env, enforce_eager=True)
+    engine = make_llm(env, enforce_eager=True, enable_prefix_caching=False)
     yield engine
     del engine
     gc.collect()
