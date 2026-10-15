@@ -8,6 +8,7 @@ import torch
 
 import vllm_lens._activations_plugin as plugin
 from vllm_lens import SteeringVector
+from vllm_lens._helpers._serialize import serialize_tensor
 
 
 class _FakeLLM:
@@ -17,6 +18,10 @@ class _FakeLLM:
         self.calls: list[str] = []
         self.fail_on = fail_on
         self._hooks_installed = True
+        model_config = SimpleNamespace(get_hidden_size=lambda: 4)
+        self.llm_engine = SimpleNamespace(
+            vllm_config=SimpleNamespace(model_config=model_config)
+        )
 
     def collective_rpc(self, method: str, args: tuple = ()) -> list:
         """Record the method name."""
@@ -58,22 +63,56 @@ def test_offline_generate_keeps_the_callers_params(
         assert received[0].extra_args == {"_steering_id": "_steer_0"}
 
 
-def test_async_generate_drops_client_sentinels(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A client cannot send the ``_steering_id`` / ``_hook_id`` sentinels to the workers."""
-    params = SimpleNamespace(
-        extra_args={"_steering_id": "_steer_0", "_hook_id": "_hook_0", "keep": 1},
-        skip_reading_prefix_cache=False,
-    )
+class _FakeAsyncEngine:
+    """Records the async RPCs; the model has hidden size 4."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self._hooks_installed = True
+        model_config = SimpleNamespace(get_hidden_size=lambda: 4)
+        self.vllm_config = SimpleNamespace(model_config=model_config)
+
+    async def collective_rpc(self, method: str, args: tuple = ()) -> list:
+        """Record the method name."""
+        self.calls.append(method)
+        return []
+
+
+@pytest.mark.parametrize(
+    ("extra", "sent", "calls"),
+    [
+        (
+            {"_steering_id": "_steer_0", "_hook_id": "_hook_0", "keep": 1},
+            {"keep": 1},
+            [],
+        ),
+        (
+            {"output_residual_stream_project": serialize_tensor(torch.ones(1, 4))},
+            None,
+            [],
+        ),
+    ],
+    ids=["client-sentinels", "projection-without-capture"],
+)
+def test_async_generate_sends_only_what_it_releases(
+    monkeypatch: pytest.MonkeyPatch, extra: dict, sent: dict | None, calls: list[str]
+) -> None:
+    """Client-sent sentinels are dropped, and directions are not sent for a request that
+    does not capture, since only a capture releases them."""
+    params = SimpleNamespace(extra_args=extra, skip_reading_prefix_cache=False)
     received: list = []
 
     async def original(self, prompt, sampling_params, request_id, **kwargs):
         received.append(dict(sampling_params.extra_args))
         yield SimpleNamespace(finished=True)
 
-    async def run() -> None:
-        async for _ in plugin._patched_generate(object(), "p", params, "r"):  # type: ignore[arg-type]
+    async def run(engine: _FakeAsyncEngine) -> None:
+        async for _ in plugin._patched_generate(engine, "p", params, "r"):  # type: ignore[arg-type]
             pass
 
     monkeypatch.setattr(plugin, "_original_generate", original)
-    asyncio.run(run())
-    assert received == [{"keep": 1}]
+    engine = _FakeAsyncEngine()
+    asyncio.run(run(engine))
+    assert engine.calls == calls
+    if sent is not None:
+        assert received == [sent]
