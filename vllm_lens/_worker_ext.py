@@ -1309,13 +1309,13 @@ class HiddenStatesExtension:
         if not external_req_ids:
             return None
         out: dict[str, dict[str, Any]] = {}
-        # Walk live state once and bucket by external id; matches the
-        # ``"{external_req_id}-"`` prefix rule from get_captured_states.
+        wanted = set(external_req_ids)
+        # An internal id is its external id, "-", and a suffix without "-"; the set lookup
+        # replaces a scan of every external id per internal id.
         for req_id in list(self._captured_states):
-            for external_req_id in external_req_ids:
-                if req_id.startswith(f"{external_req_id}-"):
-                    out[external_req_id] = self._build_payload(req_id)
-                    break
+            external_req_id = req_id.rpartition("-")[0]
+            if external_req_id in wanted and external_req_id not in out:
+                out[external_req_id] = self._build_payload(req_id)
         if not out:
             return None
         return pickle.dumps(out, protocol=pickle.HIGHEST_PROTOCOL)
