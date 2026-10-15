@@ -119,6 +119,20 @@ out = client.generate("Hello world", capture_layers=[15, 20])
 print(out.activations["residual_stream"].shape)
 ```
 
+To get one row per layer in place of every position, also pass `output_residual_stream_pool` (the client's `capture_pool`): `"last"` returns the last prompt position and `"mean"` returns the mean over the prompt positions. The result has shape `(n_layers, 1, hidden_dim)`. Generated positions are not included, and the result is the same with chunked prefill.
+
+```python
+out = client.generate("Hello world", capture_layers=[15, 20], capture_pool="last")
+print(out.activations["residual_stream"].shape)  # (2, 1, hidden_dim)
+```
+
+To get the projection of every position onto a few directions in place of the residual, pass `output_residual_stream_project` (the client's `capture_project`): a `(N, hidden_dim)` tensor, JSON-encoded with `serialize_tensor`. The response then holds `residual_stream_projection` with shape `(n_layers, total_pos, N)` and `residual_stream_norm` (the L2 norm of each position) with shape `(n_layers, total_pos)`, both float32, in place of `residual_stream`. It cannot be combined with `output_residual_stream_pool`. The workers hold one copy of each distinct direction set, however many requests send it.
+
+```python
+out = client.generate("Hello world", capture_layers=[15], capture_project=directions)
+print(out.activations["residual_stream_projection"].shape)  # (1, total_pos, N)
+```
+
 Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 only (residual streams are identical across TP ranks after all-reduce).
 
 #### Binary transport for large captures

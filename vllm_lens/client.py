@@ -33,15 +33,19 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import requests
 
 from vllm_lens._helpers._serialize import (
     decode_activations,
     deserialize_hook_results,
+    serialize_tensor,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -97,11 +101,14 @@ class VLLMLensClient:
 
     def _build_xargs(
         self,
+        *,
         hooks: list[Hook] | None,
         capture_layers: list[int] | None,
         steering_vectors: list[SteeringVector] | None,
-        activations_transport: str | None = None,
-        capture_qk: list[int] | bool | None = None,
+        activations_transport: str | None,
+        capture_qk: list[int] | bool | None,
+        capture_pool: Literal["last", "mean"] | None,
+        capture_project: torch.Tensor | None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
@@ -110,6 +117,12 @@ class VLLMLensClient:
             xargs["activations_transport"] = activations_transport
         if capture_qk is not None:
             xargs["output_qk"] = json.dumps(capture_qk)
+        if capture_pool is not None:
+            xargs["output_residual_stream_pool"] = capture_pool
+        if capture_project is not None:
+            xargs["output_residual_stream_project"] = json.dumps(
+                serialize_tensor(capture_project.float())
+            )
         if hooks is not None:
             xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
         if steering_vectors is not None:
@@ -169,6 +182,8 @@ class VLLMLensClient:
         capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
+        capture_pool: Literal["last", "mean"] | None = None,
+        capture_project: torch.Tensor | None = None,
         logprobs: int | None = None,
         echo: bool = False,
         **kwargs: Any,
@@ -185,6 +200,10 @@ class VLLMLensClient:
         ``capture_qk`` captures post-RoPE attention Q/K for the given
         layers (or all layers with ``True``); reconstruct patterns with
         :func:`vllm_lens.attention.attention_patterns`.
+
+        ``capture_pool`` returns one row per layer (the last prompt position or the
+        prompt mean); ``capture_project`` returns the projection of every position onto
+        its ``(N, hidden)`` rows and the norm of every position.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -199,7 +218,13 @@ class VLLMLensClient:
             body["echo"] = True
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
+            hooks=hooks,
+            capture_layers=capture_layers,
+            steering_vectors=steering_vectors,
+            activations_transport=activations_transport,
+            capture_qk=capture_qk,
+            capture_pool=capture_pool,
+            capture_project=capture_project,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -220,6 +245,8 @@ class VLLMLensClient:
         capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
+        capture_pool: Literal["last", "mean"] | None = None,
+        capture_project: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> GenerateOutput:
         """Generate a chat completion from a list of messages.
@@ -242,7 +269,13 @@ class VLLMLensClient:
         }
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
+            hooks=hooks,
+            capture_layers=capture_layers,
+            steering_vectors=steering_vectors,
+            activations_transport=activations_transport,
+            capture_qk=capture_qk,
+            capture_pool=capture_pool,
+            capture_project=capture_project,
         )
         if xargs:
             body["vllm_xargs"] = xargs

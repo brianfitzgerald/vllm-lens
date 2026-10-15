@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import base64
+import pickle
 
 import pytest
 import torch
 
 from vllm_lens._helpers._serialize import (
+    PackEntry,
     decode_activations,
     deserialize_tensor,
+    pack_chunks,
     serialize_activations,
     serialize_tensor,
+    unpack_payloads,
 )
 
 
@@ -119,3 +123,44 @@ def test_round_trip_qk_activations() -> None:
     assert torch.equal(recovered["attn_k"], activations["attn_k"])
     assert recovered["qk_layers"] == [2, 7]
     assert recovered["qk_meta"] == activations["qk_meta"]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_packed_chunks_round_trip(dtype: torch.dtype) -> None:
+    """Chunks fill their tensor in flat order, each tensor comes back in its own storage, and
+    a float32 tensor after an odd-sized one unpacks because offsets are aligned."""
+    layers = [
+        [torch.randn(2, 3).to(dtype), torch.randn(1, 3).to(dtype)] for _ in range(2)
+    ]
+    one = torch.randn(1, 3)[:, 2]
+    norms = torch.randn(1, 3)
+    packed = pack_chunks(
+        [
+            PackEntry("a", "residual_stream", dtype, [2, 3, 3], layers[0] + layers[1]),
+            PackEntry("a", "residual_stream_norm", torch.float32, [1, 3], [norms]),
+            PackEntry("b", "residual_stream_norm", torch.float32, [1, 1], [one]),
+        ]
+    )
+    recovered = unpack_payloads(pickle.loads(pickle.dumps(packed)))
+    expected = torch.stack([torch.cat(layer) for layer in layers])
+    stream = recovered["a"]["activations"]["residual_stream"]
+    assert stream.dtype == dtype and torch.equal(stream, expected)
+    assert stream.untyped_storage().nbytes() == stream.numel() * stream.element_size()
+    assert torch.equal(recovered["a"]["activations"]["residual_stream_norm"], norms)
+    assert torch.equal(recovered["b"]["activations"]["residual_stream_norm"], one[None])
+    assert all(start % 64 == 0 for *_, start, _ in packed["packed_index"])
+
+
+@pytest.mark.parametrize("rows", [1, 3], ids=["short", "long"])
+def test_packed_chunks_refuse_a_wrong_row_count(rows: int) -> None:
+    """Chunks that do not fill the shape exactly raise, in place of filling another entry."""
+    entry = PackEntry(
+        "a", "residual_stream", torch.float32, [2, 4], [torch.ones(rows, 4)]
+    )
+    with pytest.raises((ValueError, RuntimeError)):
+        pack_chunks([entry])
+
+
+def test_packed_chunks_empty() -> None:
+    """An empty batch packs and unpacks to nothing."""
+    assert unpack_payloads(pack_chunks([])) == {}
