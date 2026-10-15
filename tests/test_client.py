@@ -1,5 +1,6 @@
 """Tests for VLLMLensClient."""
 
+import requests
 import torch
 from vllm_lens import Hook, SteeringVector
 from vllm_lens.client import VLLMLensClient
@@ -28,9 +29,12 @@ def test_generate_with_logprobs(vllm_server):
     assert "top_logprobs" in output.logprobs
 
 
-def test_model_auto_detected(vllm_server):
+def test_model_auto_detected(vllm_server: str) -> None:
+    """The client discovers the served model, including models outside the Llama family."""
     client = VLLMLensClient(vllm_server)
-    assert "Llama" in client.model or "llama" in client.model
+    response = requests.get(f"{vllm_server}/v1/models", timeout=10)
+    response.raise_for_status()
+    assert client.model == response.json()["data"][0]["id"]
 
 
 def test_chat_returns_text(vllm_server):
