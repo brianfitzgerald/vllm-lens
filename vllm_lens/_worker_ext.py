@@ -663,7 +663,7 @@ def _step_needs(
     hook is stored, and each layer's steered requests as ``(batch index, key, vectors)``;
     computed on the first layer of the pass and kept for its other layers."""
     context = get_forward_context()
-    cached = extension.__dict__.get("_step_needs_cache")
+    cached = extension._step_needs_cache
     if cached is not None and cached[0] is context:
         return cached[1]
     runner = extension.model_runner
@@ -1210,6 +1210,18 @@ class HiddenStatesExtension:
     _steer_rows: dict[str, int] = {}
     # The eager path's (add, unit) rows per key and layer.
     _eager_rows: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+    # The forward context a pass's plan was made for, and the plan (see _step_needs).
+    _step_needs_cache: (
+        tuple[
+            Any,
+            tuple[
+                set[int] | None,
+                bool,
+                dict[int, list[tuple[int, str, list[SteeringVector]]]],
+            ],
+        ]
+        | None
+    ) = None
 
     # Per-request hook definitions:
     # key (external_req_id or _hook_id) → list of Hook
@@ -1573,9 +1585,9 @@ class HiddenStatesExtension:
         for external_req_id, rows in pooled:
             by_dtype.setdefault(rows.dtype, []).append((external_req_id, rows))
         for group in by_dtype.values():
-            host = torch.cat([rows.reshape(-1) for _, rows in group]).cpu()
+            on_host = torch.cat([rows.reshape(-1) for _, rows in group]).cpu()
             for (external_req_id, rows), part in zip(
-                group, host.split([rows.numel() for _, rows in group])
+                group, on_host.split([rows.numel() for _, rows in group])
             ):
                 entries.append(
                     (

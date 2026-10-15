@@ -1,7 +1,9 @@
 """Capture collection needs no GPU: rows go to the right request, and the batch RPC finds
 each request's capture by its external id."""
 
+import os
 import pickle
+import socket
 from types import SimpleNamespace
 from typing import Any
 
@@ -139,3 +141,23 @@ def test_batch_splits_projected_rows_into_scores_and_norms() -> None:
     assert torch.equal(activations["residual_stream_projection"], rows[None, :, :3])
     assert torch.equal(activations["residual_stream_norm"], rows[None, :, 3])
     assert extension._projections == {}
+
+
+def test_a_pooled_batch_from_this_host_goes_through_shared_memory() -> None:
+    """A batch with a pooled capture, asked for from the worker's own host, travels as file
+    paths whenever the host has /dev/shm."""
+    extension = SimpleNamespace(
+        _captured_states={"0-ab": {2: [torch.ones(1, HIDDEN)]}},
+        _pooled_counts={"0-ab": {2: (1, torch.bfloat16, 1)}},
+        _projections={},
+    )
+    result = HiddenStatesExtension.get_captured_states_batch(  # type: ignore[arg-type]
+        extension, ["0"], socket.gethostname()
+    )
+    packed = pickle.loads(result)
+    assert ("packed_path" in packed) == os.path.isdir("/dev/shm")
+    assert unpack_payloads(packed)["0"]["activations"]["residual_stream"].shape == (
+        1,
+        1,
+        HIDDEN,
+    )
