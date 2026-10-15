@@ -12,6 +12,7 @@ per-request activations for both online (async) and offline (sync) usage.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -275,6 +276,18 @@ def _decode_steering_vectors(value: Any) -> list[SteeringVector] | None:
     ]
 
 
+def _compact_vectors(vectors: list[SteeringVector]) -> list[SteeringVector]:
+    """Copy each vector that is a view into a larger storage, so its pickle holds the vector
+    alone: a row of an ``(N, hidden)`` matrix pickles the whole matrix."""
+    compact = []
+    for sv in vectors:
+        tensor = sv.activations
+        if tensor.untyped_storage().nbytes() != tensor.numel() * tensor.element_size():
+            sv = sv.model_copy(update={"activations": tensor.detach().clone()})
+        compact.append(sv)
+    return compact
+
+
 def _decode_hooks(value: Any) -> list[Hook] | None:
     """Normalise an ``apply_hooks`` extra_args value.
 
@@ -450,22 +463,19 @@ async def _patched_generate(
         await self.collective_rpc("install_qk_hooks")
         setattr(self, "_qk_hooks_installed", True)
 
-    # Send steering data to workers before the forward pass begins.
-    if steering_vectors is not None:
-        await self.collective_rpc(
-            "set_steering_data",
-            args=(request_id, pickle.dumps(steering_vectors)),
-        )
-
-    # Send hook data to workers before the forward pass begins.
-    if hooks_list is not None:
-        await self.collective_rpc(
-            "set_hook_data",
-            args=(request_id, cloudpickle.dumps(hooks_list)),
-        )
-
     assert _original_generate is not None
+    # The set RPCs run inside the try, so a failure among them still releases the rest.
     try:
+        if steering_vectors is not None:
+            await self.collective_rpc(
+                "set_steering_data",
+                args=(request_id, pickle.dumps(_compact_vectors(steering_vectors))),
+            )
+        if hooks_list is not None:
+            await self.collective_rpc(
+                "set_hook_data",
+                args=(request_id, cloudpickle.dumps(hooks_list)),
+            )
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
@@ -534,12 +544,21 @@ def _prepare_offline_params(
 
     Returns the state dict consumed by :func:`_finalize_offline_outputs`.
     """
-    if isinstance(sampling_params, Sequence):
-        params_list = list(sampling_params)
-    elif sampling_params is not None:
-        params_list = [sampling_params]
-    else:
-        params_list = []
+    # Copies with their own extra_args: what follows strips and rewrites extra_args, and the
+    # caller may pass the same SamplingParams to the next call.
+    source = (
+        list(sampling_params)
+        if isinstance(sampling_params, Sequence)
+        else [sampling_params]
+        if sampling_params is not None
+        else []
+    )
+    params_list = []
+    for sp in source:
+        own = copy.copy(sp)
+        if sp.extra_args:
+            own.extra_args = dict(sp.extra_args)
+        params_list.append(own)
 
     wants_activations = any(
         (sp.extra_args or {}).get("output_residual_stream") is not None
@@ -558,7 +577,7 @@ def _prepare_offline_params(
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
         if vectors is not None:
             steering_id = f"_steer_{idx}"
-            steering_payloads[steering_id] = pickle.dumps(vectors)
+            steering_payloads[steering_id] = pickle.dumps(_compact_vectors(vectors))
             if sp.extra_args is None:
                 sp.extra_args = {}
             sp.extra_args["_steering_id"] = steering_id
@@ -610,6 +629,12 @@ def _prepare_offline_params(
         "wants_qk": wants_qk,
         "steering_payloads": steering_payloads,
         "hook_payloads": hook_payloads,
+        # The copies vLLM receives in place of the caller's SamplingParams.
+        "sampling_params": (
+            params_list
+            if isinstance(sampling_params, Sequence)
+            else (params_list[0] if params_list else None)
+        ),
     }
 
 
@@ -626,9 +651,7 @@ def _finalize_offline_outputs(
     """
     wants_activations = state["wants_activations"]
     wants_qk = state.get("wants_qk", False)
-    steering_payloads = state["steering_payloads"]
-    hook_payloads = state["hook_payloads"]
-    has_hooks = len(hook_payloads) > 0
+    has_hooks = len(state["hook_payloads"]) > 0
 
     if wants_activations:
         req_ids = [output.request_id for output in outputs]
@@ -666,18 +689,19 @@ def _finalize_offline_outputs(
             if merged is not None:
                 output.hook_results = merged
 
-    # Clean up steering data.
-    for sid in steering_payloads:
-        self.collective_rpc("clear_steering_data", args=(sid,))
-
-    # Clean up hook data and contexts.
-    for hid in hook_payloads:
-        self.collective_rpc("clear_hook_data", args=(hid,))
     if has_hooks:
         for output in outputs:
             self.collective_rpc("clear_hook_contexts", args=(output.request_id,))
-
+    _release_offline_state(self, state)
     return outputs
+
+
+def _release_offline_state(self: LLM, state: dict[str, Any]) -> None:
+    """Clear the steering and hook data that :func:`_prepare_offline_params` sent."""
+    for sid in state["steering_payloads"]:
+        self.collective_rpc("clear_steering_data", args=(sid,))
+    for hid in state["hook_payloads"]:
+        self.collective_rpc("clear_hook_data", args=(hid,))
 
 
 def _patched_llm_generate(
@@ -694,7 +718,13 @@ def _patched_llm_generate(
     """
     state = _prepare_offline_params(self, sampling_params)
     assert _original_llm_generate is not None
-    outputs = _original_llm_generate(self, prompts, sampling_params, *args, **kwargs)
+    try:
+        outputs = _original_llm_generate(
+            self, prompts, state["sampling_params"], *args, **kwargs
+        )
+    except BaseException:
+        _release_offline_state(self, state)
+        raise
     return _finalize_offline_outputs(self, outputs, state)
 
 
@@ -716,7 +746,13 @@ def _patched_llm_chat(
     """
     state = _prepare_offline_params(self, sampling_params)
     assert _original_llm_chat is not None
-    outputs = _original_llm_chat(self, messages, sampling_params, *args, **kwargs)
+    try:
+        outputs = _original_llm_chat(
+            self, messages, state["sampling_params"], *args, **kwargs
+        )
+    except BaseException:
+        _release_offline_state(self, state)
+        raise
     return _finalize_offline_outputs(self, outputs, state)
 
 
@@ -953,6 +989,25 @@ def _report_integration_failure(component: str, error: Exception) -> None:
     logger.warning(message)
 
 
+def _configure_logging() -> None:
+    """Attach a stderr handler to the ``vllm_lens`` logger when it has none.
+    vLLM configures only its own ``vllm`` logger tree."""
+    pkg_logger = logging.getLogger("vllm_lens")
+    if not pkg_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[vllm-lens] %(levelname)s %(message)s"))
+        pkg_logger.addHandler(handler)
+        # The handler prints the record, so a root handler must not print it again.
+        pkg_logger.propagate = False
+        pkg_logger.setLevel(logging.INFO)
+    level = os.environ.get("VLLM_LENS_LOG_LEVEL", "").strip().upper()
+    if level in logging.getLevelNamesMapping():
+        pkg_logger.setLevel(level)
+    elif level:
+        # Ignored with a warning: an error in register() stops every vLLM process.
+        logger.warning("VLLM_LENS_LOG_LEVEL=%s is not a log level; ignored.", level)
+
+
 def register() -> None:
     """Entry point called by vLLM's plugin system at engine startup.
 
@@ -981,6 +1036,7 @@ def register() -> None:
     ):
         logger.info("VLLM_LENS_DISABLE set; vllm-lens activation plugin inactive.")
         return
+    _configure_logging()
 
     global _original_create_engine_config
     global _original_generate, _original_llm_generate, _original_llm_chat
