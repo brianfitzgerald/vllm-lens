@@ -86,27 +86,43 @@ def pack_chunks(
 ) -> dict[str, Any]:
     """Pack ``(id, key, dtype, shape, chunks)`` entries as one uint8 buffer and an index; each
     entry's chunks, flattened in order, fill its tensor, so each row is copied once. With
-    ``path`` the buffer is a shared-memory file there, and only its path travels."""
+    ``path`` the entries go to ``_IO_THREADS`` shared-memory files ``path.<n>``, written in
+    parallel, and only the paths travel."""
+    shards = _IO_THREADS if path is not None else 1
     index: list[tuple[str, str, str, list[int], int, int]] = []
-    offset = 0
-    for req_id, key, dtype, shape, _ in entries:
+    shard_of: list[int] = []
+    ends = [0] * shards
+    for number, (req_id, key, dtype, shape, _) in enumerate(entries):
         size = math.prod(shape) * dtype.itemsize
-        index.append((req_id, key, str(dtype), shape, offset, size))
-        offset += -(-size // _PACK_ALIGN) * _PACK_ALIGN
+        shard = number % shards
+        index.append((req_id, key, str(dtype), shape, ends[shard], size))
+        shard_of.append(shard)
+        ends[shard] += -(-size // _PACK_ALIGN) * _PACK_ALIGN
     if path is not None:
-        # Large writes: a mapped file would fault in every new page from the writing process.
-        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
-        try:
-            with ThreadPoolExecutor(_IO_THREADS) as pool:
-                writes = [
-                    pool.submit(_pwrite_all, fd, chunks, start)
-                    for (*_, chunks), (*_, start, _) in zip(entries, index)
-                ]
-                for write in writes:
-                    write.result()
-        finally:
-            os.close(fd)
-        return {"packed_index": index, "packed_path": path, "packed_size": offset}
+        # One file per thread: writes to one file serialize on its inode lock.
+        def _write_shard(shard: int) -> None:
+            fd = os.open(
+                f"{path}.{shard}", os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600
+            )
+            try:
+                for (*_, chunks), (*_, start, _), owner in zip(
+                    entries, index, shard_of
+                ):
+                    if owner == shard:
+                        _pwrite_all(fd, chunks, start)
+            finally:
+                os.close(fd)
+
+        with ThreadPoolExecutor(shards) as pool:
+            for write in [pool.submit(_write_shard, shard) for shard in range(shards)]:
+                write.result()
+        return {
+            "packed_index": index,
+            "packed_path": path,
+            "packed_shards": shard_of,
+            "packed_files": shards,
+        }
+    offset = ends[0]
     buffer = torch.empty(offset, dtype=torch.uint8)
     for (_, _, dtype, _, chunks), (*_, start, size) in zip(entries, index):
         target = buffer[start : start + size].view(dtype)
@@ -141,23 +157,26 @@ def unpack_payloads(
     path = packed.get("packed_path")
     if path is not None:
         # Each tensor is read straight into its own storage: one copy, no mapped pages.
-        fd = os.open(path, os.O_RDONLY)
+        files = packed["packed_files"]
+        fds = [os.open(f"{path}.{shard}", os.O_RDONLY) for shard in range(files)]
         try:
-            with ThreadPoolExecutor(_IO_THREADS) as pool:
+            with ThreadPoolExecutor(files) as pool:
                 reads = []
-                for req_id, key, dtype, shape, offset, _ in packed["packed_index"]:
+                entries = zip(packed["packed_index"], packed["packed_shards"])
+                for (req_id, key, dtype, shape, offset, _), shard in entries:
                     tensor = torch.empty(
                         shape, dtype=getattr(torch, dtype.removeprefix("torch."))
                     )
-                    reads.append(pool.submit(_pread_all, fd, tensor, offset))
+                    reads.append(pool.submit(_pread_all, fds[shard], tensor, offset))
                     out.setdefault(req_id, {"activations": {}})["activations"][key] = (
                         tensor
                     )
                 for read in reads:
                     read.result()
         finally:
-            os.close(fd)
-            os.unlink(path)
+            for shard, fd in enumerate(fds):
+                os.close(fd)
+                os.unlink(f"{path}.{shard}")
         return out
     buffer = torch.from_numpy(packed["packed_buffer"])
     for req_id, key, dtype, shape, offset, size in packed["packed_index"]:

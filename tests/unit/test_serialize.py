@@ -179,14 +179,19 @@ def test_packed_chunks_fill_each_tensor_in_order() -> None:
     assert all(start % 64 == 0 for *_, start, _ in packed["packed_index"])
 
 
-def test_packed_chunks_through_a_shared_file(tmp_path: Path) -> None:
-    """A packed buffer written to a file travels as its path, and unpacking removes the file."""
-    rows = torch.randn(2, 4, 8).to(torch.bfloat16)
-    path = tmp_path / "packed"
+@pytest.mark.parametrize("entries", [1, 20])
+def test_packed_chunks_through_shared_files(tmp_path: Path, entries: int) -> None:
+    """Packed entries written to files travel as paths, and unpacking removes the files."""
+    tensors = [torch.randn(2, 4, 8).to(torch.bfloat16) for _ in range(entries)]
     packed = pack_chunks(
-        [("a", "residual_stream", rows.dtype, [2, 4, 8], [rows])], str(path)
+        [
+            (str(n), "residual_stream", t.dtype, [2, 4, 8], [t])
+            for n, t in enumerate(tensors)
+        ],
+        str(tmp_path / "packed"),
     )
-    assert "packed_buffer" not in packed and path.exists()
+    assert "packed_buffer" not in packed and any(tmp_path.iterdir())
     recovered = unpack_payloads(pickle.loads(pickle.dumps(packed)))
-    assert torch.equal(recovered["a"]["activations"]["residual_stream"], rows)
-    assert not path.exists()
+    for n, tensor in enumerate(tensors):
+        assert torch.equal(recovered[str(n)]["activations"]["residual_stream"], tensor)
+    assert not any(tmp_path.iterdir())
