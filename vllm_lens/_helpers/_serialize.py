@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import math
 import os
@@ -71,6 +72,8 @@ def _pwrite_all(fd: int, chunks: list[torch.Tensor], start: int) -> None:
         view = memoryview(flat.view(torch.uint8).numpy())
         while view:
             written = os.pwrite(fd, view, start)
+            if written == 0:
+                raise OSError(f"the file accepted no bytes at offset {start}")
             view, start = view[written:], start + written
 
 
@@ -113,12 +116,16 @@ def pack_chunks(
     # A few large writes, one file per thread: per-entry calls cost more than the bytes, and
     # writes to one file serialize on its inode lock.
     ranges = _byte_ranges(offset)
-    with ThreadPoolExecutor(len(ranges)) as pool:
-        for write in [
-            pool.submit(_write_file, f"{path}.{n}", buffer[low:high])
-            for n, (low, high) in enumerate(ranges)
-        ]:
-            write.result()
+    try:
+        with ThreadPoolExecutor(len(ranges)) as pool:
+            for write in [
+                pool.submit(_write_file, f"{path}.{n}", buffer[low:high])
+                for n, (low, high) in enumerate(ranges)
+            ]:
+                write.result()
+    except BaseException:
+        _remove_shared_files(path)
+        raise
     return {"packed_index": index, "packed_path": path, "packed_size": offset}
 
 
@@ -149,10 +156,23 @@ def _pack_entries_to_files(
         finally:
             os.close(fd)
 
-    with ThreadPoolExecutor(_IO_THREADS) as pool:
-        for write in [pool.submit(_write_shard, shard) for shard in range(_IO_THREADS)]:
-            write.result()
+    try:
+        with ThreadPoolExecutor(_IO_THREADS) as pool:
+            for write in [
+                pool.submit(_write_shard, shard) for shard in range(_IO_THREADS)
+            ]:
+                write.result()
+    except BaseException:
+        _remove_shared_files(path)
+        raise
     return {"packed_index": index, "packed_path": path, "packed_shards": shard_of}
+
+
+def _remove_shared_files(path: str) -> None:
+    """Remove every shard, including partial files left by a failed transfer."""
+    for shard in range(_IO_THREADS):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(f"{path}.{shard}")
 
 
 def _byte_ranges(size: int) -> list[tuple[int, int]]:
@@ -209,12 +229,15 @@ def unpack_payloads(
     else:
         buffer = torch.empty(packed["packed_size"], dtype=torch.uint8)
         ranges = _byte_ranges(packed["packed_size"])
-        with ThreadPoolExecutor(len(ranges)) as pool:
-            for read in [
-                pool.submit(_read_file, f"{path}.{n}", buffer[low:high])
-                for n, (low, high) in enumerate(ranges)
-            ]:
-                read.result()
+        try:
+            with ThreadPoolExecutor(len(ranges)) as pool:
+                for read in [
+                    pool.submit(_read_file, f"{path}.{n}", buffer[low:high])
+                    for n, (low, high) in enumerate(ranges)
+                ]:
+                    read.result()
+        finally:
+            _remove_shared_files(path)
     out: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
     for req_id, key, dtype, shape, offset, size in packed["packed_index"]:
         tensor = (
@@ -233,9 +256,11 @@ def _unpack_entries_from_files(
     """Read each entry of :func:`_pack_entries_to_files` straight into its own tensor, then
     remove the files."""
     path = packed["packed_path"]
-    fds = [os.open(f"{path}.{shard}", os.O_RDONLY) for shard in range(_IO_THREADS)]
+    fds: list[int] = []
     out: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
     try:
+        for shard in range(_IO_THREADS):
+            fds.append(os.open(f"{path}.{shard}", os.O_RDONLY))
         with ThreadPoolExecutor(_IO_THREADS) as pool:
             reads = []
             entries = zip(packed["packed_index"], packed["packed_shards"])
@@ -248,9 +273,9 @@ def _unpack_entries_from_files(
             for read in reads:
                 read.result()
     finally:
-        for shard, fd in enumerate(fds):
+        for fd in fds:
             os.close(fd)
-            os.unlink(f"{path}.{shard}")
+        _remove_shared_files(path)
     return out
 
 

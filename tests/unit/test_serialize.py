@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import os
 import pickle
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -215,3 +217,47 @@ def test_packed_chunks_take_strided_one_element_slices(tmp_path: Path) -> None:
         )
         recovered = unpack_payloads(pickle.loads(pickle.dumps(packed)))
         assert recovered["a"]["activations"]["residual_stream_norm"].tolist() == [[4.0]]
+
+
+@pytest.mark.parametrize("shape", [[2, 4, 8], [2, 128, 512]], ids=["small", "large"])
+@pytest.mark.parametrize("operation", ["pwrite", "preadv"])
+@pytest.mark.parametrize("zero", [False, True], ids=["io-error", "no-progress"])
+def test_failed_shared_transfer_removes_all_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: list[int],
+    operation: str,
+    zero: bool,
+) -> None:
+    """A failed or stalled write/read raises and removes every temporary shard."""
+    tensor = torch.ones(shape, dtype=torch.bfloat16)
+    entries = [("a", "residual_stream", tensor.dtype, shape, [tensor])]
+    path = str(tmp_path / "packed")
+    packed = pack_chunks(entries, path) if operation == "preadv" else None
+    monkeypatch.setattr(
+        os,
+        operation,
+        Mock(return_value=0) if zero else Mock(side_effect=OSError("I/O failed")),
+    )
+    with pytest.raises(OSError):
+        if packed is None:
+            pack_chunks(entries, path)
+        else:
+            unpack_payloads(packed)
+    assert not any(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("shape", [[2, 4, 8], [2, 128, 512]], ids=["small", "large"])
+def test_a_missing_shared_shard_removes_the_remaining_files(
+    tmp_path: Path, shape: list[int]
+) -> None:
+    """An unavailable shard still releases the other files and already opened descriptors."""
+    tensor = torch.ones(shape, dtype=torch.bfloat16)
+    path = tmp_path / "packed"
+    packed = pack_chunks(
+        [("a", "residual_stream", tensor.dtype, shape, [tensor])], str(path)
+    )
+    path.with_suffix(".1").unlink()
+    with pytest.raises(FileNotFoundError):
+        unpack_payloads(packed)
+    assert not any(tmp_path.iterdir())
