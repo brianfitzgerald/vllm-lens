@@ -52,6 +52,8 @@ def _encode_tensor(tensor: torch.Tensor) -> tuple[bytes, dict[str, Any]]:
     return compressed, meta
 
 
+# Marks a failed call in a ``run_calls`` result.
+RUN_CALLS_ERROR = "__vllm_lens_call_error__"
 # Every packed tensor starts on this byte boundary, so any dtype view of it is aligned.
 _PACK_ALIGN = 64
 # Threads for the shared file: pwrite and preadv release the GIL, and one thread is bound by

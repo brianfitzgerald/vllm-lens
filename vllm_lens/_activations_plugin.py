@@ -12,6 +12,7 @@ per-request activations for both online (async) and offline (sync) usage.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -28,6 +29,7 @@ import zstandard as zstd
 
 from vllm_lens._cudagraph import LensGraphConfig, install_graph_patches
 from vllm_lens._helpers._serialize import (
+    RUN_CALLS_ERROR,
     deserialize_directions,
     serialize_activations,
     serialize_activations_binary,
@@ -448,6 +450,60 @@ def _patched_create_engine_config(self, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 
+class _CallCoalescer:
+    """Sends the per-request worker calls of the online path as one ``run_calls`` RPC, one at
+    a time, so the calls that arrive while one is in flight go together in the next."""
+
+    def __init__(self, engine: AsyncLLM) -> None:
+        self._engine = engine
+        self._pending: list[tuple[str, tuple[Any, ...], asyncio.Future[list[Any]]]] = []
+        self._running = False
+
+    async def call(self, name: str, args: tuple[Any, ...]) -> list[Any]:
+        """Run ``name(*args)`` on every worker and return the per-rank results."""
+        future: asyncio.Future[list[Any]] = asyncio.get_running_loop().create_future()
+        self._pending.append((name, args, future))
+        if not self._running:
+            self._running = True
+            asyncio.ensure_future(self._drain())
+        return await future
+
+    async def _drain(self) -> None:
+        """Send the queued calls until none is left."""
+        try:
+            while self._pending:
+                # One turn of the loop, so the requests resumed with this one queue too.
+                await asyncio.sleep(0)
+                batch, self._pending = self._pending, []
+                calls = [(name, args) for name, args, _ in batch]
+                try:
+                    per_rank = await self._engine.collective_rpc(
+                        "run_calls", args=(calls,)
+                    )
+                except Exception as error:  # noqa: BLE001
+                    for *_, future in batch:
+                        if not future.done():
+                            future.set_exception(error)
+                    continue
+                for position, (_, _, future) in enumerate(batch):
+                    results = [rank[position] for rank in per_rank]
+                    failed = [
+                        r[1]
+                        for r in results
+                        if isinstance(r, tuple)
+                        and len(r) == 2
+                        and r[0] == RUN_CALLS_ERROR
+                    ]
+                    if future.done():
+                        continue
+                    if failed:
+                        future.set_exception(RuntimeError(failed[0]))
+                    else:
+                        future.set_result(results)
+        finally:
+            self._running = False
+
+
 async def _patched_generate(
     self: AsyncLLM,
     prompt: str,
@@ -535,28 +591,29 @@ async def _patched_generate(
         setattr(self, "_qk_hooks_installed", True)
 
     assert _original_generate is not None
+    calls = self.__dict__.get("_lens_calls")
+    if calls is None:
+        calls = _CallCoalescer(self)
+        setattr(self, "_lens_calls", calls)
     # The set RPCs run inside the try, so a failure among them still releases the rest.
     try:
         if steering_vectors is not None:
-            await self.collective_rpc(
+            await calls.call(
                 "set_steering_data",
-                args=(request_id, pickle.dumps(_compact_vectors(steering_vectors))),
+                (request_id, pickle.dumps(_compact_vectors(steering_vectors))),
             )
         if projection is not None:
-            await self.collective_rpc("set_projection_directions", args=projection)
+            await calls.call("set_projection_directions", projection)
         if hooks_list is not None:
-            await self.collective_rpc(
-                "set_hook_data",
-                args=(request_id, cloudpickle.dumps(hooks_list)),
+            await calls.call(
+                "set_hook_data", (request_id, cloudpickle.dumps(hooks_list))
             )
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
             if output.finished:
                 if wants_activations:
-                    states = await self.collective_rpc(
-                        "get_captured_states", args=(request_id,)
-                    )
+                    states = await calls.call("get_captured_states", (request_id,))
                     activations = _merge_captured_states(states)
                     if activations is not None:
                         n_prompt = len(output.prompt_token_ids)
@@ -565,9 +622,7 @@ async def _patched_generate(
                         output.activations = activations
                         output._vllm_lens_transport = activations_transport
                 if wants_qk:
-                    qk_states = await self.collective_rpc(
-                        "get_captured_qk", args=(request_id,)
-                    )
+                    qk_states = await calls.call("get_captured_qk", (request_id,))
                     qk = _merge_captured_qk(qk_states)
                     if qk is not None:
                         n_prompt = len(output.prompt_token_ids)
@@ -577,27 +632,23 @@ async def _patched_generate(
                         merged_acts.update(qk)
                         output.activations = merged_acts
                 if hooks_list is not None:
-                    raw_results = await self.collective_rpc(
-                        "get_hook_results", args=(request_id,)
-                    )
+                    raw_results = await calls.call("get_hook_results", (request_id,))
                     merged = _merge_hook_results(raw_results)
                     if merged is not None:
                         output.hook_results = merged
             yield output
     finally:
         if steering_vectors is not None:
-            await self.collective_rpc("clear_steering_data", args=(request_id,))
+            await calls.call("clear_steering_data", (request_id,))
         if projection is not None:
-            await self.collective_rpc(
-                "clear_projection_directions", args=(projection[0],)
-            )
+            await calls.call("clear_projection_directions", (projection[0],))
         if wants_activations:
-            await self.collective_rpc("clear_captured_states", args=(request_id,))
+            await calls.call("clear_captured_states", (request_id,))
         if wants_qk:
-            await self.collective_rpc("clear_captured_qk", args=(request_id,))
+            await calls.call("clear_captured_qk", (request_id,))
         if hooks_list is not None:
-            await self.collective_rpc("clear_hook_data", args=(request_id,))
-            await self.collective_rpc("clear_hook_contexts", args=(request_id,))
+            await calls.call("clear_hook_data", (request_id,))
+            await calls.call("clear_hook_contexts", (request_id,))
 
 
 # ---------------------------------------------------------------------------
