@@ -250,38 +250,20 @@ def _find_steering_configs(
     return results
 
 
-def _find_hook_configs(
+def _request_hooks(
     extension: HiddenStatesExtension,
     internal_req_id: str,
     extra_args: dict[str, Any] | None,
 ) -> list[Hook]:
-    """Find all hook definitions that apply to an internal request ID.
-
-    Checks three sources (in order):
-    1. Per-request hooks keyed by external ID prefix (async path).
-    2. Per-request hooks keyed by ``_hook_id`` sentinel (offline path).
-    3. Persistent hooks (apply to every request).
-    """
-    results = _find_hook_configs_no_persistent(extension, internal_req_id, extra_args)
-    results.extend(extension._persistent_hooks)
-    return results
-
-
-def _find_hook_configs_no_persistent(
-    extension: HiddenStatesExtension,
-    internal_req_id: str,
-    extra_args: dict[str, Any] | None,
-) -> list[Hook]:
-    """Find per-request hook definitions only (excludes persistent hooks)."""
-    results: list[Hook] = []
-    for external_id, hooks in extension._hook_data.items():
-        if internal_req_id.startswith(f"{external_id}-"):
-            results.extend(hooks)
-    if extra_args:
-        hook_id = extra_args.get("_hook_id")
-        if hook_id and hook_id in extension._hook_data:
-            results.extend(extension._hook_data[hook_id])
-    return results
+    """The per-request hooks of a request: the offline ``_hook_id`` sentinel, else its
+    external id (the internal id before its last ``-``)."""
+    data = extension._hook_data
+    if not data:
+        return []
+    hook_id = extra_args.get("_hook_id") if extra_args else None
+    if hook_id is not None:
+        return data.get(hook_id, [])
+    return data.get(internal_req_id.rpartition("-")[0], [])
 
 
 def norm_match(
@@ -468,7 +450,7 @@ def _hook_inner(
             if req_state and req_state.sampling_params
             else None
         )
-        hooks = _find_hook_configs_no_persistent(extension, req_id, extra)
+        hooks = _request_hooks(extension, req_id, extra)
         per_req_hooks.append(hooks)
         if hooks or persistent_hooks:
             needs_hooks = True
@@ -667,7 +649,7 @@ def _pre_hook_inner(
             if req_state and req_state.sampling_params
             else None
         )
-        per_req = _find_hook_configs_no_persistent(extension, req_id, extra)
+        per_req = _request_hooks(extension, req_id, extra)
         if not any(h.pre for h in persistent_hooks) and not any(h.pre for h in per_req):
             continue
 
@@ -1027,24 +1009,24 @@ class HiddenStatesExtension:
 
         self._steering_data[key] = vectors
 
-    def clear_steering_data(self, key: str) -> None:
-        """Remove steering data for a completed request."""
-        self._steering_data.pop(key, None)
+    def set_steering_data_batch(self, items: dict[str, bytes]) -> None:
+        """``set_steering_data`` for many requests in one RPC (the offline path)."""
+        for key, pickled_data in items.items():
+            self.set_steering_data(key, pickled_data)
 
-    def clear_captured_states(self, external_req_id: str) -> None:
-        """Remove captured activations without returning them.
-
-        Called in the ``finally`` block of ``_patched_generate`` to clean
-        up leaked state when a request is aborted or the client disconnects
-        before ``get_captured_states`` is called.  On normal completion this
-        is a no-op because ``get_captured_states`` already ``.pop()``-ed
-        the entry.
-        """
-        prefix = f"{external_req_id}-"
-        for req_id in list(self._captured_states):
-            if req_id.startswith(prefix):
-                del self._captured_states[req_id]
-                logger.debug("Cleared leaked activations for %s", req_id)
+    def clear_request_state(
+        self, keys: list[str], external_ids: list[str] | None
+    ) -> None:
+        """Drop the steering and hook data under ``keys``, and the captures and hook contexts
+        of ``external_ids``; None drops those of every request (a failed offline call)."""
+        for key in keys:
+            self._steering_data.pop(key, None)
+            self._hook_data.pop(key, None)
+        wanted = None if external_ids is None else set(external_ids)
+        for store in (self._captured_states, self._captured_qk, self._hook_contexts):
+            for req_id in list(store):
+                if wanted is None or req_id.rpartition("-")[0] in wanted:
+                    del store[req_id]
 
     def _build_payload(
         self, internal_req_id: str
@@ -1362,14 +1344,6 @@ class HiddenStatesExtension:
             return None
         return pickle.dumps(out, protocol=pickle.HIGHEST_PROTOCOL)
 
-    def clear_captured_qk(self, external_req_id: str) -> None:
-        """Remove captured Q/K without returning it (abort/disconnect cleanup)."""
-        prefix = f"{external_req_id}-"
-        for req_id in list(self._captured_qk):
-            if req_id.startswith(prefix):
-                del self._captured_qk[req_id]
-                logger.debug("Cleared leaked Q/K capture for %s", req_id)
-
     def _debug_captured_qk_count(self) -> int:
         """Return the number of entries in _captured_qk (for testing)."""
         return len(self._captured_qk)
@@ -1412,20 +1386,6 @@ class HiddenStatesExtension:
                 saved_dicts = {str(pos): ctx.saved for pos, ctx in contexts.items()}
                 return pickle.dumps(saved_dicts)
         return None
-
-    def clear_hook_data(self, key: str) -> None:
-        """Remove hook definitions for a completed request."""
-        self._hook_data.pop(key, None)
-
-    def clear_hook_contexts(self, external_req_id: str) -> None:
-        """Remove hook contexts for a completed or aborted request.
-
-        Prefix-match cleanup, same pattern as ``clear_captured_states``.
-        """
-        prefix = f"{external_req_id}-"
-        for req_id in list(self._hook_contexts):
-            if req_id.startswith(prefix):
-                del self._hook_contexts[req_id]
 
     # ------------------------------------------------------------------
     # Persistent hook management (called via collective_rpc)
