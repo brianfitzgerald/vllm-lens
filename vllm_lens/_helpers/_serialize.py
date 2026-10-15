@@ -69,9 +69,21 @@ def pack_chunks(
         index.append((req_id, key, str(dtype), shape, offset, size))
         offset += -(-size // _PACK_ALIGN) * _PACK_ALIGN
     if path is not None:
-        buffer = torch.from_file(path, shared=True, size=offset, dtype=torch.uint8)
-    else:
-        buffer = torch.empty(offset, dtype=torch.uint8)
+        # Large writes: a mapped file would fault in every new page from the writing process.
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        try:
+            for (*_, chunks), (*_, start, _) in zip(entries, index):
+                for chunk in chunks:
+                    raw = chunk.detach().contiguous().view(torch.uint8).reshape(-1)
+                    view = memoryview(raw.numpy())
+                    # A call writes at most about 2 GB, so a larger chunk takes several.
+                    while view:
+                        written = os.pwrite(fd, view, start)
+                        view, start = view[written:], start + written
+        finally:
+            os.close(fd)
+        return {"packed_index": index, "packed_path": path, "packed_size": offset}
+    buffer = torch.empty(offset, dtype=torch.uint8)
     for (_, _, dtype, _, chunks), (*_, start, size) in zip(entries, index):
         target = buffer[start : start + size].view(dtype)
         position = 0
@@ -79,8 +91,6 @@ def pack_chunks(
             flat = chunk.detach().reshape(-1)
             target[position : position + flat.numel()].copy_(flat)
             position += flat.numel()
-    if path is not None:
-        return {"packed_index": index, "packed_path": path, "packed_size": offset}
     return {"packed_index": index, "packed_buffer": buffer.numpy()}
 
 
@@ -103,25 +113,36 @@ def unpack_payloads(
 ) -> dict[str, dict[str, dict[str, torch.Tensor]]]:
     """Rebuild :func:`pack_chunks` input. Each tensor is copied out of the shared buffer, so
     pickling one later does not carry the others; a shared-memory file is removed after."""
-    path = packed.get("packed_path")
-    if path is None:
-        buffer = torch.from_numpy(packed["packed_buffer"])
-    else:
-        size = packed["packed_size"]
-        buffer = torch.from_file(path, shared=False, size=size, dtype=torch.uint8)
     out: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
-    try:
-        for req_id, key, dtype, shape, offset, size in packed["packed_index"]:
-            tensor = (
-                buffer[offset : offset + size]
-                .view(getattr(torch, dtype.removeprefix("torch.")))
-                .reshape(shape)
-                .clone()
-            )
-            out.setdefault(req_id, {"activations": {}})["activations"][key] = tensor
-    finally:
-        if path is not None:
+    path = packed.get("packed_path")
+    if path is not None:
+        # Each tensor is read straight into its own storage: one copy, no mapped pages.
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            for req_id, key, dtype, shape, offset, size in packed["packed_index"]:
+                tensor = torch.empty(
+                    shape, dtype=getattr(torch, dtype.removeprefix("torch."))
+                )
+                view = memoryview(tensor.view(torch.uint8).reshape(-1).numpy())
+                while view:
+                    read = os.preadv(fd, [view], offset)
+                    if read == 0:
+                        raise OSError(f"{path} ends before offset {offset}")
+                    view, offset = view[read:], offset + read
+                out.setdefault(req_id, {"activations": {}})["activations"][key] = tensor
+        finally:
+            os.close(fd)
             os.unlink(path)
+        return out
+    buffer = torch.from_numpy(packed["packed_buffer"])
+    for req_id, key, dtype, shape, offset, size in packed["packed_index"]:
+        tensor = (
+            buffer[offset : offset + size]
+            .view(getattr(torch, dtype.removeprefix("torch.")))
+            .reshape(shape)
+            .clone()
+        )
+        out.setdefault(req_id, {"activations": {}})["activations"][key] = tensor
     return out
 
 
