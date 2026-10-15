@@ -651,28 +651,55 @@ def _capture_rows(
             ).append(piece)
 
 
-def _step_needs(extension: HiddenStatesExtension) -> tuple[bool, bool]:
-    """Whether this forward pass has a request that captures, and whether any steering or hook
-    is stored; computed on the first layer of the pass and kept for its other layers."""
+def _step_needs(
+    extension: HiddenStatesExtension,
+) -> tuple[
+    set[int] | None, bool, dict[int, list[tuple[int, str, list[SteeringVector]]]]
+]:
+    """The layers a request of this forward pass captures (None for every layer), whether any
+    hook is stored, and each layer's steered requests as ``(batch index, key, vectors)``;
+    computed on the first layer of the pass and kept for its other layers."""
     context = get_forward_context()
     cached = extension.__dict__.get("_step_needs_cache")
     if cached is not None and cached[0] is context:
         return cached[1]
     runner = extension.model_runner
-    capture = False
-    for req_id in runner.input_batch.req_ids[: runner.input_batch.num_reqs]:
+    capture: set[int] | None = set()
+    plan: dict[int, list[tuple[int, str, list[SteeringVector]]]] = {}
+    steering = bool(extension._steering_data)
+    for i, req_id in enumerate(
+        runner.input_batch.req_ids[: runner.input_batch.num_reqs]
+    ):
         req_state = runner.requests.get(req_id)
         params = req_state.sampling_params if req_state is not None else None
         extra = params.extra_args if params is not None else None
-        if extra and extra.get("output_residual_stream") is not None:
-            capture = True
-            break
-    other = bool(
-        extension._steering_data or extension._hook_data or extension._persistent_hooks
-    )
+        layers = extra.get("output_residual_stream") if extra else None
+        if layers is not None and capture is not None:
+            # vllm_xargs passes the list as a JSON string; anything else is every layer.
+            if isinstance(layers, str):
+                try:
+                    layers = json.loads(layers)
+                except ValueError:
+                    layers = None
+            if isinstance(layers, list):
+                capture.update(int(layer) for layer in layers)
+            else:
+                capture = None
+        if not steering:
+            continue
+        key = _steering_key(extension, req_id, extra)
+        if key is None:
+            continue
+        by_layer: dict[int, list[SteeringVector]] = {}
+        for config in extension._steering_data[key]:
+            for layer in config.layer_index_map:
+                by_layer.setdefault(layer, []).append(config)
+        for layer, configs in by_layer.items():
+            plan.setdefault(layer, []).append((i, key, configs))
+    hooks = bool(extension._hook_data or extension._persistent_hooks)
     # The context is held, so a later pass cannot reuse its id.
-    extension._step_needs_cache = (context, (capture, other))
-    return capture, other
+    extension._step_needs_cache = (context, (capture, hooks, plan))
+    return capture, hooks, plan
 
 
 def _hook_inner(
@@ -684,37 +711,24 @@ def _hook_inner(
     query_start_loc = _batch_layout(extension.model_runner, warn=True)
     if query_start_loc is None:
         return None
-    capture, other = _step_needs(extension)
-    # A pass with no capture, steering or hook leaves the layer untouched.
-    if not (capture or other):
+    capture_layers, hooks, plan = _step_needs(extension)
+    capture = capture_layers is None or layer_idx in capture_layers
+    steered = plan.get(layer_idx, [])
+    # A layer with no capture, steering or hook in this pass is left untouched.
+    if not (capture or hooks or steered):
         return None
     runner = extension.model_runner
     num_reqs = runner.input_batch.num_reqs
     req_ids = runner.input_batch.req_ids
 
     # --- Phase 1: detect steering requests --------------------------
+    # The pass's plan holds only this layer's vectors.
     per_req_steering: list[list[SteeringVector]] = [[] for _ in range(num_reqs)]
     per_req_keys: list[str | None] = [None] * num_reqs
-    needs_steering = False
-    for i in range(num_reqs if other else 0):
-        req_id = req_ids[i]
-        req_state = runner.requests.get(req_id)
-        extra = (
-            req_state.sampling_params.extra_args
-            if req_state and req_state.sampling_params
-            else None
-        )
-        key = _steering_key(extension, req_id, extra)
-        if key is None:
-            continue
-        # Only the vectors of this layer; a request steering other layers leaves it alone.
-        configs = [
-            c for c in extension._steering_data[key] if layer_idx in c.layer_index_map
-        ]
+    for i, key, configs in steered:
         per_req_steering[i] = configs
         per_req_keys[i] = key
-        if configs:
-            needs_steering = True
+    needs_steering = bool(steered)
 
     # --- Phase 2: apply steering ------------------------------------
     modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None = None
@@ -771,7 +785,7 @@ def _hook_inner(
     per_req_hooks: list[list[Hook]] = [[] for _ in range(num_reqs)]
     needs_hooks = False
     persistent_hooks = extension._persistent_hooks
-    for i in range(num_reqs if other else 0):
+    for i in range(num_reqs if hooks else 0):
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
         extra = (
