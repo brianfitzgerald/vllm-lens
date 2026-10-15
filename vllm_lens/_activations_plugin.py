@@ -13,6 +13,7 @@ per-request activations for both online (async) and offline (sync) usage.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -26,9 +27,11 @@ import torch
 import zstandard as zstd
 
 from vllm_lens._helpers._serialize import (
+    deserialize_directions,
     serialize_activations,
     serialize_activations_binary,
     serialize_hook_results,
+    unpack_payloads,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
 
@@ -124,8 +127,10 @@ def _merge_captured_states(
         return None
     if len(parts) == 1:
         return parts[0]["activations"]
-    merged = torch.cat([p["activations"]["residual_stream"] for p in parts], dim=0)
-    return {"residual_stream": merged}
+    return {
+        key: torch.cat([p["activations"][key] for p in parts], dim=0)
+        for key in parts[0]["activations"]
+    }
 
 
 def _merge_captured_states_batch(
@@ -134,7 +139,7 @@ def _merge_captured_states_batch(
 ) -> dict[str, dict[str, Any]]:
     """Merge a batched ``get_captured_states_batch`` response across PP ranks.
 
-    Each rank returns either ``None`` or pickled bytes encoding
+    Each rank returns either ``None`` or the pickled :func:`pack_chunks` form of
     ``{external_req_id → {"activations": {"residual_stream": Tensor}}}``.
 
     For PP > 1 we concatenate the per-id residual streams along dim 0 in
@@ -142,14 +147,16 @@ def _merge_captured_states_batch(
     done per request.
 
     The output is keyed by ``external_req_id`` and contains the inner
-    dict shape ``{"residual_stream": Tensor}`` that callers already
-    expect. Requests with no captured data (no rank emitted a payload
+    dict ``{"residual_stream": Tensor}``, or ``residual_stream_projection``
+    and ``residual_stream_norm`` for a projected capture. Requests with no captured data (no rank emitted a payload
     for that id) are simply absent from the returned dict.
     """
     if not states_per_rank:
         return {}
     rank_dicts: list[dict[str, dict[str, Any]]] = [
-        _decode_rank_payload(s) for s in states_per_rank if s is not None
+        unpack_payloads(_decode_rank_payload(s))
+        for s in states_per_rank
+        if s is not None
     ]
     if not rank_dicts:
         return {}
@@ -161,11 +168,10 @@ def _merge_captured_states_batch(
         if len(per_rank) == 1:
             out[req_id] = per_rank[0]["activations"]
         else:
-            merged = torch.cat(
-                [p["activations"]["residual_stream"] for p in per_rank],
-                dim=0,
-            )
-            out[req_id] = {"residual_stream": merged}
+            out[req_id] = {
+                key: torch.cat([p["activations"][key] for p in per_rank], dim=0)
+                for key in per_rank[0]["activations"]
+            }
     return out
 
 
@@ -300,6 +306,46 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
     return [h if isinstance(h, Hook) else Hook.model_validate(h) for h in value]
 
 
+def _projection_payload(extra: dict[str, Any]) -> tuple[str, str] | None:
+    """The hash and the wire string of ``output_residual_stream_project``, or None when the
+    request projects nothing. The workers hold the directions under the hash."""
+    project = extra.get("output_residual_stream_project")
+    if project is None:
+        return None
+    payload = project if isinstance(project, str) else json.dumps(project)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16], payload
+
+
+def _validate_capture(extra: dict[str, Any], hidden: int, decode: bool = True) -> None:
+    """Raise ``ValueError`` for an unknown ``output_residual_stream_pool`` or for directions that
+    are not finite ``(N, hidden)``; ``decode=False`` skips a payload validated before."""
+    pool = extra.get("output_residual_stream_pool")
+    if pool is not None and pool not in ("last", "mean"):
+        raise ValueError(
+            f"output_residual_stream_pool must be 'last' or 'mean', got {pool!r}"
+        )
+    project = extra.get("output_residual_stream_project")
+    if project is None:
+        return
+    if pool is not None:
+        raise ValueError(
+            "output_residual_stream_project cannot be combined with "
+            "output_residual_stream_pool"
+        )
+    if not decode:
+        return
+    directions = deserialize_directions(project)
+    if (
+        directions.ndim != 2
+        or directions.shape[1] != hidden
+        or not torch.isfinite(directions).all()
+    ):
+        raise ValueError(
+            f"output_residual_stream_project must be finite (N, {hidden}), "
+            f"got {tuple(directions.shape)}"
+        )
+
+
 def _trim_activations(
     activations: dict[str, Any],
     expected_len: int,
@@ -315,10 +361,13 @@ def _trim_activations(
     during that extra pass.  This trims the surplus positions so the
     residual stream shape is always deterministic.
     """
-    rs = activations.get("residual_stream")
-    if rs is not None and rs.shape[1] > expected_len:
-        activations["residual_stream"] = rs[:, :expected_len, :]
-    for key in ("attn_q", "attn_k"):
+    for key in (
+        "residual_stream",
+        "residual_stream_projection",
+        "residual_stream_norm",
+        "attn_q",
+        "attn_k",
+    ):
         t = activations.get(key)
         if t is not None and t.shape[1] > expected_len:
             activations[key] = t[:, :expected_len]
@@ -424,7 +473,7 @@ async def _patched_generate(
 
     extra = effective_params.extra_args or {}
     # The workers trust these sentinels, so a client must not send them.
-    for sentinel in ("_steering_id", "_hook_id"):
+    for sentinel in ("_steering_id", "_hook_id", "_projection_id"):
         extra.pop(sentinel, None)
     wants_activations = extra.get("output_residual_stream") is not None
     # Response-transport negotiation (issue #31): "binary" parks activation
@@ -434,6 +483,12 @@ async def _patched_generate(
     if activations_transport == "binary":
         _warn_if_multi_api_server(self)
     wants_qk = extra.get("output_qk") is not None
+    _validate_capture(extra, self.vllm_config.model_config.get_hidden_size())
+    # The directions go to the workers by hash, not into the engine with the request.
+    projection = _projection_payload(extra)
+    if projection is not None:
+        extra.pop("output_residual_stream_project")
+        extra["_projection_id"] = projection[0]
     # Extract steering data and remove from extra_args before vLLM
     # serialises the SamplingParams (tensors don't survive msgspec).
     # When arriving via the OpenAI API (vllm_xargs), complex values
@@ -468,12 +523,16 @@ async def _patched_generate(
 
     assert _original_generate is not None
     # The set RPCs run inside the try, so a failure among them still releases the rest.
+    projected = False
     try:
         if steering_vectors is not None:
             await self.collective_rpc(
                 "set_steering_data",
                 args=(request_id, pickle.dumps(_compact_vectors(steering_vectors))),
             )
+        if projection is not None:
+            await self.collective_rpc("set_projection_directions", args=projection)
+            projected = True
         if hooks_list is not None:
             await self.collective_rpc(
                 "set_hook_data",
@@ -523,7 +582,12 @@ async def _patched_generate(
             or wants_qk
         ):
             await self.collective_rpc(
-                "clear_request_state", args=([request_id], [request_id])
+                "clear_request_state",
+                args=(
+                    [request_id],
+                    [request_id],
+                    [projection[0]] if projected and projection else [],
+                ),
             )
 
 
@@ -560,6 +624,22 @@ def _prepare_offline_params(
         params_list[idx] = copy.copy(sp)
         if sp.extra_args:
             params_list[idx].extra_args = dict(sp.extra_args)
+
+    hidden = self.llm_engine.vllm_config.model_config.get_hidden_size()
+    # Each distinct direction set is decoded, validated and shipped once, by its hash.
+    projection_payloads: dict[str, str] = {}
+    for sp in params_list:
+        extra = sp.extra_args or {}
+        projection = _projection_payload(extra)
+        if projection is None:
+            _validate_capture(extra, hidden)
+            continue
+        _validate_capture(
+            extra, hidden, decode=projection[0] not in projection_payloads
+        )
+        projection_payloads[projection[0]] = projection[1]
+        extra.pop("output_residual_stream_project")
+        extra["_projection_id"] = projection[0]
 
     wants_activations = any(
         (sp.extra_args or {}).get("output_residual_stream") is not None
@@ -622,6 +702,8 @@ def _prepare_offline_params(
         "wants_qk": wants_qk,
         "steering_payloads": steering_payloads,
         "hook_payloads": hook_payloads,
+        # Filled once the workers hold the directions, so a release matches what was set.
+        "projection_ids": [],
         # The copies vLLM receives in place of the caller's SamplingParams.
         "sampling_params": (
             params_list
@@ -633,6 +715,11 @@ def _prepare_offline_params(
     try:
         if steering_payloads:
             self.collective_rpc("set_steering_data_batch", args=(steering_payloads,))
+        if projection_payloads:
+            self.collective_rpc(
+                "set_projection_directions_batch", args=(projection_payloads,)
+            )
+            state["projection_ids"] = list(projection_payloads)
         for hid, payload in hook_payloads.items():
             self.collective_rpc("set_hook_data", args=(hid, payload))
     except BaseException:
@@ -651,7 +738,7 @@ def _finalize_offline_outputs(
     Attaches captured activations and hook results to the outputs.
     """
     wants_activations = state["wants_activations"]
-    wants_qk = state.get("wants_qk", False)
+    wants_qk = state["wants_qk"]
     has_hooks = len(state["hook_payloads"]) > 0
 
     if wants_activations:
@@ -697,8 +784,11 @@ def _release_offline_state(self: LLM, state: dict[str, Any], failed: bool) -> No
     """Clear the steering and hook data :func:`_prepare_offline_params` sent; after a failure,
     the captures and hook contexts of every request too (the offline call holds the engine)."""
     keys = [*state["steering_payloads"], *state["hook_payloads"]]
-    if keys or failed:
-        self.collective_rpc("clear_request_state", args=(keys, None if failed else []))
+    if keys or failed or state["projection_ids"]:
+        self.collective_rpc(
+            "clear_request_state",
+            args=(keys, None if failed else [], state["projection_ids"]),
+        )
 
 
 def _patched_llm_generate(

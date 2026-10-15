@@ -15,6 +15,10 @@ class _FakeLLM:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self._hooks_installed = True
+        model_config = SimpleNamespace(get_hidden_size=lambda: 4)
+        self.llm_engine = SimpleNamespace(
+            vllm_config=SimpleNamespace(model_config=model_config)
+        )
 
     def collective_rpc(self, method: str, args: tuple = ()) -> list:
         """Record the method name."""
