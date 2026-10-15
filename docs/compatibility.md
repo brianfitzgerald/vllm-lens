@@ -33,7 +33,7 @@ from public dependencies; benchmark image paths are supplied explicitly.
 Newer stable releases must pass both suites before advancing this pin.
 
 V2 model-runner mode is unsupported and rejected by the plugin. The plugin
-defaults to V1 and forces eager execution; native V2/CUDA-graph support is outside
+defaults to V1 and forces eager execution unless the CUDA-graph mode of the README is on; native V2 support is outside
 this matrix work. Model-specific features requiring V2 cannot use the fallback.
 Passing the small Qwen suite does not establish support for every model,
 quantization mode, attention backend, hardware platform or distributed layout.

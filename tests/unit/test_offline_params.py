@@ -54,4 +54,4 @@ def test_offline_generate_keeps_the_callers_params(
     assert params.extra_args == extra and params.skip_reading_prefix_cache is False
     assert received[0] is not params
     assert received[0].extra_args == {"_steering_id": "_steer_0"}
-    assert llm.calls == ["set_steering_data", "clear_steering_data"]
+    assert llm.calls == ["set_steering_data_batch", "clear_steering_data_batch"]
