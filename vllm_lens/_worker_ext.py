@@ -448,6 +448,10 @@ def _capture_rows(
     runner = extension.model_runner
     num_reqs = runner.input_batch.num_reqs
     req_ids = runner.input_batch.req_ids
+    # One host read of the layout, made only when a request captures: it waits for the GPU.
+    bounds: list[int] | None = None
+    # Full-residual rows go to the host in one copy after the loop.
+    full: list[tuple[str, int, int]] = []
     for i in range(num_reqs):
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
@@ -472,8 +476,10 @@ def _capture_rows(
         ):
             continue
 
-        start = query_start_loc[i].item()
-        end = query_start_loc[i + 1].item()
+        if bounds is None:
+            bounds = query_start_loc[: num_reqs + 1].tolist()
+        start = bounds[i]
+        end = bounds[i + 1]
 
         pool = extra.get("output_residual_stream_pool")
         # The front end validates the value; any other value is not pooled.
@@ -489,33 +495,38 @@ def _capture_rows(
             )
             continue
 
-        rows = hidden_states[start:end]
         projection_id = extra.get("_projection_id")
         if projection_id is None:
-            activation = rows.cpu()
-        else:
-            # Each position is stored as its N projections and its norm, in float32.
-            # The directions are shared by every request that sent the same payload.
-            directions = extension._direction_tables.get(projection_id)
-            if directions is None:
-                # An aborted request can run one step after its directions were released.
-                logger.warning(
-                    "No projection directions for request %s; its capture is skipped",
-                    req_id,
-                )
-                continue
-            extension._projections[req_id] = directions
-            rows = rows.float()
-            activation = torch.cat(
-                [rows @ directions.T, rows.norm(dim=-1, keepdim=True)], dim=1
-            ).cpu()
+            full.append((req_id, start, end))
+            continue
+        # Each position is stored as its N projections and its norm, in float32.
+        # The directions are shared by every request that sent the same payload.
+        directions = extension._direction_tables.get(projection_id)
+        if directions is None:
+            # An aborted request can run one step after its directions were released.
+            logger.warning(
+                "No projection directions for request %s; its capture is skipped",
+                req_id,
+            )
+            continue
+        extension._projections[req_id] = directions
+        rows = hidden_states[start:end].float()
+        activation = torch.cat(
+            [rows @ directions.T, rows.norm(dim=-1, keepdim=True)], dim=1
+        ).cpu()
 
-        if req_id not in extension._captured_states:
-            extension._captured_states[req_id] = {}
-        layer_states = extension._captured_states[req_id]
-        if layer_idx not in layer_states:
-            layer_states[layer_idx] = []
-        layer_states[layer_idx].append(activation)
+        extension._captured_states.setdefault(req_id, {}).setdefault(
+            layer_idx, []
+        ).append(activation)
+
+    if full:
+        # One device-to-host copy for every full-residual request of the step.
+        host = torch.cat([hidden_states[start:end] for _, start, end in full]).cpu()
+        pieces = host.split([end - start for _, start, end in full])
+        for (req_id, _, _), piece in zip(full, pieces):
+            extension._captured_states.setdefault(req_id, {}).setdefault(
+                layer_idx, []
+            ).append(piece)
 
 
 def _hook_inner(
@@ -561,11 +572,12 @@ def _hook_inner(
             target = modified_output
             norm_ref = target
 
+        bounds: list[int] = query_start_loc[: num_reqs + 1].tolist()
         for i in range(num_reqs):
             if not per_req_steering[i]:
                 continue
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
+            start = bounds[i]
+            end = bounds[i + 1]
             req_state = runner.requests.get(req_ids[i])
             if req_state is None:
                 continue
