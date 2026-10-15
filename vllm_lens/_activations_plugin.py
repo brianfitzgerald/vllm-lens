@@ -13,6 +13,7 @@ per-request activations for both online (async) and offline (sync) usage.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -672,12 +673,26 @@ def _prepare_offline_params(
 
     Returns the state dict consumed by :func:`_finalize_offline_outputs`.
     """
-    if isinstance(sampling_params, Sequence):
-        params_list = list(sampling_params)
-    elif sampling_params is not None:
-        params_list = [sampling_params]
-    else:
-        params_list = []
+    # Copies with their own extra_args: what follows strips and rewrites extra_args, and the
+    # caller may pass the same SamplingParams to the next call.
+    params_list = []
+    source = (
+        list(sampling_params)
+        if isinstance(sampling_params, Sequence)
+        else [sampling_params]
+        if sampling_params is not None
+        else []
+    )
+    for sp in source:
+        own = copy.copy(sp)
+        if sp.extra_args:
+            own.extra_args = dict(sp.extra_args)
+        params_list.append(own)
+    passed = (
+        params_list
+        if isinstance(sampling_params, Sequence)
+        else (params_list[0] if params_list else None)
+    )
 
     hidden = self.llm_engine.vllm_config.model_config.get_hidden_size()
     # Each distinct direction set is decoded, validated and shipped once, by its hash.
@@ -780,6 +795,8 @@ def _prepare_offline_params(
         "steering_payloads": steering_payloads,
         "projection_ids": list(projection_payloads),
         "hook_payloads": hook_payloads,
+        # The copies vLLM must receive in place of the caller's SamplingParams.
+        "sampling_params": passed,
     }
 
 
@@ -871,7 +888,9 @@ def _patched_llm_generate(
     """
     state = _prepare_offline_params(self, sampling_params)
     assert _original_llm_generate is not None
-    outputs = _original_llm_generate(self, prompts, sampling_params, *args, **kwargs)
+    outputs = _original_llm_generate(
+        self, prompts, state["sampling_params"], *args, **kwargs
+    )
     return _finalize_offline_outputs(self, outputs, state)
 
 
@@ -893,7 +912,9 @@ def _patched_llm_chat(
     """
     state = _prepare_offline_params(self, sampling_params)
     assert _original_llm_chat is not None
-    outputs = _original_llm_chat(self, messages, sampling_params, *args, **kwargs)
+    outputs = _original_llm_chat(
+        self, messages, state["sampling_params"], *args, **kwargs
+    )
     return _finalize_offline_outputs(self, outputs, state)
 
 

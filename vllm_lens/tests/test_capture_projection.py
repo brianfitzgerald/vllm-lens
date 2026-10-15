@@ -206,6 +206,24 @@ def test_two_direction_sets_share_one_batch(llm):
     assert llm.collective_rpc("_debug_direction_table_count") == [0]
 
 
+def test_a_reused_sampling_params_projects_every_call(llm):
+    """A SamplingParams passed to two calls projects in both, and the caller's extra_args
+    keep their directions: the plugin works on its own copy."""
+    hidden = llm.llm_engine.vllm_config.model_config.get_hidden_size()
+    directions = torch.randn(2, hidden, generator=torch.Generator().manual_seed(2))
+    extra = {
+        "output_residual_stream": [LAYER_IDX],
+        "output_residual_stream_project": _encode(directions),
+    }
+    params = SamplingParams(temperature=0.0, max_tokens=1, extra_args=dict(extra))
+    first, second = (llm.generate([PROMPT], params)[0] for _ in range(2))
+    assert params.extra_args == extra
+    assert torch.equal(
+        first.activations["residual_stream_projection"],  # type: ignore[reportAttributeAccessIssue]
+        second.activations["residual_stream_projection"],  # type: ignore[reportAttributeAccessIssue]
+    )
+
+
 @pytest.mark.parametrize(
     ("extra", "match"),
     [
