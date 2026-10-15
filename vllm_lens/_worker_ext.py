@@ -31,11 +31,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_lens._helpers._hook_output import _replace_hook_output
-from vllm_lens._helpers._serialize import (
-    RUN_CALLS_ERROR,
-    deserialize_directions,
-    pack_chunks,
-)
+from vllm_lens._helpers._serialize import deserialize_directions, pack_chunks
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
@@ -1391,17 +1387,6 @@ class HiddenStatesExtension:
     def _debug_direction_table_count(self) -> int:
         """Return the number of direction sets held (for testing)."""
         return len(self._direction_tables)
-
-    def run_calls(self, calls: list[tuple[str, tuple[Any, ...]]]) -> list[Any]:
-        """Run several of this extension's methods in one RPC and return each result; a call
-        that raises returns ``(RUN_CALLS_ERROR, message)`` so the others still run."""
-        results: list[Any] = []
-        for name, args in calls:
-            try:
-                results.append(getattr(self, name)(*args))
-            except Exception as error:  # noqa: BLE001
-                results.append((RUN_CALLS_ERROR, f"{name}: {error!r}"))
-        return results
 
     def clear_captured_states(self, external_req_id: str) -> None:
         """Remove captured activations without returning them.
