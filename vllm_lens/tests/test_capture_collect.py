@@ -122,3 +122,20 @@ def test_batch_returns_pooled_means_in_layer_order() -> None:
     assert torch.equal(pooled[:, 0, 0], torch.tensor([2.0, 2.0], dtype=torch.bfloat16))
     assert payloads["1"]["activations"]["residual_stream"].shape == (1, 3, HIDDEN)
     assert extension._pooled_counts == {} and extension._captured_states == {}
+
+
+def test_batch_splits_projected_rows_into_scores_and_norms() -> None:
+    """A projected capture's per-step rows come back as (layers, positions, N) scores and
+    (layers, positions) norms."""
+    steps = [torch.arange(12.0).reshape(3, 4), torch.arange(12.0, 20.0).reshape(2, 4)]
+    extension = SimpleNamespace(
+        _captured_states={"0-ab": {5: steps}},
+        _pooled_counts={},
+        _projections={"0-ab": torch.eye(3)},
+    )
+    result = HiddenStatesExtension.get_captured_states_batch(extension, ["0"])  # type: ignore[arg-type]
+    activations = unpack_payloads(pickle.loads(result))["0"]["activations"]
+    rows = torch.cat(steps)
+    assert torch.equal(activations["residual_stream_projection"], rows[None, :, :3])
+    assert torch.equal(activations["residual_stream_norm"], rows[None, :, 3])
+    assert extension._projections == {}

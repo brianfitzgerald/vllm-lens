@@ -1537,26 +1537,37 @@ class HiddenStatesExtension:
                     )
                 )
                 continue
-            if req_id in self._projections:
-                for key, tensor in self._build_payload(req_id)["activations"].items():
-                    entries.append(
-                        (
-                            external_req_id,
-                            key,
-                            tensor.dtype,
-                            list(tensor.shape),
-                            [tensor],
-                        )
-                    )
-                continue
-            # A full capture's per-step rows go straight into the packed buffer, one copy.
+            # A capture's per-step rows go straight into the packed buffer, one copy.
             layer_dict = self._captured_states.pop(req_id)
             layers = sorted(layer_dict)
             first = layer_dict[layers[0]]
-            shape = [len(layers), sum(p.shape[0] for p in first), first[0].shape[-1]]
-            chunks = [piece for layer in layers for piece in layer_dict[layer]]
+            positions = sum(p.shape[0] for p in first)
+            pieces = [piece for layer in layers for piece in layer_dict[layer]]
+            if self._projections.pop(req_id, None) is not None:
+                # Each row holds the N projections, then the norm.
+                n = first[0].shape[-1] - 1
+                entries.append(
+                    (
+                        external_req_id,
+                        "residual_stream_projection",
+                        first[0].dtype,
+                        [len(layers), positions, n],
+                        [piece[:, :n] for piece in pieces],
+                    )
+                )
+                entries.append(
+                    (
+                        external_req_id,
+                        "residual_stream_norm",
+                        first[0].dtype,
+                        [len(layers), positions],
+                        [piece[:, n] for piece in pieces],
+                    )
+                )
+                continue
+            shape = [len(layers), positions, first[0].shape[-1]]
             entries.append(
-                (external_req_id, "residual_stream", first[0].dtype, shape, chunks)
+                (external_req_id, "residual_stream", first[0].dtype, shape, pieces)
             )
         by_dtype: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
         for external_req_id, rows in pooled:
