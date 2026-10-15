@@ -195,3 +195,15 @@ def test_packed_chunks_through_shared_files(tmp_path: Path, entries: int) -> Non
     for n, tensor in enumerate(tensors):
         assert torch.equal(recovered[str(n)]["activations"]["residual_stream"], tensor)
     assert not any(tmp_path.iterdir())
+
+
+def test_packed_chunks_take_strided_one_element_slices(tmp_path: Path) -> None:
+    """A column of a one-row step is a one-element slice with its parent's stride; it packs
+    through the shared files and in memory alike."""
+    step = torch.arange(5.0).reshape(1, 5)
+    for path in (None, str(tmp_path / "packed")):
+        packed = pack_chunks(
+            [("a", "residual_stream_norm", step.dtype, [1, 1], [step[:, 4]])], path
+        )
+        recovered = unpack_payloads(pickle.loads(pickle.dumps(packed)))
+        assert recovered["a"]["activations"]["residual_stream_norm"].tolist() == [[4.0]]

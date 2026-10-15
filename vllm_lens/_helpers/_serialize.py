@@ -62,9 +62,11 @@ _IO_THREADS = 8
 def _pwrite_all(fd: int, chunks: list[torch.Tensor], start: int) -> None:
     """Write ``chunks`` back to back from byte ``start``; a call writes at most about 2 GB."""
     for chunk in chunks:
-        view = memoryview(
-            chunk.detach().contiguous().view(torch.uint8).reshape(-1).numpy()
-        )
+        flat = chunk.detach().reshape(-1)
+        # A one-element slice counts as contiguous but can keep its parent's stride.
+        if flat.stride(-1) != 1:
+            flat = flat.clone(memory_format=torch.contiguous_format)
+        view = memoryview(flat.view(torch.uint8).numpy())
         while view:
             written = os.pwrite(fd, view, start)
             view, start = view[written:], start + written
