@@ -24,6 +24,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import cloudpickle
+import numpy as np
 import torch
 import zstandard as zstd
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -385,6 +386,54 @@ def _apply_steering(
                 target[rel] = target[rel] + v * cfg.scale
 
 
+def _eager_steer_row(
+    extension: HiddenStatesExtension, key: str, config: SteeringVector, layer_idx: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A request's float32 ``(add, unit)`` rows for one layer, with the scale folded in, made
+    once and kept until its vectors are set again or cleared."""
+    layers = extension._eager_rows.setdefault(key, {})
+    cached = layers.get(layer_idx)
+    if cached is not None:
+        return cached
+    vec = config.activations[config.layer_index_map[layer_idx]].float()
+    zero = torch.zeros_like(vec)
+    if config.norm_match:
+        row = (zero, vec / (vec.norm() + 1e-6) * config.scale)
+    else:
+        row = (vec * config.scale, zero)
+    layers[layer_idx] = row
+    return row
+
+
+def _apply_steering_rows(
+    rows: list[tuple[torch.Tensor, torch.Tensor]],
+    spans: list[tuple[int, int]],
+    target: torch.Tensor,
+    norm_ref: torch.Tensor,
+) -> None:
+    """Add every request's row to its tokens in one gather and one ``index_add_``, in place
+    of a few kernels per request: ``h += add + unit * ||norm_ref||``."""
+    lengths = np.asarray([end - start for start, end in spans], dtype=np.int64)
+    starts = np.repeat(
+        np.asarray([start for start, _ in spans], dtype=np.int64), lengths
+    )
+    offsets = np.arange(lengths.sum(), dtype=np.int64) - np.repeat(
+        np.cumsum(lengths) - lengths, lengths
+    )
+    layout = np.stack([starts + offsets, np.repeat(np.arange(len(spans)), lengths)])
+    host = torch.from_numpy(layout)
+    # Through pinned memory, so the copy to the device does not wait for the stream.
+    if target.is_cuda:
+        host = host.pin_memory()
+    tokens, which = host.to(target.device, non_blocking=True)
+    adds = torch.stack([add for add, _ in rows])[which]
+    units = torch.stack([unit for _, unit in rows])[which]
+    stream_norm = torch.linalg.vector_norm(
+        norm_ref.index_select(0, tokens), dim=-1, keepdim=True, dtype=torch.float32
+    )
+    target.index_add_(0, tokens, (adds + units * stream_norm).to(target.dtype))
+
+
 def _accumulate_pooled(
     extension: HiddenStatesExtension,
     req_id: str,
@@ -605,6 +654,7 @@ def _hook_inner(
 
     # --- Phase 1: detect steering requests --------------------------
     per_req_steering: list[list[SteeringVector]] = [[] for _ in range(num_reqs)]
+    per_req_keys: list[str | None] = [None] * num_reqs
     needs_steering = False
     for i in range(num_reqs if other else 0):
         req_id = req_ids[i]
@@ -614,8 +664,15 @@ def _hook_inner(
             if req_state and req_state.sampling_params
             else None
         )
-        configs = _find_steering_configs(extension, req_id, extra)
+        key = _steering_key(extension, req_id, extra)
+        if key is None:
+            continue
+        # Only the vectors of this layer; a request steering other layers leaves it alone.
+        configs = [
+            c for c in extension._steering_data[key] if layer_idx in c.layer_index_map
+        ]
         per_req_steering[i] = configs
+        per_req_keys[i] = key
         if configs:
             needs_steering = True
 
@@ -634,19 +691,33 @@ def _hook_inner(
             norm_ref = target
 
         bounds = _host_layout(runner, query_start_loc, num_reqs)
+        # A request with one whole-sequence vector here joins one batched update; others
+        # (several vectors, or position-specific ones) keep the per-request path.
+        rows: list[tuple[torch.Tensor, torch.Tensor]] = []
+        spans: list[tuple[int, int]] = []
         for i in range(num_reqs):
-            if not per_req_steering[i]:
+            configs = per_req_steering[i]
+            if not configs:
                 continue
             start = bounds[i]
             end = bounds[i + 1]
+            key = per_req_keys[i]
+            if (
+                key is not None
+                and len(configs) == 1
+                and configs[0].activations.dim() == 2
+            ):
+                rows.append(_eager_steer_row(extension, key, configs[0], layer_idx))
+                spans.append((start, end))
+                continue
             req_state = runner.requests.get(req_ids[i])
             if req_state is None:
                 continue
             # The absolute position of the first token of this forward pass.
             abs_start = req_state.num_computed_tokens
-            _apply_steering(
-                per_req_steering[i], layer_idx, target, start, end, abs_start, norm_ref
-            )
+            _apply_steering(configs, layer_idx, target, start, end, abs_start, norm_ref)
+        if rows:
+            _apply_steering_rows(rows, spans, target, norm_ref)
 
     # --- Phase 2.5: run generic (post) hooks -------------------------
     # Per-request and persistent hooks are stored in separate context
@@ -1080,6 +1151,8 @@ class HiddenStatesExtension:
     _steering_data: dict[str, list[SteeringVector]] = {}
     # The CUDA-graph table row per key (0 none, -1 position-specific).
     _steer_rows: dict[str, int] = {}
+    # The eager path's (add, unit) rows per key and layer.
+    _eager_rows: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
 
     # Per-request hook definitions:
     # key (external_req_id or _hook_id) → list of Hook
@@ -1123,6 +1196,7 @@ class HiddenStatesExtension:
         self._direction_refs = {}
         self._steering_data = {}
         self._steer_rows = {}
+        self._eager_rows = {}
         self._hook_data = {}
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
             self._persistent_hooks = []
@@ -1209,9 +1283,11 @@ class HiddenStatesExtension:
             self.set_steering_data(key, pickled_data)
 
     def _release_steer_row(self, key: str) -> None:
-        """Give the key's table row back to the CUDA-graph buffers, if it has one."""
+        """Give the key's table row back to the CUDA-graph buffers, if it has one, and drop
+        its eager rows."""
         from vllm_lens._cudagraph import _STEER_STATE
 
+        self._eager_rows.pop(key, None)
         row = self._steer_rows.pop(key, None)
         buffers = _STEER_STATE.get("buffers")
         if row is not None and row > 0 and buffers is not None:
