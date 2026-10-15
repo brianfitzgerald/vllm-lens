@@ -26,6 +26,7 @@ import cloudpickle
 import torch
 import zstandard as zstd
 
+from vllm_lens._cudagraph import LensGraphConfig
 from vllm_lens._helpers._serialize import (
     deserialize_directions,
     serialize_activations,
@@ -384,7 +385,8 @@ def _trim_activations(
 def _patched_create_engine_config(self, *args, **kwargs):
     """Patch for ``EngineArgs.create_engine_config``.
 
-    Injects our worker extension and forces eager mode *before* the
+    Injects our worker extension and forces eager mode (unless the
+    CUDA-graph mode is on) *before* the
     ``VllmConfig`` is built, so the settings propagate through any
     engine creation path (``AsyncLLM.from_engine_args``,
     ``AsyncLLM.from_vllm_config``, ``vllm serve``, etc.) including
@@ -392,7 +394,13 @@ def _patched_create_engine_config(self, *args, **kwargs):
     """
     if not self.worker_extension_cls:
         self.worker_extension_cls = _WORKER_EXT
-    self.enforce_eager = True
+    graph_config = LensGraphConfig.from_env()
+    # The user's value, kept from the first call: a second config from this
+    # EngineArgs must not read the value that this patch wrote.
+    if not hasattr(self, "_lens_enforce_eager"):
+        self._lens_enforce_eager = self.enforce_eager
+    self.enforce_eager = self._lens_enforce_eager or not graph_config.enabled
+    self.additional_config = graph_config.to_additional_config(self.additional_config)
 
     # Our capture/steering hooks read V1 model-runner internals (input_batch,
     # requests). vLLM's V2 runner — the default for dense models on vLLM 0.23+ —
@@ -506,6 +514,12 @@ async def _patched_generate(
         or steering_vectors is not None
         or hooks_list is not None
         or has_persistent
+    )
+    LensGraphConfig.from_vllm_config(self.vllm_config).reject_unserved(
+        extra.get("output_residual_stream"),
+        {layer for sv in steering_vectors or [] for layer in sv.layer_indices},
+        hooks_list or [],
+        qk=wants_qk,
     )
     if needs_hooks or wants_qk or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
@@ -649,9 +663,13 @@ def _prepare_offline_params(
     # extra_args before vLLM serialises SamplingParams, but keep them
     # for the RPC call.
     steering_payloads: dict[str, bytes] = {}  # steering_id -> pickled vectors
+    steering_layers: list[set[int]] = []
     for idx, sp in enumerate(params_list):
         extra = sp.extra_args or {}
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
+        steering_layers.append(
+            {layer for sv in vectors or [] for layer in sv.layer_indices}
+        )
         if vectors is not None:
             steering_id = f"_steer_{idx}"
             steering_payloads[steering_id] = pickle.dumps(_compact_vectors(vectors))
@@ -661,9 +679,16 @@ def _prepare_offline_params(
 
     # Extract hooks per-request (same pattern as steering).
     hook_payloads: dict[str, bytes] = {}  # hook_id -> cloudpickled hooks
+    graph_config = LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config)
     for idx, sp in enumerate(params_list):
         extra = sp.extra_args or {}
         hooks = _decode_hooks(extra.pop("apply_hooks", None))
+        graph_config.reject_unserved(
+            extra.get("output_residual_stream"),
+            steering_layers[idx],
+            hooks or [],
+            qk=extra.get("output_qk") is not None,
+        )
         if hooks is not None:
             hook_id = f"_hook_{idx}"
             hook_payloads[hook_id] = cloudpickle.dumps(hooks)
@@ -693,9 +718,9 @@ def _prepare_offline_params(
         self.collective_rpc("install_qk_hooks")
         self._qk_hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
 
-    # Send steering data to workers before generation.
-    for sid, payload in steering_payloads.items():
-        self.collective_rpc("set_steering_data", args=(sid, payload))
+    # Send every request's steering data to the workers in one RPC.
+    if steering_payloads:
+        self.collective_rpc("set_steering_data_batch", args=(steering_payloads,))
 
     if projection_payloads:
         self.collective_rpc(
@@ -781,8 +806,10 @@ def _finalize_offline_outputs(
 
 def _release_offline_state(self: LLM, state: dict[str, Any]) -> None:
     """Clear the steering and hook data that :func:`_prepare_offline_params` sent."""
-    for sid in state["steering_payloads"]:
-        self.collective_rpc("clear_steering_data", args=(sid,))
+    if state["steering_payloads"]:
+        self.collective_rpc(
+            "clear_steering_data_batch", args=(list(state["steering_payloads"]),)
+        )
     for hid in state["hook_payloads"]:
         self.collective_rpc("clear_hook_data", args=(hid,))
     if state["projection_ids"]:
@@ -1012,6 +1039,9 @@ def _llm_register_hooks(
     prefetch_params: list[str] | None = None,
 ) -> None:
     """Register persistent hooks that apply to every subsequent request."""
+    LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config).reject_unserved(
+        None, set(), hooks
+    )
     if not getattr(self, "_hooks_installed", False):
         self.collective_rpc("install_hooks")
         self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
@@ -1111,7 +1141,7 @@ def register() -> None:
     Opt-out: set ``VLLM_LENS_DISABLE=1`` to make this a no-op. This plugin
     auto-loads in *every* vLLM process via the ``vllm.general_plugins`` entry
     point, and its patches force ``enforce_eager=True`` (disabling CUDA graphs)
-    on all engines. The kill switch lets vllm-lens be installed alongside a
+    on all engines, unless ``VLLM_LENS_CUDAGRAPH`` or ``VLLM_LENS_*_LAYERS`` is set. The kill switch lets vllm-lens be installed alongside a
     trainer's inference server (e.g. prime-rl rollouts) without perturbing it.
     Unset => unchanged default-on behaviour.
     """
@@ -1197,3 +1227,10 @@ def register() -> None:
         _serve_mod.register_vllm_serve_api_routers = _patched_register_routers
     except Exception as error:
         _report_integration_failure("hook and activation HTTP routes", error)
+
+    try:
+        from vllm_lens._graph_worker import install_graph_patches
+    except ImportError:
+        logger.debug("No vLLM GPU worker; the CUDA-graph mode is not available.")
+    else:
+        install_graph_patches()

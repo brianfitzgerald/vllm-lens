@@ -15,13 +15,14 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 import pytest
 import ray
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+# VLLM_TEST_MODEL runs the suite on another model, such as google/gemma-2-2b-it.
+MODEL_NAME = os.environ.get("VLLM_TEST_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 # Compare implementations in FP32; functional/intervention tests retain BF16.
 REFERENCE_DTYPE = "float32"
 LAYER_IDX = 2
-NUM_LAYERS = 24
+NUM_LAYERS = AutoConfig.from_pretrained(MODEL_NAME).num_hidden_layers
 PROMPT = "The future of AI is"
 PROMPTS = [
     "The future of AI is",
@@ -58,6 +59,33 @@ def make_llm(env: dict[str, str], **kwargs):
         for name, value in env.items():
             patch.setenv(name, value)
         return LLM(model=MODEL_NAME, dtype="auto", **kwargs)
+
+
+def row_error(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    """The largest per-row ``||actual - expected|| / ||expected||``."""
+    return ((actual - expected).norm(dim=-1) / expected.norm(dim=-1)).max().item()
+
+
+def prompt_rows(output) -> torch.Tensor:
+    """The captured prompt rows of the first layer, which no sampled token changes."""
+    acts = output.activations["residual_stream"]  # type: ignore[reportAttributeAccessIssue]
+    return acts[0, : len(output.prompt_token_ids)].float()
+
+
+@pytest.fixture(scope="module")
+def eager_llm():
+    """The reference of the CUDA-graph tests: forward hooks in eager mode."""
+    engine = make_llm({}, enable_prefix_caching=False)
+    yield engine
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
+def hidden(eager_llm) -> int:
+    """The hidden size of the test model."""
+    return eager_llm.llm_engine.vllm_config.model_config.get_hidden_size()
 
 
 @pytest.fixture(autouse=True, scope="module")

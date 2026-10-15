@@ -60,11 +60,38 @@ client.clear_hooks()
 
 ## Disabling the plugin
 
-vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` entry point) and forces `enforce_eager=True` (disabling CUDA graphs) so its hooks can fire. To install it alongside another inference server without perturbing that server, set `VLLM_LENS_DISABLE=1` to make the plugin a complete no-op:
+vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` entry point) and forces `enforce_eager=True` (disabling CUDA graphs) so its hooks can fire, unless the [CUDA graphs](#cuda-graphs) mode is on. To install it alongside another inference server without perturbing that server, set `VLLM_LENS_DISABLE=1` to make the plugin a complete no-op:
 
 ```bash
 VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
+
+## CUDA graphs
+
+The forward hooks do not run under a CUDA graph, so the plugin forces `enforce_eager=True`. Set `VLLM_LENS_CUDAGRAPH=1` to keep compilation and CUDA graphs on:
+
+```bash
+VLLM_LENS_CUDAGRAPH=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+In this mode a request that asks for hooks or Q/K capture fails with an error, because the hooks would not run. The registration of a persistent hook fails too.
+
+Capture and steering are served for the layers named in `VLLM_LENS_CAPTURE_LAYERS` and `VLLM_LENS_STEER_LAYERS`. Either list also turns this mode on:
+
+```bash
+VLLM_LENS_STEER_LAYERS=18 VLLM_LENS_CAPTURE_LAYERS=15,20 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+A forward hook on each named layer calls one custom op, `vllm_lens::lens`, which the compiler keeps inside the graph. The op adds the layer's steering rows to the stream, then copies the stream into a capture buffer. Before each forward pass the plugin writes every token's steering rows into the steering buffers; after it, the plugin reads the captured rows of the requests that asked for them. Zero rows change nothing, so requests with and without steering share a batch. This works for any model whose decoder layers the plugin can find, with no change to the model.
+
+The request format does not change: `output_residual_stream_pool`, `output_residual_stream_project`, `scale`, `norm_match`, `position_indices` and several vectors on one layer work as in eager mode. Limits:
+
+- A request must name its layers: a capture layer or a steering layer that is not in the lists, or `output_residual_stream=True` (all layers), fails with an error.
+- Pipeline parallelism is not tested in this mode, so the engine refuses to load with it.
+- The buffers are allocated when the model loads, before vLLM sizes the KV cache: two `(max_num_batched_tokens, hidden_size)` buffers per steered layer and one per captured layer, in the model dtype. Each stored request also takes a float32 row of `hidden_size` values per steered layer; the table starts at 64 rows and doubles when full.
+- Every `norm_match` vector on a layer is scaled to the norm of the unsteered stream. Eager mode does the same.
+
+The settings of this mode are stored in `VllmConfig.additional_config`, which is part of vLLM's compile cache key. One cache directory therefore serves engines with different settings, and each gets its own compiled graph.
 
 ## Logging
 
