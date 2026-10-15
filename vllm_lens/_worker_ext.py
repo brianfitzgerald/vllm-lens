@@ -404,7 +404,8 @@ def _accumulate_pooled(
     # No entry is made for a step that holds no new prompt row.
     if high <= low:
         return
-    total = rows[low - first : high - first].float().sum(0, keepdim=True).cpu()
+    # The sum stays on the device until collection, so the hook does not wait for the GPU.
+    total = rows[low - first : high - first].float().sum(0, keepdim=True)
     states = extension._captured_states.setdefault(req_id, {})
     if pool == "mean" and layer_idx in states:
         total = states[layer_idx][0] + total
@@ -442,6 +443,27 @@ def _batch_layout(
             list(attn_metadata.keys()),
         )
     return None
+
+
+def _host_layout(
+    runner: Any, query_start_loc: torch.Tensor, num_reqs: int
+) -> list[int]:
+    """The step's ``query_start_loc`` on the host: the runner's pinned CPU copy, which needs no
+    GPU sync, when it matches the forward pass's; else a read of the device tensor."""
+    pinned = getattr(getattr(runner, "query_start_loc", None), "np", None)
+    if pinned is not None and query_start_loc.shape[0] >= num_reqs + 1:
+        return pinned[: num_reqs + 1].tolist()
+    return query_start_loc[: num_reqs + 1].tolist()
+
+
+def _to_host(rows: torch.Tensor) -> torch.Tensor:
+    """Queue a copy of ``rows`` into pinned host memory and return it without waiting. The
+    engine syncs every step's output before ``generate`` returns, so collection reads it whole."""
+    if not rows.is_cuda:
+        return rows
+    host = torch.empty(rows.shape, dtype=rows.dtype, pin_memory=True)
+    host.copy_(rows, non_blocking=True)
+    return host
 
 
 def _capture_rows(
@@ -484,7 +506,7 @@ def _capture_rows(
             continue
 
         if bounds is None:
-            bounds = query_start_loc[: num_reqs + 1].tolist()
+            bounds = _host_layout(runner, query_start_loc, num_reqs)
         start = bounds[i]
         end = bounds[i + 1]
 
@@ -518,9 +540,9 @@ def _capture_rows(
             continue
         extension._projections[req_id] = directions
         rows = hidden_states[start:end].float()
-        activation = torch.cat(
-            [rows @ directions.T, rows.norm(dim=-1, keepdim=True)], dim=1
-        ).cpu()
+        activation = _to_host(
+            torch.cat([rows @ directions.T, rows.norm(dim=-1, keepdim=True)], dim=1)
+        )
 
         extension._captured_states.setdefault(req_id, {}).setdefault(
             layer_idx, []
@@ -528,7 +550,7 @@ def _capture_rows(
 
     if full:
         # One device-to-host copy for every full-residual request of the step.
-        host = torch.cat([hidden_states[start:end] for _, start, end in full]).cpu()
+        host = _to_host(torch.cat([hidden_states[start:end] for _, start, end in full]))
         pieces = host.split([end - start for _, start, end in full])
         for (req_id, _, _), piece in zip(full, pieces):
             extension._captured_states.setdefault(req_id, {}).setdefault(
@@ -579,7 +601,7 @@ def _hook_inner(
             target = modified_output
             norm_ref = target
 
-        bounds: list[int] = query_start_loc[: num_reqs + 1].tolist()
+        bounds = _host_layout(runner, query_start_loc, num_reqs)
         for i in range(num_reqs):
             if not per_req_steering[i]:
                 continue
