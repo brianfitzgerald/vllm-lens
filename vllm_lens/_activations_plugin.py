@@ -12,6 +12,7 @@ per-request activations for both online (async) and offline (sync) usage.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -410,6 +411,9 @@ async def _patched_generate(
         pass
 
     extra = effective_params.extra_args or {}
+    # The workers trust these sentinels, so a client must not send them.
+    for sentinel in ("_steering_id", "_hook_id"):
+        extra.pop(sentinel, None)
     wants_activations = extra.get("output_residual_stream") is not None
     # Response-transport negotiation (issue #31): "binary" parks activation
     # bytes in the process-local store and returns a handle instead of base64.
@@ -450,22 +454,19 @@ async def _patched_generate(
         await self.collective_rpc("install_qk_hooks")
         setattr(self, "_qk_hooks_installed", True)
 
-    # Send steering data to workers before the forward pass begins.
-    if steering_vectors is not None:
-        await self.collective_rpc(
-            "set_steering_data",
-            args=(request_id, pickle.dumps(steering_vectors)),
-        )
-
-    # Send hook data to workers before the forward pass begins.
-    if hooks_list is not None:
-        await self.collective_rpc(
-            "set_hook_data",
-            args=(request_id, cloudpickle.dumps(hooks_list)),
-        )
-
     assert _original_generate is not None
+    # The set RPCs run inside the try, so a failure among them still releases the rest.
     try:
+        if steering_vectors is not None:
+            await self.collective_rpc(
+                "set_steering_data",
+                args=(request_id, pickle.dumps(steering_vectors)),
+            )
+        if hooks_list is not None:
+            await self.collective_rpc(
+                "set_hook_data",
+                args=(request_id, cloudpickle.dumps(hooks_list)),
+            )
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
@@ -502,15 +503,16 @@ async def _patched_generate(
                         output.hook_results = merged
             yield output
     finally:
-        if steering_vectors is not None:
-            await self.collective_rpc("clear_steering_data", args=(request_id,))
-        if wants_activations:
-            await self.collective_rpc("clear_captured_states", args=(request_id,))
-        if wants_qk:
-            await self.collective_rpc("clear_captured_qk", args=(request_id,))
-        if hooks_list is not None:
-            await self.collective_rpc("clear_hook_data", args=(request_id,))
-            await self.collective_rpc("clear_hook_contexts", args=(request_id,))
+        # An aborted request leaves its data and captures on the workers.
+        if (
+            steering_vectors is not None
+            or hooks_list is not None
+            or wants_activations
+            or wants_qk
+        ):
+            await self.collective_rpc(
+                "clear_request_state", args=([request_id], [request_id])
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -540,6 +542,12 @@ def _prepare_offline_params(
         params_list = [sampling_params]
     else:
         params_list = []
+    # Copies with their own extra_args: what follows strips and rewrites extra_args, and the
+    # caller may pass the same SamplingParams to the next call.
+    for idx, sp in enumerate(params_list):
+        params_list[idx] = copy.copy(sp)
+        if sp.extra_args:
+            params_list[idx].extra_args = dict(sp.extra_args)
 
     wants_activations = any(
         (sp.extra_args or {}).get("output_residual_stream") is not None
@@ -597,20 +605,28 @@ def _prepare_offline_params(
         self.collective_rpc("install_qk_hooks")
         self._qk_hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
 
-    # Send steering data to workers before generation.
-    for sid, payload in steering_payloads.items():
-        self.collective_rpc("set_steering_data", args=(sid, payload))
-
-    # Send hook data to workers before generation.
-    for hid, payload in hook_payloads.items():
-        self.collective_rpc("set_hook_data", args=(hid, payload))
-
-    return {
+    state: dict[str, Any] = {
         "wants_activations": wants_activations,
         "wants_qk": wants_qk,
         "steering_payloads": steering_payloads,
         "hook_payloads": hook_payloads,
+        # The copies vLLM receives in place of the caller's SamplingParams.
+        "sampling_params": (
+            params_list
+            if isinstance(sampling_params, Sequence)
+            else (params_list[0] if params_list else None)
+        ),
     }
+    # A failure here leaves part of the data on the workers, so it is released.
+    try:
+        for sid, payload in steering_payloads.items():
+            self.collective_rpc("set_steering_data", args=(sid, payload))
+        for hid, payload in hook_payloads.items():
+            self.collective_rpc("set_hook_data", args=(hid, payload))
+    except BaseException:
+        _release_offline_state(self, state, failed=True)
+        raise
+    return state
 
 
 def _finalize_offline_outputs(
@@ -620,15 +636,11 @@ def _finalize_offline_outputs(
 ) -> list:
     """Shared post-processing for the patched offline entry points.
 
-    Attaches captured activations and hook results to the outputs, then
-    clears per-request worker state set up by
-    :func:`_prepare_offline_params`.
+    Attaches captured activations and hook results to the outputs.
     """
     wants_activations = state["wants_activations"]
-    wants_qk = state.get("wants_qk", False)
-    steering_payloads = state["steering_payloads"]
-    hook_payloads = state["hook_payloads"]
-    has_hooks = len(hook_payloads) > 0
+    wants_qk = state["wants_qk"]
+    has_hooks = len(state["hook_payloads"]) > 0
 
     if wants_activations:
         req_ids = [output.request_id for output in outputs]
@@ -666,17 +678,34 @@ def _finalize_offline_outputs(
             if merged is not None:
                 output.hook_results = merged
 
-    # Clean up steering data.
-    for sid in steering_payloads:
-        self.collective_rpc("clear_steering_data", args=(sid,))
+    return outputs
 
-    # Clean up hook data and contexts.
-    for hid in hook_payloads:
-        self.collective_rpc("clear_hook_data", args=(hid,))
-    if has_hooks:
-        for output in outputs:
-            self.collective_rpc("clear_hook_contexts", args=(output.request_id,))
 
+def _release_offline_state(self: LLM, state: dict[str, Any], failed: bool) -> None:
+    """Clear the steering and hook data :func:`_prepare_offline_params` sent; after a failure,
+    the captures and hook contexts of every request too (the offline call holds the engine)."""
+    keys = [*state["steering_payloads"], *state["hook_payloads"]]
+    if keys or failed:
+        self.collective_rpc("clear_request_state", args=(keys, None if failed else []))
+
+
+def _run_offline(
+    self: LLM,
+    original: Callable[..., list],
+    first: Any,
+    sampling_params: SamplingParams | Sequence[SamplingParams] | None,
+    args: tuple,
+    kwargs: dict[str, Any],
+) -> list:
+    """Run an offline entry point with the prepared params, and release its worker state."""
+    state = _prepare_offline_params(self, sampling_params)
+    try:
+        outputs = original(self, first, state["sampling_params"], *args, **kwargs)
+        outputs = _finalize_offline_outputs(self, outputs, state)
+    except BaseException:
+        _release_offline_state(self, state, failed=True)
+        raise
+    _release_offline_state(self, state, failed=False)
     return outputs
 
 
@@ -692,10 +721,10 @@ def _patched_llm_generate(
     Same logic as the async variant but for the synchronous offline API;
     see :func:`_prepare_offline_params` for the mechanics.
     """
-    state = _prepare_offline_params(self, sampling_params)
     assert _original_llm_generate is not None
-    outputs = _original_llm_generate(self, prompts, sampling_params, *args, **kwargs)
-    return _finalize_offline_outputs(self, outputs, state)
+    return _run_offline(
+        self, _original_llm_generate, prompts, sampling_params, args, kwargs
+    )
 
 
 def _patched_llm_chat(
@@ -714,10 +743,10 @@ def _patched_llm_chat(
     pre-processing is harmless: the inner call finds ``extra_args``
     already stripped and the worker-side clear RPCs are idempotent.
     """
-    state = _prepare_offline_params(self, sampling_params)
     assert _original_llm_chat is not None
-    outputs = _original_llm_chat(self, messages, sampling_params, *args, **kwargs)
-    return _finalize_offline_outputs(self, outputs, state)
+    return _run_offline(
+        self, _original_llm_chat, messages, sampling_params, args, kwargs
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -953,6 +982,25 @@ def _report_integration_failure(component: str, error: Exception) -> None:
     logger.warning(message)
 
 
+def _configure_logging() -> None:
+    """Attach a stderr handler to the ``vllm_lens`` logger when it has none.
+    vLLM configures only its own ``vllm`` logger tree."""
+    pkg_logger = logging.getLogger("vllm_lens")
+    if not pkg_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[vllm-lens] %(levelname)s %(message)s"))
+        pkg_logger.addHandler(handler)
+        # The handler prints the record, so a root handler must not print it again.
+        pkg_logger.propagate = False
+        pkg_logger.setLevel(logging.INFO)
+    level = os.environ.get("VLLM_LENS_LOG_LEVEL", "").strip().upper()
+    if level in logging.getLevelNamesMapping():
+        pkg_logger.setLevel(level)
+    elif level:
+        # Ignored with a warning: an error in register() stops every vLLM process.
+        logger.warning("VLLM_LENS_LOG_LEVEL=%s is not a log level; ignored.", level)
+
+
 def register() -> None:
     """Entry point called by vLLM's plugin system at engine startup.
 
@@ -981,6 +1029,7 @@ def register() -> None:
     ):
         logger.info("VLLM_LENS_DISABLE set; vllm-lens activation plugin inactive.")
         return
+    _configure_logging()
 
     global _original_create_engine_config
     global _original_generate, _original_llm_generate, _original_llm_chat

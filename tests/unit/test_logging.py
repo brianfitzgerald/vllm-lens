@@ -52,4 +52,3 @@ def test_configure_logging_keeps_an_existing_handler(pkg_logger, monkeypatch):
     assert pkg_logger.handlers == [existing]
     assert pkg_logger.propagate is True
     assert pkg_logger.level == logging.WARNING
-
