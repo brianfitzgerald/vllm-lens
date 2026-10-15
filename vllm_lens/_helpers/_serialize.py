@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import cloudpickle
 import numpy as np
@@ -47,6 +48,65 @@ def _encode_tensor(tensor: torch.Tensor) -> tuple[bytes, dict[str, Any]]:
         "compression": "zstd",
     }
     return compressed, meta
+
+
+# Every packed tensor starts on this byte boundary, so any dtype view of it is aligned.
+_PACK_ALIGN = 64
+
+
+class PackEntry(NamedTuple):
+    """One tensor of a packed batch: its chunks, flattened in order, fill ``shape``."""
+
+    req_id: str
+    key: str
+    dtype: torch.dtype
+    shape: list[int]
+    chunks: list[torch.Tensor]
+
+
+def pack_chunks(entries: list[PackEntry]) -> dict[str, Any]:
+    """Pack ``entries`` as one uint8 buffer and an index of ``(id, key, dtype, shape, offset,
+    size)``; pickling one array is one copy, where pickling each tensor saves each storage."""
+    index: list[tuple[str, str, str, list[int], int, int]] = []
+    offset = 0
+    for entry in entries:
+        size = math.prod(entry.shape) * entry.dtype.itemsize
+        index.append(
+            (entry.req_id, entry.key, str(entry.dtype), entry.shape, offset, size)
+        )
+        offset += -(-size // _PACK_ALIGN) * _PACK_ALIGN
+    buffer = torch.empty(offset, dtype=torch.uint8)
+    for entry, (*_, start, size) in zip(entries, index):
+        target = buffer[start : start + size].view(entry.dtype)
+        position = 0
+        for chunk in entry.chunks:
+            flat = chunk.detach().reshape(-1)
+            target[position : position + flat.numel()].copy_(flat)
+            position += flat.numel()
+        if position != target.numel():
+            raise ValueError(
+                f"{entry.req_id} {entry.key}: chunks hold {position} values, "
+                f"shape {entry.shape} needs {target.numel()}"
+            )
+    return {"packed_index": index, "packed_buffer": buffer.numpy()}
+
+
+def unpack_payloads(
+    packed: dict[str, Any],
+) -> dict[str, dict[str, dict[str, torch.Tensor]]]:
+    """Rebuild ``{id: {"activations": {key: tensor}}}`` from :func:`pack_chunks`. Each tensor
+    is copied out of the buffer, so pickling one later does not carry the others."""
+    buffer = torch.from_numpy(packed["packed_buffer"])
+    out: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
+    for req_id, key, dtype, shape, offset, size in packed["packed_index"]:
+        tensor = (
+            buffer[offset : offset + size]
+            .view(getattr(torch, dtype.removeprefix("torch.")))
+            .reshape(shape)
+            .clone()
+        )
+        out.setdefault(req_id, {"activations": {}})["activations"][key] = tensor
+    return out
 
 
 def serialize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
@@ -100,6 +160,24 @@ def tensor_from_bytes(raw: bytes, meta: dict[str, Any]) -> torch.Tensor:
         t = t.to(torch.float16)
 
     return t
+
+
+def decode_layers(value: Any) -> list[int] | None:
+    """The layers of an ``output_residual_stream`` or ``output_qk`` value; None for every
+    layer. ``vllm_xargs`` sends the list as a JSON string."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return [int(layer) for layer in value] if isinstance(value, list) else None
+
+
+def deserialize_directions(value: str | dict[str, Any]) -> torch.Tensor:
+    """Decode an ``output_residual_stream_project`` value to float32 directions."""
+    return deserialize_tensor(
+        json.loads(value) if isinstance(value, str) else value
+    ).float()
 
 
 def serialize_activations(tensor_dict: dict[str, Any]) -> dict[str, Any]:

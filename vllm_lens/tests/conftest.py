@@ -49,6 +49,17 @@ def hf_model():
     torch.cuda.empty_cache()
 
 
+def make_llm(env: dict[str, str], **kwargs):
+    """Start an offline engine with ``env`` set while its config is created."""
+    from vllm import LLM
+
+    kwargs.setdefault("gpu_memory_utilization", 0.2)
+    with pytest.MonkeyPatch.context() as patch:
+        for name, value in env.items():
+            patch.setenv(name, value)
+        return LLM(model=MODEL_NAME, dtype="auto", **kwargs)
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_vllm():
     yield
