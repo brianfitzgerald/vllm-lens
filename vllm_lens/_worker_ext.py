@@ -1500,6 +1500,8 @@ class HiddenStatesExtension:
         if not external_req_ids:
             return None
         entries: list[tuple[str, str, torch.dtype, list[int], list[torch.Tensor]]] = []
+        # Pooled rows stay on the device until one copy to the host for all of them.
+        pooled: list[tuple[str, torch.Tensor]] = []
         wanted = set(external_req_ids)
         found: set[str] = set()
         # An internal id is its external id, "-", and a suffix without "-"; the set lookup
@@ -1509,7 +1511,26 @@ class HiddenStatesExtension:
             if external_req_id not in wanted or external_req_id in found:
                 continue
             found.add(external_req_id)
-            if req_id in self._pooled_counts or req_id in self._projections:
+            counts = self._pooled_counts.pop(req_id, None)
+            if counts is not None:
+                layer_dict = self._captured_states.pop(req_id)
+                self._projections.pop(req_id, None)
+                # Each layer holds one float32 sum row; divide to get the mean.
+                pooled.append(
+                    (
+                        external_req_id,
+                        torch.stack(
+                            [
+                                (layer_dict[layer][0] / counts[layer][0]).to(
+                                    counts[layer][1]
+                                )
+                                for layer in sorted(layer_dict)
+                            ]
+                        ),
+                    )
+                )
+                continue
+            if req_id in self._projections:
                 for key, tensor in self._build_payload(req_id)["activations"].items():
                     entries.append(
                         (
@@ -1530,6 +1551,23 @@ class HiddenStatesExtension:
             entries.append(
                 (external_req_id, "residual_stream", first[0].dtype, shape, chunks)
             )
+        by_dtype: dict[torch.dtype, list[tuple[str, torch.Tensor]]] = {}
+        for external_req_id, rows in pooled:
+            by_dtype.setdefault(rows.dtype, []).append((external_req_id, rows))
+        for group in by_dtype.values():
+            host = torch.cat([rows.reshape(-1) for _, rows in group]).cpu()
+            for (external_req_id, rows), part in zip(
+                group, host.split([rows.numel() for _, rows in group])
+            ):
+                entries.append(
+                    (
+                        external_req_id,
+                        "residual_stream",
+                        rows.dtype,
+                        list(rows.shape),
+                        [part],
+                    )
+                )
         if not entries:
             return None
         # On the caller's host, the rows go through a shared-memory file, not the RPC.

@@ -101,3 +101,24 @@ def test_batch_finds_each_external_id(
         assert stream.shape == (2, 3, HIDDEN)
         assert torch.equal(stream[0], torch.full((3, HIDDEN), rows[req_id]))
         assert torch.equal(stream[1], torch.full((3, HIDDEN), -rows[req_id]))
+
+
+def test_batch_returns_pooled_means_in_layer_order() -> None:
+    """A pooled capture comes back as one mean row per layer, in layer order and the capture
+    dtype, beside a full capture of another request."""
+    sums = {7: torch.full((1, HIDDEN), 6.0), 2: torch.full((1, HIDDEN), 4.0)}
+    extension = SimpleNamespace(
+        _captured_states={
+            "0-ab": {layer: [total] for layer, total in sums.items()},
+            "1-cd": {2: [torch.ones(3, HIDDEN, dtype=torch.bfloat16)]},
+        },
+        _pooled_counts={"0-ab": {7: (3, torch.bfloat16, 3), 2: (2, torch.bfloat16, 2)}},
+        _projections={},
+    )
+    result = HiddenStatesExtension.get_captured_states_batch(extension, ["0", "1"])  # type: ignore[arg-type]
+    payloads = unpack_payloads(pickle.loads(result))
+    pooled = payloads["0"]["activations"]["residual_stream"]
+    assert pooled.dtype == torch.bfloat16 and pooled.shape == (2, 1, HIDDEN)
+    assert torch.equal(pooled[:, 0, 0], torch.tensor([2.0, 2.0], dtype=torch.bfloat16))
+    assert payloads["1"]["activations"]["residual_stream"].shape == (1, 3, HIDDEN)
+    assert extension._pooled_counts == {} and extension._captured_states == {}
