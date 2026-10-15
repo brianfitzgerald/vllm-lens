@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import pickle
 
 import pytest
 import torch
@@ -10,8 +11,10 @@ import torch
 from vllm_lens._helpers._serialize import (
     decode_activations,
     deserialize_tensor,
+    pack_payloads,
     serialize_activations,
     serialize_tensor,
+    unpack_payloads,
 )
 
 
@@ -119,3 +122,31 @@ def test_round_trip_qk_activations() -> None:
     assert torch.equal(recovered["attn_k"], activations["attn_k"])
     assert recovered["qk_layers"] == [2, 7]
     assert recovered["qk_meta"] == activations["qk_meta"]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_packed_payloads_round_trip(dtype: torch.dtype) -> None:
+    """pack_payloads → pickle → unpack_payloads returns every tensor, each in its own storage."""
+    payloads = {
+        "0": {"activations": {"residual_stream": torch.randn(2, 5, 8).to(dtype)}},
+        "1": {"activations": {"residual_stream": torch.randn(2, 1, 8).to(dtype)}},
+        "2": {
+            "activations": {
+                "residual_stream_projection": torch.randn(1, 3, 4),
+                "residual_stream_norm": torch.randn(1, 3),
+            }
+        },
+    }
+    recovered = unpack_payloads(pickle.loads(pickle.dumps(pack_payloads(payloads))))
+
+    assert set(recovered) == set(payloads)
+    for req_id, payload in payloads.items():
+        for key, tensor in payload["activations"].items():
+            got = recovered[req_id]["activations"][key]
+            assert got.dtype == tensor.dtype and torch.equal(got, tensor)
+            assert got.untyped_storage().nbytes() == got.numel() * got.element_size()
+
+
+def test_packed_payloads_empty() -> None:
+    """An empty batch packs and unpacks to nothing."""
+    assert unpack_payloads(pack_payloads({})) == {}

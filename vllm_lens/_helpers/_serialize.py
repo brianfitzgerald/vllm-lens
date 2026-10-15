@@ -49,6 +49,51 @@ def _encode_tensor(tensor: torch.Tensor) -> tuple[bytes, dict[str, Any]]:
     return compressed, meta
 
 
+def pack_payloads(
+    payloads: dict[str, dict[str, dict[str, torch.Tensor]]],
+) -> dict[str, Any]:
+    """Pack ``{id: {"activations": {key: tensor}}}`` as one uint8 array and an index.
+    Pickling the array copies one buffer; pickling the tensors saves each storage alone."""
+    index: list[tuple[str, str, str, list[int], int, int]] = []
+    chunks: list[torch.Tensor] = []
+    offset = 0
+    for req_id, payload in payloads.items():
+        for key, tensor in payload["activations"].items():
+            raw = tensor.detach().cpu().contiguous().view(torch.uint8).reshape(-1)
+            index.append(
+                (
+                    req_id,
+                    key,
+                    str(tensor.dtype),
+                    list(tensor.shape),
+                    offset,
+                    raw.numel(),
+                )
+            )
+            chunks.append(raw)
+            offset += raw.numel()
+    buffer = torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.uint8)
+    return {"packed_index": index, "packed_buffer": buffer.numpy()}
+
+
+def unpack_payloads(
+    packed: dict[str, Any],
+) -> dict[str, dict[str, dict[str, torch.Tensor]]]:
+    """Rebuild :func:`pack_payloads` input. Each tensor is copied out of the shared buffer,
+    so pickling one later does not carry the others."""
+    buffer = torch.from_numpy(packed["packed_buffer"])
+    out: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
+    for req_id, key, dtype, shape, offset, size in packed["packed_index"]:
+        tensor = (
+            buffer[offset : offset + size]
+            .view(getattr(torch, dtype.removeprefix("torch.")))
+            .reshape(shape)
+            .clone()
+        )
+        out.setdefault(req_id, {"activations": {}})["activations"][key] = tensor
+    return out
+
+
 def serialize_tensor(tensor: torch.Tensor) -> dict[str, Any]:
     """Convert a single torch.Tensor to a JSON-serializable base64 dict.
 

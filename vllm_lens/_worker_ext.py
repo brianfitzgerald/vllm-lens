@@ -26,7 +26,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_lens._helpers._hook_output import _replace_hook_output
-from vllm_lens._helpers._serialize import deserialize_directions
+from vllm_lens._helpers._serialize import deserialize_directions, pack_payloads
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
@@ -1296,8 +1296,8 @@ class HiddenStatesExtension:
         the dominant cost on the offline ``LLM.generate`` path; batching it
         cuts N round-trips to one.
 
-        Returns ``pickle.dumps({external_req_id: payload, ...})`` where
-        each ``payload`` is ``{"activations": {"residual_stream": Tensor}}``.
+        Returns the pickled :func:`pack_payloads` form of ``{external_req_id: payload}``,
+        where each ``payload`` is ``{"activations": {"residual_stream": Tensor}}``.
         Missing or unmatched ids are simply absent; ``None`` if nothing
         matched at all.
 
@@ -1318,7 +1318,7 @@ class HiddenStatesExtension:
                 out[external_req_id] = self._build_payload(req_id)
         if not out:
             return None
-        return pickle.dumps(out, protocol=pickle.HIGHEST_PROTOCOL)
+        return pickle.dumps(pack_payloads(out), protocol=pickle.HIGHEST_PROTOCOL)
 
     def _debug_captured_states_count(self) -> int:
         """Return the number of entries in _captured_states (for testing)."""
