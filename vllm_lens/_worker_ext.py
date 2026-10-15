@@ -567,6 +567,8 @@ def _capture_rows(
     # Full-residual rows go to the host in one copy after the loop, pooled rows in one sum.
     full: list[tuple[str, int, int]] = []
     pooled: list[tuple[str, int, int, int, int, str]] = []
+    # Projected rows, by direction set: one matmul and one host copy per set.
+    projected: dict[str, list[tuple[str, int, int]]] = {}
     for i in range(num_reqs):
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
@@ -615,26 +617,31 @@ def _capture_rows(
         if projection_id is None:
             full.append((req_id, start, end))
             continue
-        # Each position is stored as its N projections and its norm, in float32.
+        projected.setdefault(projection_id, []).append((req_id, start, end))
+
+    for projection_id, spans in projected.items():
         # The directions are shared by every request that sent the same payload.
         directions = extension._direction_tables.get(projection_id)
         if directions is None:
             # An aborted request can run one step after its directions were released.
-            logger.warning(
-                "No projection directions for request %s; its capture is skipped",
-                req_id,
-            )
+            for req_id, _, _ in spans:
+                logger.warning(
+                    "No projection directions for request %s; its capture is skipped",
+                    req_id,
+                )
             continue
-        extension._projections[req_id] = directions
-        rows = hidden_states[start:end].float()
-        activation = _to_host(
+        rows = torch.cat([hidden_states[start:end] for _, start, end in spans]).float()
+        # Each position is stored as its N projections and its norm, in float32.
+        host = _to_host(
             torch.cat([rows @ directions.T, rows.norm(dim=-1, keepdim=True)], dim=1)
         )
-
-        extension._captured_states.setdefault(req_id, {}).setdefault(
-            layer_idx, []
-        ).append(activation)
-
+        for (req_id, _, _), piece in zip(
+            spans, host.split([end - start for _, start, end in spans])
+        ):
+            extension._projections[req_id] = directions
+            extension._captured_states.setdefault(req_id, {}).setdefault(
+                layer_idx, []
+            ).append(piece)
     if pooled:
         _accumulate_pooled_batch(extension, layer_idx, hidden_states, pooled)
     if full:
