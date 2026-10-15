@@ -60,11 +60,28 @@ client.clear_hooks()
 
 ## Disabling the plugin
 
-vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` entry point) and forces `enforce_eager=True` (disabling CUDA graphs) so its hooks can fire. To install it alongside another inference server without perturbing that server, set `VLLM_LENS_DISABLE=1` to make the plugin a complete no-op:
+vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` entry point) and forces `enforce_eager=True` (disabling CUDA graphs) so its hooks can fire, unless the [CUDA graphs](#cuda-graphs) mode is on. To install it alongside another inference server without perturbing that server, set `VLLM_LENS_DISABLE=1` to make the plugin a complete no-op:
 
 ```bash
 VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
+
+## CUDA graphs
+
+The forward hooks do not run under a CUDA graph, so the plugin forces `enforce_eager=True`. Name the layers to serve in `VLLM_LENS_CAPTURE_LAYERS` and `VLLM_LENS_STEER_LAYERS` to keep compilation and CUDA graphs on:
+
+```bash
+VLLM_LENS_STEER_LAYERS=18 VLLM_LENS_CAPTURE_LAYERS=15,20 vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
+A forward hook on each named layer calls one custom op, `vllm_lens::lens`, which the compiler keeps inside the graph. The op adds the layer's steering rows to the stream, then copies the stream into a capture buffer. Before each forward pass the plugin writes every token's steering rows; after it, the plugin reads the captured rows of the requests that asked for them. Zero rows change nothing, so requests with and without steering share a batch. The request format does not change. Tested on Qwen2.5 and Gemma2.
+
+Limits:
+
+- A capture or steering layer that is not in the lists, `output_residual_stream=True` (all layers), hooks and Q/K capture fail with an error, as does the registration of a persistent hook.
+- The engine refuses to load with pipeline parallelism, micro-batching (DBO) or sequence parallelism.
+- The buffers are allocated when the model loads, before vLLM sizes the KV cache: two `(max_num_batched_tokens, hidden_size)` buffers per steered layer and one per captured layer, in the model dtype.
+- The layer lists are part of vLLM's compile cache key, so each set gets its own compiled graph.
 
 ## Logging
 
