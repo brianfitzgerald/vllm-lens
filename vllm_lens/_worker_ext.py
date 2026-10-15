@@ -445,29 +445,65 @@ def _accumulate_pooled(
 ) -> None:
     """Add the prompt rows of one forward step to a layer's pooled capture.
     ``first`` is the absolute position of ``rows[0]``; a position is pooled once."""
-    counts = extension._pooled_counts.get(req_id, {})
-    count, _, seen_end = counts.get(layer_idx, (0, rows.dtype, 0))
-    if pool == "last":
-        low = max(n_prompt - 1, first)
-        high = min(first + rows.shape[0], n_prompt)
-        count = 0
-    else:
-        low = max(first, seen_end)
-        high = min(first + rows.shape[0], n_prompt)
-    # No entry is made for a step that holds no new prompt row.
-    if high <= low:
-        return
-    # The sum stays on the device until collection, so the hook does not wait for the GPU.
-    total = rows[low - first : high - first].float().sum(0, keepdim=True)
-    states = extension._captured_states.setdefault(req_id, {})
-    if pool == "mean" and layer_idx in states:
-        total = states[layer_idx][0] + total
-    states[layer_idx] = [total]
-    extension._pooled_counts.setdefault(req_id, {})[layer_idx] = (
-        count + high - low,
-        rows.dtype,
-        high,
+    _accumulate_pooled_batch(
+        extension, layer_idx, rows, [(req_id, 0, rows.shape[0], first, n_prompt, pool)]
     )
+
+
+def _accumulate_pooled_batch(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    items: list[tuple[str, int, int, int, int, str]],
+) -> None:
+    """:func:`_accumulate_pooled` for every ``(req_id, start, end, first, n_prompt, pool)`` of
+    a step at once: one gather and one ``index_add_`` in place of a few kernels per request."""
+    spans: list[tuple[str, int, int, str, int, int]] = []
+    for req_id, start, end, first, n_prompt, pool in items:
+        counts = extension._pooled_counts.get(req_id, {})
+        count, _, seen_end = counts.get(layer_idx, (0, hidden_states.dtype, 0))
+        if pool == "last":
+            low = max(n_prompt - 1, first)
+            high = min(first + end - start, n_prompt)
+            count = 0
+        else:
+            low = max(first, seen_end)
+            high = min(first + end - start, n_prompt)
+        # No entry is made for a step that holds no new prompt row.
+        if high > low:
+            spans.append(
+                (req_id, start + low - first, start + high - first, pool, count, high)
+            )
+    if not spans:
+        return
+    lengths = np.asarray([b - a for _, a, b, *_ in spans], dtype=np.int64)
+    starts = np.repeat(np.asarray([a for _, a, *_ in spans], dtype=np.int64), lengths)
+    offsets = np.arange(lengths.sum(), dtype=np.int64) - np.repeat(
+        np.cumsum(lengths) - lengths, lengths
+    )
+    layout = torch.from_numpy(
+        np.stack([starts + offsets, np.repeat(np.arange(len(spans)), lengths)])
+    )
+    if hidden_states.is_cuda:
+        layout = layout.pin_memory()
+    tokens, segments = layout.to(hidden_states.device, non_blocking=True)
+    # The sums stay on the device until collection, so the hook does not wait for the GPU.
+    sums = torch.zeros(
+        (len(spans), hidden_states.shape[-1]),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    ).index_add_(0, segments, hidden_states.index_select(0, tokens).float())
+    for row, (req_id, low, high, pool, count, seen_end) in enumerate(spans):
+        total = sums[row : row + 1]
+        states = extension._captured_states.setdefault(req_id, {})
+        if pool == "mean" and layer_idx in states:
+            total = states[layer_idx][0] + total
+        states[layer_idx] = [total]
+        extension._pooled_counts.setdefault(req_id, {})[layer_idx] = (
+            count + high - low,
+            hidden_states.dtype,
+            seen_end,
+        )
 
 
 def _batch_layout(
@@ -532,8 +568,9 @@ def _capture_rows(
     req_ids = runner.input_batch.req_ids
     # One host read of the layout, made only when a request captures: it waits for the GPU.
     bounds: list[int] | None = None
-    # Full-residual rows go to the host in one copy after the loop.
+    # Full-residual rows go to the host in one copy after the loop, pooled rows in one sum.
     full: list[tuple[str, int, int]] = []
+    pooled: list[tuple[str, int, int, int, int, str]] = []
     for i in range(num_reqs):
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
@@ -566,14 +603,15 @@ def _capture_rows(
         pool = extra.get("output_residual_stream_pool")
         # The front end validates the value; any other value is not pooled.
         if pool in ("last", "mean"):
-            _accumulate_pooled(
-                extension,
-                req_id,
-                layer_idx,
-                hidden_states[start:end],
-                req_state.num_computed_tokens,
-                req_state.num_prompt_tokens,
-                pool,
+            pooled.append(
+                (
+                    req_id,
+                    start,
+                    end,
+                    req_state.num_computed_tokens,
+                    req_state.num_prompt_tokens,
+                    pool,
+                )
             )
             continue
 
@@ -601,6 +639,8 @@ def _capture_rows(
             layer_idx, []
         ).append(activation)
 
+    if pooled:
+        _accumulate_pooled_batch(extension, layer_idx, hidden_states, pooled)
     if full:
         # One device-to-host copy for every full-residual request of the step.
         host = _to_host(torch.cat([hidden_states[start:end] for _, start, end in full]))
