@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 import torch
 
+from vllm_lens._helpers._serialize import unpack_payloads
 from vllm_lens._worker_ext import HiddenStatesExtension, _capture_rows
 
 HIDDEN = 4
@@ -78,10 +79,25 @@ def test_rows_land_on_their_requests() -> None:
 def test_batch_finds_each_external_id(
     internal: list[str], asked: list[str], found: dict[str, str]
 ) -> None:
-    """Each asked external id gets the capture of its internal id, and no other."""
+    """Each asked external id gets the capture of its internal id, and no other; a capture's
+    per-step rows come back as one (layers, positions, hidden) tensor."""
+    rows = {req_id: float(n) for n, req_id in enumerate(internal)}
     extension = SimpleNamespace(
-        _captured_states={req_id: {} for req_id in internal},
-        _build_payload=lambda req_id: req_id,
+        _captured_states={
+            req_id: {
+                2: [torch.full((2, HIDDEN), value), torch.full((1, HIDDEN), value)],
+                7: [torch.full((3, HIDDEN), -value)],
+            }
+            for req_id, value in rows.items()
+        },
+        _pooled_counts={},
+        _projections={},
     )
     result = HiddenStatesExtension.get_captured_states_batch(extension, asked)  # type: ignore[arg-type]
-    assert (pickle.loads(result) if result else {}) == found
+    payloads = unpack_payloads(pickle.loads(result)) if result else {}
+    assert set(payloads) == set(found)
+    for external, req_id in found.items():
+        stream = payloads[external]["activations"]["residual_stream"]
+        assert stream.shape == (2, 3, HIDDEN)
+        assert torch.equal(stream[0], torch.full((3, HIDDEN), rows[req_id]))
+        assert torch.equal(stream[1], torch.full((3, HIDDEN), -rows[req_id]))

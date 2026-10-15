@@ -26,7 +26,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_lens._helpers._hook_output import _replace_hook_output
-from vllm_lens._helpers._serialize import deserialize_directions, pack_payloads
+from vllm_lens._helpers._serialize import deserialize_directions, pack_chunks
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
@@ -1296,7 +1296,7 @@ class HiddenStatesExtension:
         the dominant cost on the offline ``LLM.generate`` path; batching it
         cuts N round-trips to one.
 
-        Returns the pickled :func:`pack_payloads` form of ``{external_req_id: payload}``,
+        Returns the pickled :func:`pack_chunks` form of ``{external_req_id: payload}``,
         where each ``payload`` is ``{"activations": {"residual_stream": Tensor}}``.
         Missing or unmatched ids are simply absent; ``None`` if nothing
         matched at all.
@@ -1308,17 +1308,40 @@ class HiddenStatesExtension:
         """
         if not external_req_ids:
             return None
-        out: dict[str, dict[str, Any]] = {}
+        entries: list[tuple[str, str, torch.dtype, list[int], list[torch.Tensor]]] = []
         wanted = set(external_req_ids)
+        found: set[str] = set()
         # An internal id is its external id, "-", and a suffix without "-"; the set lookup
         # replaces a scan of every external id per internal id.
         for req_id in list(self._captured_states):
             external_req_id = req_id.rpartition("-")[0]
-            if external_req_id in wanted and external_req_id not in out:
-                out[external_req_id] = self._build_payload(req_id)
-        if not out:
+            if external_req_id not in wanted or external_req_id in found:
+                continue
+            found.add(external_req_id)
+            if req_id in self._pooled_counts or req_id in self._projections:
+                for key, tensor in self._build_payload(req_id)["activations"].items():
+                    entries.append(
+                        (
+                            external_req_id,
+                            key,
+                            tensor.dtype,
+                            list(tensor.shape),
+                            [tensor],
+                        )
+                    )
+                continue
+            # A full capture's per-step rows go straight into the packed buffer, one copy.
+            layer_dict = self._captured_states.pop(req_id)
+            layers = sorted(layer_dict)
+            first = layer_dict[layers[0]]
+            shape = [len(layers), sum(p.shape[0] for p in first), first[0].shape[-1]]
+            chunks = [piece for layer in layers for piece in layer_dict[layer]]
+            entries.append(
+                (external_req_id, "residual_stream", first[0].dtype, shape, chunks)
+            )
+        if not entries:
             return None
-        return pickle.dumps(pack_payloads(out), protocol=pickle.HIGHEST_PROTOCOL)
+        return pickle.dumps(pack_chunks(entries), protocol=pickle.HIGHEST_PROTOCOL)
 
     def _debug_captured_states_count(self) -> int:
         """Return the number of entries in _captured_states (for testing)."""

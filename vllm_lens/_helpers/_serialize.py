@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -49,31 +50,44 @@ def _encode_tensor(tensor: torch.Tensor) -> tuple[bytes, dict[str, Any]]:
     return compressed, meta
 
 
+# Every packed tensor starts on this byte boundary, so any dtype view of it is aligned.
+_PACK_ALIGN = 64
+
+
+def pack_chunks(
+    entries: list[tuple[str, str, torch.dtype, list[int], list[torch.Tensor]]],
+) -> dict[str, Any]:
+    """Pack ``(id, key, dtype, shape, chunks)`` entries as one uint8 array and an index; each
+    entry's chunks, flattened in order, fill its tensor, so each row is copied once."""
+    index: list[tuple[str, str, str, list[int], int, int]] = []
+    offset = 0
+    for req_id, key, dtype, shape, _ in entries:
+        size = math.prod(shape) * dtype.itemsize
+        index.append((req_id, key, str(dtype), shape, offset, size))
+        offset += -(-size // _PACK_ALIGN) * _PACK_ALIGN
+    buffer = torch.empty(offset, dtype=torch.uint8)
+    for (_, _, dtype, _, chunks), (*_, start, size) in zip(entries, index):
+        target = buffer[start : start + size].view(dtype)
+        position = 0
+        for chunk in chunks:
+            flat = chunk.detach().reshape(-1)
+            target[position : position + flat.numel()].copy_(flat)
+            position += flat.numel()
+    return {"packed_index": index, "packed_buffer": buffer.numpy()}
+
+
 def pack_payloads(
     payloads: dict[str, dict[str, dict[str, torch.Tensor]]],
 ) -> dict[str, Any]:
-    """Pack ``{id: {"activations": {key: tensor}}}`` as one uint8 array and an index.
+    """Pack ``{id: {"activations": {key: tensor}}}`` with :func:`pack_chunks`.
     Pickling the array copies one buffer; pickling the tensors saves each storage alone."""
-    index: list[tuple[str, str, str, list[int], int, int]] = []
-    chunks: list[torch.Tensor] = []
-    offset = 0
-    for req_id, payload in payloads.items():
-        for key, tensor in payload["activations"].items():
-            raw = tensor.detach().cpu().contiguous().view(torch.uint8).reshape(-1)
-            index.append(
-                (
-                    req_id,
-                    key,
-                    str(tensor.dtype),
-                    list(tensor.shape),
-                    offset,
-                    raw.numel(),
-                )
-            )
-            chunks.append(raw)
-            offset += raw.numel()
-    buffer = torch.cat(chunks) if chunks else torch.empty(0, dtype=torch.uint8)
-    return {"packed_index": index, "packed_buffer": buffer.numpy()}
+    return pack_chunks(
+        [
+            (req_id, key, tensor.dtype, list(tensor.shape), [tensor])
+            for req_id, payload in payloads.items()
+            for key, tensor in payload["activations"].items()
+        ]
+    )
 
 
 def unpack_payloads(

@@ -11,6 +11,7 @@ import torch
 from vllm_lens._helpers._serialize import (
     decode_activations,
     deserialize_tensor,
+    pack_chunks,
     pack_payloads,
     serialize_activations,
     serialize_tensor,
@@ -150,3 +151,28 @@ def test_packed_payloads_round_trip(dtype: torch.dtype) -> None:
 def test_packed_payloads_empty() -> None:
     """An empty batch packs and unpacks to nothing."""
     assert unpack_payloads(pack_payloads({})) == {}
+
+
+def test_packed_chunks_fill_each_tensor_in_order() -> None:
+    """Chunks fill their tensor in flat order; a float32 tensor after an odd-sized bf16 one
+    still unpacks, because every tensor starts on an aligned offset."""
+    layer0 = [
+        torch.randn(2, 3).to(torch.bfloat16),
+        torch.randn(1, 3).to(torch.bfloat16),
+    ]
+    layer1 = [
+        torch.randn(2, 3).to(torch.bfloat16),
+        torch.randn(1, 3).to(torch.bfloat16),
+    ]
+    norms = torch.randn(1, 3)
+    packed = pack_chunks(
+        [
+            ("a", "residual_stream", torch.bfloat16, [2, 3, 3], layer0 + layer1),
+            ("b", "residual_stream_norm", torch.float32, [1, 3], [norms]),
+        ]
+    )
+    recovered = unpack_payloads(pickle.loads(pickle.dumps(packed)))
+    expected = torch.stack([torch.cat(layer0), torch.cat(layer1)])
+    assert torch.equal(recovered["a"]["activations"]["residual_stream"], expected)
+    assert torch.equal(recovered["b"]["activations"]["residual_stream_norm"], norms)
+    assert all(start % 64 == 0 for *_, start, _ in packed["packed_index"])
