@@ -6,6 +6,7 @@ import base64
 import json
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -53,6 +54,30 @@ def _encode_tensor(tensor: torch.Tensor) -> tuple[bytes, dict[str, Any]]:
 
 # Every packed tensor starts on this byte boundary, so any dtype view of it is aligned.
 _PACK_ALIGN = 64
+# Threads for the shared file: pwrite and preadv release the GIL, and one thread is bound by
+# its own memory copy, not by the file system.
+_IO_THREADS = 8
+
+
+def _pwrite_all(fd: int, chunks: list[torch.Tensor], start: int) -> None:
+    """Write ``chunks`` back to back from byte ``start``; a call writes at most about 2 GB."""
+    for chunk in chunks:
+        view = memoryview(
+            chunk.detach().contiguous().view(torch.uint8).reshape(-1).numpy()
+        )
+        while view:
+            written = os.pwrite(fd, view, start)
+            view, start = view[written:], start + written
+
+
+def _pread_all(fd: int, tensor: torch.Tensor, offset: int) -> None:
+    """Fill ``tensor`` from byte ``offset`` of ``fd``."""
+    view = memoryview(tensor.view(torch.uint8).reshape(-1).numpy())
+    while view:
+        read = os.preadv(fd, [view], offset)
+        if read == 0:
+            raise OSError(f"the file ends before offset {offset}")
+        view, offset = view[read:], offset + read
 
 
 def pack_chunks(
@@ -72,14 +97,13 @@ def pack_chunks(
         # Large writes: a mapped file would fault in every new page from the writing process.
         fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
         try:
-            for (*_, chunks), (*_, start, _) in zip(entries, index):
-                for chunk in chunks:
-                    raw = chunk.detach().contiguous().view(torch.uint8).reshape(-1)
-                    view = memoryview(raw.numpy())
-                    # A call writes at most about 2 GB, so a larger chunk takes several.
-                    while view:
-                        written = os.pwrite(fd, view, start)
-                        view, start = view[written:], start + written
+            with ThreadPoolExecutor(_IO_THREADS) as pool:
+                writes = [
+                    pool.submit(_pwrite_all, fd, chunks, start)
+                    for (*_, chunks), (*_, start, _) in zip(entries, index)
+                ]
+                for write in writes:
+                    write.result()
         finally:
             os.close(fd)
         return {"packed_index": index, "packed_path": path, "packed_size": offset}
@@ -119,17 +143,18 @@ def unpack_payloads(
         # Each tensor is read straight into its own storage: one copy, no mapped pages.
         fd = os.open(path, os.O_RDONLY)
         try:
-            for req_id, key, dtype, shape, offset, size in packed["packed_index"]:
-                tensor = torch.empty(
-                    shape, dtype=getattr(torch, dtype.removeprefix("torch."))
-                )
-                view = memoryview(tensor.view(torch.uint8).reshape(-1).numpy())
-                while view:
-                    read = os.preadv(fd, [view], offset)
-                    if read == 0:
-                        raise OSError(f"{path} ends before offset {offset}")
-                    view, offset = view[read:], offset + read
-                out.setdefault(req_id, {"activations": {}})["activations"][key] = tensor
+            with ThreadPoolExecutor(_IO_THREADS) as pool:
+                reads = []
+                for req_id, key, dtype, shape, offset, _ in packed["packed_index"]:
+                    tensor = torch.empty(
+                        shape, dtype=getattr(torch, dtype.removeprefix("torch."))
+                    )
+                    reads.append(pool.submit(_pread_all, fd, tensor, offset))
+                    out.setdefault(req_id, {"activations": {}})["activations"][key] = (
+                        tensor
+                    )
+                for read in reads:
+                    read.result()
         finally:
             os.close(fd)
             os.unlink(path)
