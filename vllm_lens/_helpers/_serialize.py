@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -56,16 +57,21 @@ _PACK_ALIGN = 64
 
 def pack_chunks(
     entries: list[tuple[str, str, torch.dtype, list[int], list[torch.Tensor]]],
+    path: str | None = None,
 ) -> dict[str, Any]:
-    """Pack ``(id, key, dtype, shape, chunks)`` entries as one uint8 array and an index; each
-    entry's chunks, flattened in order, fill its tensor, so each row is copied once."""
+    """Pack ``(id, key, dtype, shape, chunks)`` entries as one uint8 buffer and an index; each
+    entry's chunks, flattened in order, fill its tensor, so each row is copied once. With
+    ``path`` the buffer is a shared-memory file there, and only its path travels."""
     index: list[tuple[str, str, str, list[int], int, int]] = []
     offset = 0
     for req_id, key, dtype, shape, _ in entries:
         size = math.prod(shape) * dtype.itemsize
         index.append((req_id, key, str(dtype), shape, offset, size))
         offset += -(-size // _PACK_ALIGN) * _PACK_ALIGN
-    buffer = torch.empty(offset, dtype=torch.uint8)
+    if path is not None:
+        buffer = torch.from_file(path, shared=True, size=offset, dtype=torch.uint8)
+    else:
+        buffer = torch.empty(offset, dtype=torch.uint8)
     for (_, _, dtype, _, chunks), (*_, start, size) in zip(entries, index):
         target = buffer[start : start + size].view(dtype)
         position = 0
@@ -73,6 +79,8 @@ def pack_chunks(
             flat = chunk.detach().reshape(-1)
             target[position : position + flat.numel()].copy_(flat)
             position += flat.numel()
+    if path is not None:
+        return {"packed_index": index, "packed_path": path, "packed_size": offset}
     return {"packed_index": index, "packed_buffer": buffer.numpy()}
 
 
@@ -93,18 +101,27 @@ def pack_payloads(
 def unpack_payloads(
     packed: dict[str, Any],
 ) -> dict[str, dict[str, dict[str, torch.Tensor]]]:
-    """Rebuild :func:`pack_payloads` input. Each tensor is copied out of the shared buffer,
-    so pickling one later does not carry the others."""
-    buffer = torch.from_numpy(packed["packed_buffer"])
+    """Rebuild :func:`pack_chunks` input. Each tensor is copied out of the shared buffer, so
+    pickling one later does not carry the others; a shared-memory file is removed after."""
+    path = packed.get("packed_path")
+    if path is None:
+        buffer = torch.from_numpy(packed["packed_buffer"])
+    else:
+        size = packed["packed_size"]
+        buffer = torch.from_file(path, shared=False, size=size, dtype=torch.uint8)
     out: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
-    for req_id, key, dtype, shape, offset, size in packed["packed_index"]:
-        tensor = (
-            buffer[offset : offset + size]
-            .view(getattr(torch, dtype.removeprefix("torch.")))
-            .reshape(shape)
-            .clone()
-        )
-        out.setdefault(req_id, {"activations": {}})["activations"][key] = tensor
+    try:
+        for req_id, key, dtype, shape, offset, size in packed["packed_index"]:
+            tensor = (
+                buffer[offset : offset + size]
+                .view(getattr(torch, dtype.removeprefix("torch.")))
+                .reshape(shape)
+                .clone()
+            )
+            out.setdefault(req_id, {"activations": {}})["activations"][key] = tensor
+    finally:
+        if path is not None:
+            os.unlink(path)
     return out
 
 

@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import pickle
+import socket
 from importlib.metadata import PackageNotFoundError, version
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING, Any
@@ -750,8 +751,9 @@ def _finalize_offline_outputs(
 
     if wants_activations:
         req_ids = [output.request_id for output in outputs]
+        # A worker on this host returns its rows through a shared-memory file.
         states_per_rank = self.collective_rpc(
-            "get_captured_states_batch", args=(req_ids,)
+            "get_captured_states_batch", args=(req_ids, socket.gethostname())
         )
         activations_by_id = _merge_captured_states_batch(states_per_rank, req_ids)
         for output in outputs:

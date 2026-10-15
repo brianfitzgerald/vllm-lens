@@ -14,8 +14,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import pickle
+import shutil
+import socket
+import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +38,9 @@ if TYPE_CHECKING:
     from vllm.config import ParallelConfig
 
 logger = logging.getLogger(__name__)
+
+# Where a batch capture's rows go when the caller is on this host.
+_SHM_DIR = "/dev/shm"
 
 _DTYPE_LIST = [
     torch.float32,
@@ -1287,7 +1294,9 @@ class HiddenStatesExtension:
                 return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
         return None
 
-    def get_captured_states_batch(self, external_req_ids: list[str]) -> bytes | None:
+    def get_captured_states_batch(
+        self, external_req_ids: list[str], host: str | None = None
+    ) -> bytes | None:
         """Retrieve captured activations for many requests in one RPC.
 
         Equivalent to calling :meth:`get_captured_states` once per id, but
@@ -1341,7 +1350,14 @@ class HiddenStatesExtension:
             )
         if not entries:
             return None
-        return pickle.dumps(pack_chunks(entries), protocol=pickle.HIGHEST_PROTOCOL)
+        # On the caller's host, the rows go through a shared-memory file, not the RPC.
+        path = None
+        size = sum(math.prod(shape) * dtype.itemsize for *_, dtype, shape, _ in entries)
+        same_host = host == socket.gethostname() and os.path.isdir(_SHM_DIR)
+        if same_host and shutil.disk_usage(_SHM_DIR).free > 2 * size:
+            path = os.path.join(_SHM_DIR, f"vllm_lens_{uuid.uuid4().hex}")
+        packed = pack_chunks(entries, path)
+        return pickle.dumps(packed, protocol=pickle.HIGHEST_PROTOCOL)
 
     def _debug_captured_states_count(self) -> int:
         """Return the number of entries in _captured_states (for testing)."""

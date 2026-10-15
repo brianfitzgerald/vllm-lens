@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import pickle
+from pathlib import Path
 
 import pytest
 import torch
@@ -176,3 +177,16 @@ def test_packed_chunks_fill_each_tensor_in_order() -> None:
     assert torch.equal(recovered["a"]["activations"]["residual_stream"], expected)
     assert torch.equal(recovered["b"]["activations"]["residual_stream_norm"], norms)
     assert all(start % 64 == 0 for *_, start, _ in packed["packed_index"])
+
+
+def test_packed_chunks_through_a_shared_file(tmp_path: Path) -> None:
+    """A packed buffer written to a file travels as its path, and unpacking removes the file."""
+    rows = torch.randn(2, 4, 8).to(torch.bfloat16)
+    path = tmp_path / "packed"
+    packed = pack_chunks(
+        [("a", "residual_stream", rows.dtype, [2, 4, 8], [rows])], str(path)
+    )
+    assert "packed_buffer" not in packed and path.exists()
+    recovered = unpack_payloads(pickle.loads(pickle.dumps(packed)))
+    assert torch.equal(recovered["a"]["activations"]["residual_stream"], rows)
+    assert not path.exists()
