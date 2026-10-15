@@ -646,9 +646,17 @@ def _prepare_offline_params(
     hidden = self.llm_engine.vllm_config.model_config.get_hidden_size()
     # Each distinct direction set is decoded, validated and shipped once, by its hash.
     projection_payloads: dict[str, str] = {}
+    # Requests that pass one payload object share it: it is hashed once, by its identity.
+    hashed: dict[int, tuple[Any, tuple[str, str] | None]] = {}
     for sp in params_list:
         extra = sp.extra_args or {}
-        projection = _projection_payload(extra)
+        project = extra.get("output_residual_stream_project")
+        known = hashed.get(id(project))
+        if known is not None and known[0] is project:
+            projection = known[1]
+        else:
+            projection = _projection_payload(extra)
+            hashed[id(project)] = (project, projection)
         if projection is None:
             _validate_capture(extra, hidden)
             continue
