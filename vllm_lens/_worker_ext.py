@@ -15,6 +15,7 @@ and steering helpers here.
 from __future__ import annotations
 
 import logging
+import mmap
 import os
 import pickle
 from collections.abc import Callable
@@ -34,7 +35,10 @@ from vllm_lens._helpers._serialize import (
     PackEntry,
     decode_layers,
     deserialize_directions,
+    SHARED_MAP_FLAGS,
+    SHARED_NAME,
     pack_chunks,
+    shared_size,
 )
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
@@ -1301,6 +1305,8 @@ class HiddenStatesExtension:
     _pooled_counts: dict[str, dict[int, tuple[int, torch.dtype, int]]] = {}
     # Projected capture: the internal ids whose rows hold projections and a norm.
     _projections: set[str] = set()
+    # Captures popped by prepare_captured_states_batch for the next batch collect.
+    _pending_collect: list[PackEntry] = []
     # Direction sets by payload hash, and the number of requests holding each.
     _direction_tables: dict[str, torch.Tensor] = {}
     _direction_refs: dict[str, int] = {}
@@ -1351,6 +1357,7 @@ class HiddenStatesExtension:
         self._captured_states = {}
         self._pooled_counts = {}
         self._projections = set()
+        self._pending_collect = []
         self._direction_tables = {}
         self._direction_refs = {}
         self._steering_data = {}
@@ -1452,6 +1459,8 @@ class HiddenStatesExtension:
             if self._steer_table is not None:
                 self._steer_table.release(key)
         wanted = None if external_ids is None else set(external_ids)
+        if wanted is None:
+            self._pending_collect = []
         for store in (
             self._captured_states,
             self._pooled_counts,
@@ -1527,14 +1536,9 @@ class HiddenStatesExtension:
                 return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
         return None
 
-    def get_captured_states_batch(self, external_req_ids: list[str]) -> Packed | None:
-        """Retrieve captured activations for many requests in one RPC (the offline path).
-
-        Returns the :func:`pack_chunks` form of ``{external_req_id: payload}``, with each
-        payload as in :meth:`get_captured_states`; ``None`` if nothing matched.
-        """
-        if not external_req_ids:
-            return None
+    def prepare_captured_states_batch(self, external_req_ids: list[str]) -> int:
+        """Pop the captures of ``external_req_ids`` for the next
+        :meth:`get_captured_states_batch` and return the bytes they need in shared memory."""
         wanted = set(external_req_ids)
         found: set[str] = set()
         entries: list[PackEntry] = []
@@ -1545,8 +1549,6 @@ class HiddenStatesExtension:
                 continue
             found.add(external_req_id)
             entries.extend(_pop_capture(self, req_id, external_req_id))
-        if not entries:
-            return None
         # Pooled sums are still on the device: one copy to the host for all of them.
         on_device = [i for i, entry in enumerate(entries) if entry.chunks[0].is_cuda]
         if on_device:
@@ -1556,7 +1558,39 @@ class HiddenStatesExtension:
             sizes = [sum(c.numel() for c in entries[i].chunks) for i in on_device]
             for i, part in zip(on_device, flat.split(sizes)):
                 entries[i] = entries[i]._replace(chunks=[part])
-        # Only the in-process executors return the reply without pickling it.
+        self._pending_collect = entries
+        return shared_size(entries)
+
+    def get_captured_states_batch(
+        self, shared: list[tuple[int, int] | None]
+    ) -> Packed | None:
+        """Return the captures popped by :meth:`prepare_captured_states_batch` in the
+        :func:`pack_chunks` form; ``None`` if there are none. They go into this rank's
+        ``(pid, fd)`` memfd of the caller when the worker can open it."""
+        entries, self._pending_collect = self._pending_collect, []
+        if not entries:
+            return None
+        target = shared[self.rank]
+        if target is not None:
+            pid, fd = target
+            path = f"/proc/{pid}/fd/{fd}"
+            handle = None
+            try:
+                # On another host or in another pid namespace the path names something else.
+                if os.readlink(path).startswith(f"/memfd:{SHARED_NAME}"):
+                    handle = os.open(path, os.O_RDWR)
+            except OSError:
+                pass
+            if handle is not None:
+                try:
+                    region = mmap.mmap(
+                        handle, shared_size(entries), flags=SHARED_MAP_FLAGS
+                    )
+                finally:
+                    os.close(handle)
+                with region:
+                    return pack_chunks(entries, shared=region)
+        # No memfd: send the bytes. Only the in-process executors return them unpickled.
         backend = self.parallel_config.distributed_executor_backend
         return pack_chunks(entries, copy=backend not in ("uni", "external_launcher"))
 

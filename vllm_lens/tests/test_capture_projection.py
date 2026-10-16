@@ -3,6 +3,7 @@
 import gc
 import json
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -96,6 +97,8 @@ def _extension(extra: dict, first: int, directions: torch.Tensor) -> SimpleNames
         _captured_states={},
         _pooled_counts={},
         _projections=set(),
+        _pending_collect=[],
+        rank=0,
         parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
         _direction_tables={"dirs": directions},
     )
@@ -123,7 +126,10 @@ def test_each_step_is_projected_in_order(schedule):
             torch.tensor([0, n_rows]),
         )
 
-    packed = HiddenStatesExtension.get_captured_states_batch(extension, ["r"])  # type: ignore[arg-type]
+    worker: Any = extension
+    HiddenStatesExtension.prepare_captured_states_batch(worker, ["r"])
+    packed = HiddenStatesExtension.get_captured_states_batch(worker, [None])
+    assert packed is not None
     payload = unpack_payloads(packed)["r"]["activations"]
     torch.testing.assert_close(
         payload["residual_stream_projection"][0], stream.float() @ directions.T

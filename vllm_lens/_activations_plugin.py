@@ -16,6 +16,7 @@ import copy
 import hashlib
 import json
 import logging
+import mmap
 import os
 import pickle
 from importlib.metadata import PackageNotFoundError, version
@@ -33,6 +34,7 @@ from vllm_lens._helpers._serialize import (
     serialize_activations_binary,
     serialize_hook_results,
     Packed,
+    shared_segment,
     unpack_payloads,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
@@ -136,13 +138,14 @@ def _merge_captured_states(
 
 
 def _merge_captured_states_batch(
-    states_per_rank: list[Packed | None] | None,
+    states_per_rank: list[Packed | None],
     external_req_ids: Sequence[str],
+    shared: Sequence[mmap.mmap | None],
 ) -> dict[str, dict[str, Any]]:
     """Merge a batched ``get_captured_states_batch`` response across PP ranks.
 
-    Each rank returns either ``None`` or the :func:`pack_chunks` form of
-    ``{external_req_id → {"activations": {"residual_stream": Tensor}}}``.
+    Each rank returns ``None`` or a :func:`pack_chunks` ``(index, buffers)`` tuple, and
+    ``shared[rank]`` is that rank's memfd mapping or ``None``.
 
     For PP > 1 we concatenate the per-id residual streams along dim 0 in
     rank order — same convention as :func:`_merge_captured_states`, just
@@ -153,13 +156,11 @@ def _merge_captured_states_batch(
     and ``residual_stream_norm`` for a projected capture. Requests with no captured data (no rank emitted a payload
     for that id) are simply absent from the returned dict.
     """
-    if not states_per_rank:
-        return {}
     rank_dicts: list[dict[str, dict[str, Any]]] = [
-        unpack_payloads(s) for s in states_per_rank if s is not None
+        unpack_payloads(s, shared[rank])
+        for rank, s in enumerate(states_per_rank)
+        if s is not None
     ]
-    if not rank_dicts:
-        return {}
     out: dict[str, dict[str, Any]] = {}
     for req_id in external_req_ids:
         per_rank = [d[req_id] for d in rank_dicts if req_id in d]
@@ -765,10 +766,21 @@ def _finalize_offline_outputs(
 
     if wants_activations:
         req_ids = [output.request_id for output in outputs]
-        states_per_rank = self.collective_rpc(
-            "get_captured_states_batch", args=(req_ids,)
+        # Each rank writes its captures into a memfd of this process; the views keep it alive.
+        sizes = self.collective_rpc("prepare_captured_states_batch", args=(req_ids,))
+        segments = [shared_segment(size) if size else None for size in sizes]
+        try:
+            states_per_rank = self.collective_rpc(
+                "get_captured_states_batch",
+                args=([None if s is None else (os.getpid(), s[0]) for s in segments],),
+            )
+        finally:
+            for segment in segments:
+                if segment is not None:
+                    os.close(segment[0])
+        activations_by_id = _merge_captured_states_batch(
+            states_per_rank, req_ids, [None if s is None else s[1] for s in segments]
         )
-        activations_by_id = _merge_captured_states_batch(states_per_rank, req_ids)
         for output in outputs:
             activations = activations_by_id.get(output.request_id)
             if activations is not None:
