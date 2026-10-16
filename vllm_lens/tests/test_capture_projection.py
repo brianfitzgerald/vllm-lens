@@ -2,7 +2,6 @@
 
 import gc
 import json
-import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -97,6 +96,7 @@ def _extension(extra: dict, first: int, directions: torch.Tensor) -> SimpleNames
         _captured_states={},
         _pooled_counts={},
         _projections=set(),
+        parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
         _direction_tables={"dirs": directions},
     )
 
@@ -124,7 +124,7 @@ def test_each_step_is_projected_in_order(schedule):
         )
 
     packed = HiddenStatesExtension.get_captured_states_batch(extension, ["r"])  # type: ignore[arg-type]
-    payload = unpack_payloads(pickle.loads(packed))["r"]["activations"]
+    payload = unpack_payloads(packed)["r"]["activations"]
     torch.testing.assert_close(
         payload["residual_stream_projection"][0], stream.float() @ directions.T
     )

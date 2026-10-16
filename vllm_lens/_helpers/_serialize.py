@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import math
+import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -12,6 +13,7 @@ import cloudpickle
 import numpy as np
 import torch
 import zstandard as zstd
+from msgspec import msgpack
 
 if TYPE_CHECKING:
     from vllm_lens._helpers._activation_store import ActivationStore
@@ -50,8 +52,9 @@ def _encode_tensor(tensor: torch.Tensor) -> tuple[bytes, dict[str, Any]]:
     return compressed, meta
 
 
-# Every packed tensor starts on this byte boundary, so any dtype view of it is aligned.
-_PACK_ALIGN = 64
+# vLLM's CUSTOM_TYPE_RAW_VIEW: its decoder returns this msgpack extension as a view of the
+# received frame, with no copy and without VLLM_ALLOW_INSECURE_SERIALIZATION.
+_RAW_VIEW = 3
 
 
 class PackEntry(NamedTuple):
@@ -64,47 +67,48 @@ class PackEntry(NamedTuple):
     chunks: list[torch.Tensor]
 
 
-def pack_chunks(entries: list[PackEntry]) -> dict[str, Any]:
-    """Pack ``entries`` as one uint8 buffer and an index of ``(id, key, dtype, shape, offset,
-    size)``; pickling one array is one copy, where pickling each tensor saves each storage."""
-    index: list[tuple[str, str, str, list[int], int, int]] = []
-    offset = 0
+Packed = tuple[list[tuple[str, str, str, list[int]]], list[msgpack.Ext]]
+
+
+def pack_chunks(entries: list[PackEntry], copy: bool = False) -> Packed:
+    """Pack ``entries`` as an index of ``(id, key, dtype, shape)`` and one extension per tensor,
+    which vLLM decodes as a view of the received frame. ``copy`` gives the extensions bytes, for
+    a reply that is pickled to another process."""
+    index: list[tuple[str, str, str, list[int]]] = []
+    buffers: list[msgpack.Ext] = []
     for entry in entries:
-        size = math.prod(entry.shape) * entry.dtype.itemsize
-        index.append(
-            (entry.req_id, entry.key, str(entry.dtype), entry.shape, offset, size)
-        )
-        offset += -(-size // _PACK_ALIGN) * _PACK_ALIGN
-    buffer = torch.empty(offset, dtype=torch.uint8)
-    for entry, (*_, start, size) in zip(entries, index):
-        target = buffer[start : start + size].view(entry.dtype)
-        position = 0
-        for chunk in entry.chunks:
-            flat = chunk.detach().reshape(-1)
-            target[position : position + flat.numel()].copy_(flat)
-            position += flat.numel()
-        if position != target.numel():
+        chunks = [chunk.detach().reshape(-1) for chunk in entry.chunks]
+        one = len(chunks) == 1 and chunks[0].stride(-1) == 1
+        flat = chunks[0] if one else torch.cat(chunks)
+        if flat.numel() != math.prod(entry.shape):
             raise ValueError(
-                f"{entry.req_id} {entry.key}: chunks hold {position} values, "
-                f"shape {entry.shape} needs {target.numel()}"
+                f"{entry.req_id} {entry.key}: chunks hold {flat.numel()} values, "
+                f"shape {entry.shape} needs {math.prod(entry.shape)}"
             )
-    return {"packed_index": index, "packed_buffer": buffer.numpy()}
+        data = flat.view(torch.uint8).numpy()
+        index.append((entry.req_id, entry.key, str(entry.dtype), entry.shape))
+        buffers.append(msgpack.Ext(_RAW_VIEW, data.tobytes() if copy else data.data))
+    # A tuple: vLLM's typed utility results leave its items as they arrive.
+    return index, buffers
 
 
 def unpack_payloads(
-    packed: dict[str, Any],
+    packed: Packed,
 ) -> dict[str, dict[str, dict[str, torch.Tensor]]]:
     """Rebuild ``{id: {"activations": {key: tensor}}}`` from :func:`pack_chunks`. Each tensor
-    is copied out of the buffer, so pickling one later does not carry the others."""
-    buffer = torch.from_numpy(packed["packed_buffer"])
+    is a view of its own received bytes, so pickling one later does not carry the others."""
     out: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
-    for req_id, key, dtype, shape, offset, size in packed["packed_index"]:
-        tensor = (
-            buffer[offset : offset + size]
-            .view(getattr(torch, dtype.removeprefix("torch.")))
-            .reshape(shape)
-            .clone()
-        )
+    for (req_id, key, dtype, shape), buffer in zip(*packed):
+        torch_dtype = getattr(torch, dtype.removeprefix("torch."))
+        data = buffer.data if isinstance(buffer, msgpack.Ext) else buffer
+        if math.prod(shape) == 0:
+            tensor = torch.empty(shape, dtype=torch_dtype)
+        else:
+            with warnings.catch_warnings():
+                # The frame is ours alone; torch warns only because the view is read-only.
+                warnings.simplefilter("ignore", UserWarning)
+                tensor = torch.frombuffer(data, dtype=torch.uint8)
+            tensor = tensor.view(torch_dtype).reshape(shape)
         out.setdefault(req_id, {"activations": {}})["activations"][key] = tensor
     return out
 

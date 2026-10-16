@@ -32,6 +32,7 @@ from vllm_lens._helpers._serialize import (
     serialize_activations,
     serialize_activations_binary,
     serialize_hook_results,
+    Packed,
     unpack_payloads,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
@@ -135,12 +136,12 @@ def _merge_captured_states(
 
 
 def _merge_captured_states_batch(
-    states_per_rank: list[bytes | None] | None,
+    states_per_rank: list[Packed | None] | None,
     external_req_ids: Sequence[str],
 ) -> dict[str, dict[str, Any]]:
     """Merge a batched ``get_captured_states_batch`` response across PP ranks.
 
-    Each rank returns either ``None`` or the pickled :func:`pack_chunks` form of
+    Each rank returns either ``None`` or the :func:`pack_chunks` form of
     ``{external_req_id → {"activations": {"residual_stream": Tensor}}}``.
 
     For PP > 1 we concatenate the per-id residual streams along dim 0 in
@@ -155,9 +156,7 @@ def _merge_captured_states_batch(
     if not states_per_rank:
         return {}
     rank_dicts: list[dict[str, dict[str, Any]]] = [
-        unpack_payloads(_decode_rank_payload(s))
-        for s in states_per_rank
-        if s is not None
+        unpack_payloads(s) for s in states_per_rank if s is not None
     ]
     if not rank_dicts:
         return {}

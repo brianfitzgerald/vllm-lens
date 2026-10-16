@@ -1,7 +1,6 @@
 """Capture collection needs no GPU: rows go to the right request, and the batch RPC finds
 each request's capture by its external id."""
 
-import pickle
 from types import SimpleNamespace
 from typing import Any
 
@@ -33,6 +32,7 @@ def _extension(extras: dict[str, dict[str, Any] | None]) -> SimpleNamespace:
         _captured_states={},
         _pooled_counts={},
         _projections=set(),
+        parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
         _direction_tables={"d": torch.eye(HIDDEN)[:2]},
     )
 
@@ -92,9 +92,10 @@ def test_batch_finds_each_external_id(
         },
         _pooled_counts={},
         _projections=set(),
+        parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
     )
     result = HiddenStatesExtension.get_captured_states_batch(extension, asked)  # type: ignore[arg-type]
-    payloads = unpack_payloads(pickle.loads(result)) if result else {}
+    payloads = unpack_payloads(result) if result else {}
     assert set(payloads) == set(found)
     for external, req_id in found.items():
         stream = payloads[external]["activations"]["residual_stream"]
@@ -114,9 +115,10 @@ def test_batch_returns_pooled_means_in_layer_order() -> None:
         },
         _pooled_counts={"0-ab": {7: (3, torch.bfloat16, 3), 2: (2, torch.bfloat16, 2)}},
         _projections=set(),
+        parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
     )
     result = HiddenStatesExtension.get_captured_states_batch(extension, ["0", "1"])  # type: ignore[arg-type]
-    payloads = unpack_payloads(pickle.loads(result))
+    payloads = unpack_payloads(result)
     pooled = payloads["0"]["activations"]["residual_stream"]
     assert pooled.dtype == torch.bfloat16 and pooled.shape == (2, 1, HIDDEN)
     assert torch.equal(pooled[:, 0, 0], torch.tensor([2.0, 2.0], dtype=torch.bfloat16))

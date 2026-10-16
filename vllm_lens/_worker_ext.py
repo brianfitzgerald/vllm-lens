@@ -30,6 +30,7 @@ from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_lens._helpers._hook_output import _replace_hook_output
 from vllm_lens._helpers._serialize import (
+    Packed,
     PackEntry,
     decode_layers,
     deserialize_directions,
@@ -1526,12 +1527,11 @@ class HiddenStatesExtension:
                 return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
         return None
 
-    def get_captured_states_batch(self, external_req_ids: list[str]) -> bytes | None:
+    def get_captured_states_batch(self, external_req_ids: list[str]) -> Packed | None:
         """Retrieve captured activations for many requests in one RPC (the offline path).
 
-        Returns the pickled :func:`pack_chunks` form of ``{external_req_id: payload}``,
-        with each payload as in :meth:`get_captured_states`; ``None`` if nothing matched.
-        Not compressed: the offline path is in-process IPC, not HTTP.
+        Returns the :func:`pack_chunks` form of ``{external_req_id: payload}``, with each
+        payload as in :meth:`get_captured_states`; ``None`` if nothing matched.
         """
         if not external_req_ids:
             return None
@@ -1556,8 +1556,9 @@ class HiddenStatesExtension:
             sizes = [sum(c.numel() for c in entries[i].chunks) for i in on_device]
             for i, part in zip(on_device, flat.split(sizes)):
                 entries[i] = entries[i]._replace(chunks=[part])
-        packed = pack_chunks(entries)
-        return pickle.dumps(packed, protocol=pickle.HIGHEST_PROTOCOL)
+        # Only the in-process executors return the reply without pickling it.
+        backend = self.parallel_config.distributed_executor_backend
+        return pack_chunks(entries, copy=backend not in ("uni", "external_launcher"))
 
     def _debug_captured_states_count(self) -> int:
         """Return the number of entries in _captured_states (for testing)."""

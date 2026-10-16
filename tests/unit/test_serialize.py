@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from vllm_lens._helpers._serialize import (
+    _RAW_VIEW,
     PackEntry,
     decode_activations,
     deserialize_tensor,
@@ -125,10 +126,26 @@ def test_round_trip_qk_activations() -> None:
     assert recovered["qk_meta"] == activations["qk_meta"]
 
 
+@pytest.mark.parametrize("insecure", [False, True], ids=["typed-off", "typed-on"])
+@pytest.mark.parametrize("copy", [False, True], ids=["view", "bytes"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_packed_chunks_round_trip(dtype: torch.dtype) -> None:
-    """Chunks fill their tensor in flat order, each tensor comes back in its own storage, and
-    a float32 tensor after an odd-sized one unpacks because offsets are aligned."""
+def test_packed_chunks_round_trip(
+    dtype: torch.dtype, copy: bool, insecure: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through vLLM's utility-result encoding, chunks fill their tensor in flat order and each
+    tensor comes back in a storage of its own bytes, with or without typed results."""
+    import vllm.envs as envs
+    from vllm.v1.engine import UtilityOutput
+    from vllm.v1.serial_utils import (
+        CUSTOM_TYPE_RAW_VIEW,
+        MsgpackDecoder,
+        MsgpackEncoder,
+        UtilityResult,
+    )
+
+    assert _RAW_VIEW == CUSTOM_TYPE_RAW_VIEW
+
+    monkeypatch.setattr(envs, "VLLM_ALLOW_INSECURE_SERIALIZATION", insecure)
     layers = [
         [torch.randn(2, 3).to(dtype), torch.randn(1, 3).to(dtype)] for _ in range(2)
     ]
@@ -139,16 +156,24 @@ def test_packed_chunks_round_trip(dtype: torch.dtype) -> None:
             PackEntry("a", "residual_stream", dtype, [2, 3, 3], layers[0] + layers[1]),
             PackEntry("a", "residual_stream_norm", torch.float32, [1, 3], [norms]),
             PackEntry("b", "residual_stream_norm", torch.float32, [1, 1], [one]),
-        ]
+            PackEntry("c", "residual_stream", dtype, [1, 0, 3], [torch.empty(0, 3)]),
+        ],
+        copy=copy,
     )
-    recovered = unpack_payloads(pickle.loads(pickle.dumps(packed)))
+    frames = MsgpackEncoder().encode(
+        UtilityOutput(call_id=0, result=UtilityResult(packed))
+    )
+    received = MsgpackDecoder(UtilityOutput).decode([bytes(f) for f in frames])
+    recovered = unpack_payloads(received.result.result)
     expected = torch.stack([torch.cat(layer) for layer in layers])
     stream = recovered["a"]["activations"]["residual_stream"]
     assert stream.dtype == dtype and torch.equal(stream, expected)
     assert stream.untyped_storage().nbytes() == stream.numel() * stream.element_size()
     assert torch.equal(recovered["a"]["activations"]["residual_stream_norm"], norms)
     assert torch.equal(recovered["b"]["activations"]["residual_stream_norm"], one[None])
-    assert all(start % 64 == 0 for *_, start, _ in packed["packed_index"])
+    assert recovered["c"]["activations"]["residual_stream"].shape == (1, 0, 3)
+    if copy:
+        assert pickle.loads(pickle.dumps(packed))[0] == packed[0]
 
 
 @pytest.mark.parametrize("rows", [1, 3], ids=["short", "long"])
