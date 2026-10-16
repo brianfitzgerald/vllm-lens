@@ -16,6 +16,7 @@ import copy
 import hashlib
 import json
 import logging
+import mmap
 import os
 import pickle
 from importlib.metadata import PackageNotFoundError, version
@@ -33,6 +34,7 @@ from vllm_lens._helpers._serialize import (
     serialize_activations_binary,
     serialize_hook_results,
     Packed,
+    shared_segment,
     unpack_payloads,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
@@ -138,6 +140,7 @@ def _merge_captured_states(
 def _merge_captured_states_batch(
     states_per_rank: list[Packed | None] | None,
     external_req_ids: Sequence[str],
+    shared: Sequence[mmap.mmap | None] = (),
 ) -> dict[str, dict[str, Any]]:
     """Merge a batched ``get_captured_states_batch`` response across PP ranks.
 
@@ -156,7 +159,9 @@ def _merge_captured_states_batch(
     if not states_per_rank:
         return {}
     rank_dicts: list[dict[str, dict[str, Any]]] = [
-        unpack_payloads(s) for s in states_per_rank if s is not None
+        unpack_payloads(s, shared[rank] if rank < len(shared) else None)
+        for rank, s in enumerate(states_per_rank)
+        if s is not None
     ]
     if not rank_dicts:
         return {}
@@ -765,10 +770,27 @@ def _finalize_offline_outputs(
 
     if wants_activations:
         req_ids = [output.request_id for output in outputs]
-        states_per_rank = self.collective_rpc(
-            "get_captured_states_batch", args=(req_ids,)
+        # Each rank writes its captures into a memfd of this process; the views keep it alive.
+        sizes = self.collective_rpc("prepare_captured_states_batch", args=(req_ids,))
+        segments = [shared_segment(size) if size else None for size in sizes]
+        try:
+            states_per_rank = self.collective_rpc(
+                "get_captured_states_batch",
+                args=(
+                    req_ids,
+                    [
+                        None if s is None else (os.getpid(), s[0], len(s[1]))
+                        for s in segments
+                    ],
+                ),
+            )
+        finally:
+            for segment in segments:
+                if segment is not None:
+                    os.close(segment[0])
+        activations_by_id = _merge_captured_states_batch(
+            states_per_rank, req_ids, [None if s is None else s[1] for s in segments]
         )
-        activations_by_id = _merge_captured_states_batch(states_per_rank, req_ids)
         for output in outputs:
             activations = activations_by_id.get(output.request_id)
             if activations is not None:

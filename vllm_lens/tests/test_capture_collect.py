@@ -1,13 +1,14 @@
 """Capture collection needs no GPU: rows go to the right request, and the batch RPC finds
 each request's capture by its external id."""
 
+import os
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 
-from vllm_lens._helpers._serialize import unpack_payloads
+from vllm_lens._helpers._serialize import shared_segment, unpack_payloads
 from vllm_lens._worker_ext import HiddenStatesExtension, _capture_rows
 
 HIDDEN = 4
@@ -76,11 +77,15 @@ def test_rows_land_on_their_requests() -> None:
     ],
     ids=["offline", "dashed-external", "miss", "prefix-is-not-a-match"],
 )
+@pytest.mark.parametrize(
+    "transport", ["frames", "shared", "shared-unopened", "shared-other-file"]
+)
 def test_batch_finds_each_external_id(
-    internal: list[str], asked: list[str], found: dict[str, str]
+    internal: list[str], asked: list[str], found: dict[str, str], transport: str
 ) -> None:
     """Each asked external id gets the capture of its internal id, and no other; a capture's
-    per-step rows come back as one (layers, positions, hidden) tensor."""
+    per-step rows come back as one (layers, positions, hidden) tensor, through the reply or
+    through a memfd, and through the reply when the worker cannot open the memfd."""
     rows = {req_id: float(n) for n, req_id in enumerate(internal)}
     extension = SimpleNamespace(
         _captured_states={
@@ -92,10 +97,33 @@ def test_batch_finds_each_external_id(
         },
         _pooled_counts={},
         _projections=set(),
+        _pending_collect=[],
+        rank=0,
         parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
     )
-    result = HiddenStatesExtension.get_captured_states_batch(extension, asked)  # type: ignore[arg-type]
-    payloads = unpack_payloads(result) if result else {}
+    region = None
+    if transport == "frames":
+        result = HiddenStatesExtension.get_captured_states_batch(extension, asked)  # type: ignore[arg-type]
+    else:
+        size = HiddenStatesExtension.prepare_captured_states_batch(extension, asked)  # type: ignore[arg-type]
+        assert size == len(found) * 64 * -(-2 * 3 * HIDDEN * 4 // 64)
+        segment = shared_segment(size) if size else None
+        if size and segment is None:
+            pytest.skip("no memfd on this OS")
+        target = None
+        if segment is not None:
+            fd, region = segment
+            other = {"shared": fd, "shared-unopened": 2**20, "shared-other-file": 0}
+            target = (os.getpid(), other[transport], size)
+        worker: Any = extension
+        result = HiddenStatesExtension.get_captured_states_batch(
+            worker, asked, [target]
+        )
+        if segment is not None:
+            os.close(segment[0])
+        if result:
+            assert all(isinstance(b, int) for b in result[1]) == (transport == "shared")
+    payloads = unpack_payloads(result, region) if result else {}
     assert set(payloads) == set(found)
     for external, req_id in found.items():
         stream = payloads[external]["activations"]["residual_stream"]
@@ -115,6 +143,8 @@ def test_batch_returns_pooled_means_in_layer_order() -> None:
         },
         _pooled_counts={"0-ab": {7: (3, torch.bfloat16, 3), 2: (2, torch.bfloat16, 2)}},
         _projections=set(),
+        _pending_collect=[],
+        rank=0,
         parallel_config=SimpleNamespace(distributed_executor_backend="uni"),
     )
     result = HiddenStatesExtension.get_captured_states_batch(extension, ["0", "1"])  # type: ignore[arg-type]
