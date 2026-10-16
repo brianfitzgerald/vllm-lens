@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import base64
+import ctypes
 import json
 import math
+import mmap
+import os
 import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -67,15 +70,55 @@ class PackEntry(NamedTuple):
     chunks: list[torch.Tensor]
 
 
-Packed = tuple[list[tuple[str, str, str, list[int]]], list[msgpack.Ext]]
+# The index of (id, key, dtype, shape) and, per tensor, its memfd offset or raw-view extension.
+Packed = tuple[list[tuple[str, str, str, list[int]]], list[msgpack.Ext | int]]
+# Every tensor in a shared segment starts on this byte boundary, so any dtype view is aligned.
+_SHARED_ALIGN = 64
+# Map shared segments with their pages in place: under gVisor a first touch from user space
+# costs about 3 s per 1.2 GB, a populated mapping about 0.3 s. 0 where the OS lacks it.
+SHARED_MAP_FLAGS = mmap.MAP_SHARED | getattr(mmap, "MAP_POPULATE", 0)
+# The memfd name; /proc shows it as the link target "/memfd:<name> (deleted)".
+SHARED_NAME = "vllm-lens-capture"
 
 
-def pack_chunks(entries: list[PackEntry], copy: bool = False) -> Packed:
-    """Pack ``entries`` as an index of ``(id, key, dtype, shape)`` and one extension per tensor,
-    which vLLM decodes as a view of the received frame. ``copy`` gives the extensions bytes, for
-    a reply that is pickled to another process."""
+def shared_size(entries: list[PackEntry]) -> int:
+    """The bytes ``entries`` take in a shared segment, each tensor on a 64-byte boundary."""
+    return sum(
+        -(-math.prod(entry.shape) * entry.dtype.itemsize // _SHARED_ALIGN)
+        * _SHARED_ALIGN
+        for entry in entries
+    )
+
+
+def shared_segment(size: int) -> tuple[int, mmap.mmap] | None:
+    """A memfd of ``size`` bytes and its shared mapping; None where the OS has no memfd.
+    A memfd has no path, so its memory is freed when the last fd and mapping go."""
+    fd = -1
+    try:
+        create = getattr(os, "memfd_create", None)
+        if create is not None:
+            fd = create(SHARED_NAME)
+        else:
+            # Some Python builds lack os.memfd_create; Linux libc has it. MFD_CLOEXEC = 1.
+            fd = ctypes.CDLL(None).memfd_create(SHARED_NAME.encode(), 1)
+        if fd < 0:
+            return None
+        os.ftruncate(fd, size)
+        return fd, mmap.mmap(fd, size, flags=SHARED_MAP_FLAGS)
+    except (AttributeError, OSError):
+        if fd >= 0:
+            os.close(fd)
+        return None
+
+
+def pack_chunks(
+    entries: list[PackEntry], copy: bool = False, shared: mmap.mmap | None = None
+) -> Packed:
+    """Pack ``entries`` as an index of ``(id, key, dtype, shape)`` and, per tensor, its offset in
+    ``shared`` or a raw-view msgpack extension; ``copy`` gives the extension bytes for a pickle."""
     index: list[tuple[str, str, str, list[int]]] = []
-    buffers: list[msgpack.Ext] = []
+    buffers: list[msgpack.Ext | int] = []
+    offset = 0
     for entry in entries:
         chunks = [chunk.detach().reshape(-1) for chunk in entry.chunks]
         one = len(chunks) == 1 and chunks[0].stride(-1) == 1
@@ -85,27 +128,43 @@ def pack_chunks(entries: list[PackEntry], copy: bool = False) -> Packed:
                 f"{entry.req_id} {entry.key}: chunks hold {flat.numel()} values, "
                 f"shape {entry.shape} needs {math.prod(entry.shape)}"
             )
-        data = flat.view(torch.uint8).numpy()
+        data = flat.view(torch.uint8)
         index.append((entry.req_id, entry.key, str(entry.dtype), entry.shape))
-        buffers.append(msgpack.Ext(_RAW_VIEW, data.tobytes() if copy else data.data))
+        if shared is None:
+            array = data.numpy()
+            buffers.append(
+                msgpack.Ext(_RAW_VIEW, array.tobytes() if copy else array.data)
+            )
+            continue
+        if data.numel():
+            torch.frombuffer(
+                shared, dtype=torch.uint8, count=data.numel(), offset=offset
+            ).copy_(data)
+        buffers.append(offset)
+        offset += -(-data.numel() // _SHARED_ALIGN) * _SHARED_ALIGN
     # A tuple: vLLM's typed utility results leave its items as they arrive.
     return index, buffers
 
 
 def unpack_payloads(
-    packed: Packed,
+    packed: Packed, shared: mmap.mmap | None = None
 ) -> dict[str, dict[str, dict[str, torch.Tensor]]]:
-    """Rebuild ``{id: {"activations": {key: tensor}}}`` from :func:`pack_chunks`. Each tensor
-    is a view of its own received bytes, so pickling one later does not carry the others."""
+    """Rebuild ``{id: {"activations": {key: tensor}}}`` from :func:`pack_chunks`; each tensor is
+    a view of only its own bytes in ``shared`` or the frame, so a pickle carries no others."""
     out: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
     for (req_id, key, dtype, shape), buffer in zip(*packed):
         torch_dtype = getattr(torch, dtype.removeprefix("torch."))
-        data = buffer.data if isinstance(buffer, msgpack.Ext) else buffer
+        if isinstance(buffer, int):
+            assert shared is not None
+            size = math.prod(shape) * torch_dtype.itemsize
+            data = memoryview(shared)[buffer : buffer + size]
+        else:
+            data = buffer.data if isinstance(buffer, msgpack.Ext) else buffer
         if math.prod(shape) == 0:
             tensor = torch.empty(shape, dtype=torch_dtype)
         else:
             with warnings.catch_warnings():
-                # The frame is ours alone; torch warns only because the view is read-only.
+                # A received frame is ours alone; torch warns only because it is read-only.
                 warnings.simplefilter("ignore", UserWarning)
                 tensor = torch.frombuffer(data, dtype=torch.uint8)
             tensor = tensor.view(torch_dtype).reshape(shape)
