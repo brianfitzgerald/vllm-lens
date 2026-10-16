@@ -201,7 +201,7 @@ class TestBatchedFetch:
     """Coverage for the batched ``get_captured_states_batch`` offline path.
 
     On ``LLM.generate`` the plugin fetches every request's captured
-    activations in one RPC and demultiplexes them by request id. These verify
+    activations in one batched collect and demultiplexes them by request id. These verify
     each request gets *its own* activations (no cross-request mixing/dropping)
     and that the cross-rank batched merge is correct under TP and PP.
 

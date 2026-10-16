@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import pickle
 
 import pytest
@@ -16,6 +17,8 @@ from vllm_lens._helpers._serialize import (
     pack_chunks,
     serialize_activations,
     serialize_tensor,
+    shared_segment,
+    shared_size,
     unpack_payloads,
 )
 
@@ -134,7 +137,7 @@ def test_packed_chunks_round_trip(
 ) -> None:
     """Through vLLM's utility-result encoding, chunks fill their tensor in flat order and each
     tensor comes back in a storage of its own bytes, with or without typed results."""
-    import vllm.envs as envs
+    envs = pytest.importorskip("vllm.envs")
     from vllm.v1.engine import UtilityOutput
     from vllm.v1.serial_utils import (
         CUSTOM_TYPE_RAW_VIEW,
@@ -173,7 +176,39 @@ def test_packed_chunks_round_trip(
     assert torch.equal(recovered["b"]["activations"]["residual_stream_norm"], one[None])
     assert recovered["c"]["activations"]["residual_stream"].shape == (1, 0, 3)
     if copy:
-        assert pickle.loads(pickle.dumps(packed))[0] == packed[0]
+        assert pickle.loads(pickle.dumps(packed)) == packed
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_packed_chunks_through_a_memfd(dtype: torch.dtype) -> None:
+    """Tensors written into a memfd come back equal, each on its own aligned bytes and
+    writable, and the segment lives as long as the tensors do."""
+    entries = [
+        PackEntry(
+            "a", "residual_stream", dtype, [2, 3, 3], [torch.randn(6, 3).to(dtype)]
+        ),
+        PackEntry("b", "residual_stream_norm", torch.float32, [1, 1], [torch.ones(1)]),
+        PackEntry("c", "residual_stream", dtype, [1, 0, 3], [torch.empty(0, 3)]),
+    ]
+    size = shared_size(entries)
+    segment = shared_segment(size)
+    if segment is None:
+        pytest.skip("no memfd on this OS")
+    fd, region = segment
+    os.close(fd)
+    packed = pack_chunks(entries, shared=region)
+    first = -(-18 * dtype.itemsize // 64) * 64
+    assert packed[1] == [0, first, first + 64] and size == first + 64
+    recovered = unpack_payloads(packed, region)
+    del region
+    stream = recovered["a"]["activations"]["residual_stream"]
+    assert torch.equal(stream.reshape(6, 3), entries[0].chunks[0])
+    assert stream.untyped_storage().nbytes() == stream.numel() * stream.element_size()
+    stream.add_(1)
+    assert torch.equal(
+        recovered["b"]["activations"]["residual_stream_norm"], torch.ones(1, 1)
+    )
+    assert recovered["c"]["activations"]["residual_stream"].shape == (1, 0, 3)
 
 
 @pytest.mark.parametrize("rows", [1, 3], ids=["short", "long"])
@@ -182,7 +217,7 @@ def test_packed_chunks_refuse_a_wrong_row_count(rows: int) -> None:
     entry = PackEntry(
         "a", "residual_stream", torch.float32, [2, 4], [torch.ones(rows, 4)]
     )
-    with pytest.raises((ValueError, RuntimeError)):
+    with pytest.raises(ValueError):
         pack_chunks([entry])
 
 
