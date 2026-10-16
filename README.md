@@ -126,6 +126,8 @@ out = llm.generate(["Hello world"], sp)
 acts = out[0].activations["residual_stream"]  # (n_layers, n_positions, hidden_dim)
 ```
 
+The tensors of one offline call are views of one host buffer per rank (a shared memory segment, or the received message), which is freed with the last of them; `clone()` a tensor to keep it alone.
+
 Over the HTTP server, pass it in `vllm_xargs` — or use the client's `capture_layers`:
 
 ```python
