@@ -227,61 +227,31 @@ def _get_total_num_layers(worker: Any) -> int:
     return int(worker.model_config.get_total_num_hidden_layers())
 
 
-def _find_steering_configs(
+def _steering_key(
     extension: HiddenStatesExtension,
     internal_req_id: str,
     extra_args: dict[str, Any] | None,
-) -> list[SteeringVector]:
-    """Find all steering configs that apply to an internal request ID.
-
-    Matches by ``"{external_id}-"`` prefix (async path: vLLM appends
-    ``"-{random_suffix}"`` to external IDs) and by ``_steering_id``
-    sentinel in ``extra_args`` (offline path).
-    """
-    results: list[SteeringVector] = []
-    for external_id, configs in extension._steering_data.items():
-        if internal_req_id.startswith(f"{external_id}-"):
-            results.extend(configs)
-    # Offline path stores a lightweight string key in extra_args
-    if extra_args:
-        steering_id = extra_args.get("_steering_id")
-        if steering_id and steering_id in extension._steering_data:
-            results.extend(extension._steering_data[steering_id])
-    return results
+) -> str | None:
+    """The ``_steering_data`` key of a request, or None without vectors: the offline
+    ``_steering_id`` sentinel, else the external id (the internal id before its last ``-``)."""
+    key = (extra_args or {}).get("_steering_id")
+    if key is None:
+        key = internal_req_id.rpartition("-")[0]
+    return key if key in extension._steering_data else None
 
 
-def _find_hook_configs(
+def _request_hooks(
     extension: HiddenStatesExtension,
     internal_req_id: str,
     extra_args: dict[str, Any] | None,
 ) -> list[Hook]:
-    """Find all hook definitions that apply to an internal request ID.
-
-    Checks three sources (in order):
-    1. Per-request hooks keyed by external ID prefix (async path).
-    2. Per-request hooks keyed by ``_hook_id`` sentinel (offline path).
-    3. Persistent hooks (apply to every request).
-    """
-    results = _find_hook_configs_no_persistent(extension, internal_req_id, extra_args)
-    results.extend(extension._persistent_hooks)
-    return results
-
-
-def _find_hook_configs_no_persistent(
-    extension: HiddenStatesExtension,
-    internal_req_id: str,
-    extra_args: dict[str, Any] | None,
-) -> list[Hook]:
-    """Find per-request hook definitions only (excludes persistent hooks)."""
-    results: list[Hook] = []
-    for external_id, hooks in extension._hook_data.items():
-        if internal_req_id.startswith(f"{external_id}-"):
-            results.extend(hooks)
-    if extra_args:
-        hook_id = extra_args.get("_hook_id")
-        if hook_id and hook_id in extension._hook_data:
-            results.extend(extension._hook_data[hook_id])
-    return results
+    """The per-request hooks of a request: the offline ``_hook_id`` sentinel, else its
+    external id (the internal id before its last ``-``)."""
+    data = extension._hook_data
+    hook_id = extra_args.get("_hook_id") if extra_args else None
+    if hook_id is not None:
+        return data.get(hook_id, [])
+    return data.get(internal_req_id.rpartition("-")[0], [])
 
 
 def norm_match(
@@ -415,7 +385,8 @@ def _hook_inner(
             if req_state and req_state.sampling_params
             else None
         )
-        configs = _find_steering_configs(extension, req_id, extra)
+        key = _steering_key(extension, req_id, extra)
+        configs = extension._steering_data[key] if key is not None else []
         per_req_steering.append(configs)
         if configs:
             needs_steering = True
@@ -434,23 +405,13 @@ def _hook_inner(
             target = modified_output
             norm_ref = target
 
-        # Retrieve seq_lens for absolute position calculation.
-        # seq_lens may be a tensor or a list depending on vLLM version.
-        seq_lens: Any = getattr(attn_metadata, "seq_lens", None)
-
         for i in range(num_reqs):
             if not per_req_steering[i]:
                 continue
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
-            n_query = end - start
-            # Absolute position of the first token in this forward pass
-            if seq_lens is not None:
-                sl = seq_lens[i]
-                sl_val = sl.item() if isinstance(sl, torch.Tensor) else int(sl)
-                abs_start = int(sl_val - n_query)
-            else:
-                abs_start = 0  # fallback: treat as prefill from position 0
+            # The absolute position of the first token of this forward pass.
+            abs_start = runner.requests[req_ids[i]].num_computed_tokens
             _apply_steering(
                 per_req_steering[i], layer_idx, target, start, end, abs_start, norm_ref
             )
@@ -475,7 +436,7 @@ def _hook_inner(
             if req_state and req_state.sampling_params
             else None
         )
-        hooks = _find_hook_configs_no_persistent(extension, req_id, extra)
+        hooks = _request_hooks(extension, req_id, extra)
         per_req_hooks.append(hooks)
         if hooks or persistent_hooks:
             needs_hooks = True
@@ -674,7 +635,7 @@ def _pre_hook_inner(
             if req_state and req_state.sampling_params
             else None
         )
-        per_req = _find_hook_configs_no_persistent(extension, req_id, extra)
+        per_req = _request_hooks(extension, req_id, extra)
         if not any(h.pre for h in persistent_hooks) and not any(h.pre for h in per_req):
             continue
 
@@ -1034,24 +995,19 @@ class HiddenStatesExtension:
 
         self._steering_data[key] = vectors
 
-    def clear_steering_data(self, key: str) -> None:
-        """Remove steering data for a completed request."""
-        self._steering_data.pop(key, None)
-
-    def clear_captured_states(self, external_req_id: str) -> None:
-        """Remove captured activations without returning them.
-
-        Called in the ``finally`` block of ``_patched_generate`` to clean
-        up leaked state when a request is aborted or the client disconnects
-        before ``get_captured_states`` is called.  On normal completion this
-        is a no-op because ``get_captured_states`` already ``.pop()``-ed
-        the entry.
-        """
-        prefix = f"{external_req_id}-"
-        for req_id in list(self._captured_states):
-            if req_id.startswith(prefix):
-                del self._captured_states[req_id]
-                logger.debug("Cleared leaked activations for %s", req_id)
+    def clear_request_state(
+        self, keys: list[str], external_ids: list[str] | None
+    ) -> None:
+        """Drop the steering and hook data under ``keys``, and the captures and hook contexts
+        of ``external_ids``; None drops those of every request (a failed offline call)."""
+        for key in keys:
+            self._steering_data.pop(key, None)
+            self._hook_data.pop(key, None)
+        wanted = None if external_ids is None else set(external_ids)
+        for store in (self._captured_states, self._captured_qk, self._hook_contexts):
+            for req_id in list(store):
+                if wanted is None or req_id.rpartition("-")[0] in wanted:
+                    del store[req_id]
 
     def _build_payload(
         self, internal_req_id: str
@@ -1077,10 +1033,8 @@ class HiddenStatesExtension:
     def get_captured_states(self, external_req_id: str) -> bytes | None:
         """Retrieve captured activations for a specific request.
 
-        Matches by ``"{external_req_id}-"`` prefix because vLLM internally
-        transforms the user-provided ``request_id`` into
-        ``"{request_id}-{random_suffix}"``. So ``"req-0"`` matches
-        ``"req-0-a1b2c3d4"`` but NOT ``"req-00-b5c6d7e8"``.
+        vLLM turns the user's ``request_id`` into ``"{request_id}-{random_suffix}"``, so
+        this matches the internal id before its last ``-``.
 
         Moves tensors to CPU and serializes via pickle + zstd for safe ZMQ
         transport (the compression matters most when the response crosses
@@ -1097,9 +1051,8 @@ class HiddenStatesExtension:
         Layers are stacked in ascending order along dim 0.
         Removes the request's data after retrieval.
         """
-        prefix = f"{external_req_id}-"
         for req_id in list(self._captured_states):
-            if req_id.startswith(prefix):
+            if req_id.rpartition("-")[0] == external_req_id:
                 payload = self._build_payload(req_id)
                 return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
         return None
@@ -1126,13 +1079,11 @@ class HiddenStatesExtension:
         if not external_req_ids:
             return None
         out: dict[str, dict[str, Any]] = {}
-        # Walk live state once and bucket by external id; matches the
-        # ``"{external_req_id}-"`` prefix rule from get_captured_states.
+        wanted = set(external_req_ids)
         for req_id in list(self._captured_states):
-            for external_req_id in external_req_ids:
-                if req_id.startswith(f"{external_req_id}-"):
-                    out[external_req_id] = self._build_payload(req_id)
-                    break
+            external_req_id = req_id.rpartition("-")[0]
+            if external_req_id in wanted and external_req_id not in out:
+                out[external_req_id] = self._build_payload(req_id)
         if not out:
             return None
         return pickle.dumps(out, protocol=pickle.HIGHEST_PROTOCOL)
@@ -1343,14 +1294,12 @@ class HiddenStatesExtension:
     def get_captured_qk(self, external_req_id: str) -> bytes | None:
         """Retrieve captured Q/K for a request (zstd + pickle).
 
-        Same ``"{external_req_id}-"`` prefix-match convention as
-        :meth:`get_captured_states`.  Every TP rank returns its own head
+        Matches the external id as :meth:`get_captured_states` does.  Every TP rank returns its own head
         shard, tagged with its ranks; the plugin merges along the head
         dimension.  Removes the request's data after retrieval.
         """
-        prefix = f"{external_req_id}-"
         for req_id in list(self._captured_qk):
-            if req_id.startswith(prefix):
+            if req_id.rpartition("-")[0] == external_req_id:
                 payload = self._build_qk_payload(req_id)
                 return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
         return None
@@ -1360,22 +1309,14 @@ class HiddenStatesExtension:
         if not external_req_ids:
             return None
         out: dict[str, dict[str, Any]] = {}
+        wanted = set(external_req_ids)
         for req_id in list(self._captured_qk):
-            for external_req_id in external_req_ids:
-                if req_id.startswith(f"{external_req_id}-"):
-                    out[external_req_id] = self._build_qk_payload(req_id)
-                    break
+            external_req_id = req_id.rpartition("-")[0]
+            if external_req_id in wanted and external_req_id not in out:
+                out[external_req_id] = self._build_qk_payload(req_id)
         if not out:
             return None
         return pickle.dumps(out, protocol=pickle.HIGHEST_PROTOCOL)
-
-    def clear_captured_qk(self, external_req_id: str) -> None:
-        """Remove captured Q/K without returning it (abort/disconnect cleanup)."""
-        prefix = f"{external_req_id}-"
-        for req_id in list(self._captured_qk):
-            if req_id.startswith(prefix):
-                del self._captured_qk[req_id]
-                logger.debug("Cleared leaked Q/K capture for %s", req_id)
 
     def _debug_captured_qk_count(self) -> int:
         """Return the number of entries in _captured_qk (for testing)."""
@@ -1408,31 +1349,16 @@ class HiddenStatesExtension:
 
         Returns from ALL ranks (including PP ranks that own different
         layers).  The plugin merges results across ranks.
-        Matches by ``"{external_req_id}-"`` prefix on ``_hook_contexts``.
+        Matches the external id: the internal id before its last ``-``.
         Returns ``{str(hook_position): ctx.saved}`` pickled, where
         ``hook_position`` indexes the per-request hook list.
         """
-        prefix = f"{external_req_id}-"
         for req_id in list(self._hook_contexts):
-            if req_id.startswith(prefix):
+            if req_id.rpartition("-")[0] == external_req_id:
                 contexts = self._hook_contexts.pop(req_id)
                 saved_dicts = {str(pos): ctx.saved for pos, ctx in contexts.items()}
                 return pickle.dumps(saved_dicts)
         return None
-
-    def clear_hook_data(self, key: str) -> None:
-        """Remove hook definitions for a completed request."""
-        self._hook_data.pop(key, None)
-
-    def clear_hook_contexts(self, external_req_id: str) -> None:
-        """Remove hook contexts for a completed or aborted request.
-
-        Prefix-match cleanup, same pattern as ``clear_captured_states``.
-        """
-        prefix = f"{external_req_id}-"
-        for req_id in list(self._hook_contexts):
-            if req_id.startswith(prefix):
-                del self._hook_contexts[req_id]
 
     # ------------------------------------------------------------------
     # Persistent hook management (called via collective_rpc)

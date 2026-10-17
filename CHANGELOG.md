@@ -1,5 +1,9 @@
 ## Unreleased
 
+- Steering: Fixed `position_indices` during decode and chunked prefill. The absolute start of each forward pass was always 0, so a position in a later prefill chunk was never steered, and position 0 was steered again on every decode step. The start now comes from the request's computed-token count, which does not depend on the attention backend.
+- Offline: `LLM.generate` and `LLM.chat` work on copies of the caller's `SamplingParams`. Before, they removed the steering vectors and hooks from the caller's `extra_args`, so a `SamplingParams` passed to a second call was not steered. The worker state of a call is released also when the call raises.
+- Plugin: `register()` attaches a stderr handler to the `vllm_lens` logger when it has none, so the INFO records of the package are no longer dropped. `VLLM_LENS_LOG_LEVEL` sets the level (default `INFO`).
+
 ## v1.3.0 (2 October 2026)
 
 - Compatibility: Pin vLLM to the GPU-validated **0.30.0** release, with V1/eager execution. Add CPU regression CI and reproducible Slurm smoke/TP/PP suites; FP32 reference parity retains the 0.01 threshold and BF16 functional checks remain. See `docs/compatibility.md` for exact environments and coverage. (#39, #41)
