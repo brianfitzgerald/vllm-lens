@@ -280,6 +280,18 @@ def _decode_steering_vectors(value: Any) -> list[SteeringVector] | None:
     ]
 
 
+def _compact_vectors(vectors: list[SteeringVector]) -> list[SteeringVector]:
+    """Copy each vector that is a view into a larger storage, so its pickle holds the vector
+    alone: a row of an ``(N, hidden)`` matrix pickles the whole matrix."""
+    compact = []
+    for sv in vectors:
+        tensor = sv.activations
+        if tensor.untyped_storage().nbytes() != tensor.numel() * tensor.element_size():
+            sv = sv.model_copy(update={"activations": tensor.detach().clone()})
+        compact.append(sv)
+    return compact
+
+
 def _decode_hooks(value: Any) -> list[Hook] | None:
     """Normalise an ``apply_hooks`` extra_args value.
 
@@ -514,7 +526,7 @@ async def _patched_generate(
         if steering_vectors is not None:
             await self.collective_rpc(
                 "set_steering_data",
-                args=(request_id, pickle.dumps(steering_vectors)),
+                args=(request_id, pickle.dumps(_compact_vectors(steering_vectors))),
             )
         # Only a capture releases its directions in the finally below.
         if projection is not None and wants_activations:
@@ -641,7 +653,7 @@ def _prepare_offline_params(
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
         if vectors is not None:
             steering_id = f"_steer_{idx}"
-            steering_payloads[steering_id] = pickle.dumps(vectors)
+            steering_payloads[steering_id] = pickle.dumps(_compact_vectors(vectors))
             if sp.extra_args is None:
                 sp.extra_args = {}
             sp.extra_args["_steering_id"] = steering_id
@@ -696,8 +708,8 @@ def _prepare_offline_params(
     }
     # A failure here leaves part of the data on the workers, so it is released.
     try:
-        for sid, payload in steering_payloads.items():
-            self.collective_rpc("set_steering_data", args=(sid, payload))
+        if steering_payloads:
+            self.collective_rpc("set_steering_data_batch", args=(steering_payloads,))
         for pid, payload in projection_payloads.items():
             self.collective_rpc("set_projection_directions", args=(pid, payload))
             state["projection_ids"].append(pid)

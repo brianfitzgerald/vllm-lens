@@ -31,7 +31,7 @@ class _FakeLLM:
         return []
 
 
-@pytest.mark.parametrize("fail", [None, "generate", "set_steering_data"])
+@pytest.mark.parametrize("fail", [None, "generate", "set_steering_data_batch"])
 def test_offline_generate_keeps_the_callers_params(
     monkeypatch: pytest.MonkeyPatch, fail: str | None
 ) -> None:
@@ -57,8 +57,8 @@ def test_offline_generate_keeps_the_callers_params(
         plugin._patched_llm_generate(llm, ["p"], params)  # type: ignore[arg-type]
 
     assert params.extra_args == extra and params.skip_reading_prefix_cache is False
-    assert llm.calls == ["set_steering_data", "clear_request_state"]
-    if fail != "set_steering_data":
+    assert llm.calls == ["set_steering_data_batch", "clear_request_state"]
+    if fail != "set_steering_data_batch":
         assert received[0] is not params
         assert received[0].extra_args == {"_steering_id": "_steer_0"}
 
