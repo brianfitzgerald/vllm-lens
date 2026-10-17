@@ -3,6 +3,8 @@ import multiprocessing
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -23,6 +25,8 @@ REFERENCE_DTYPE = "float32"
 LAYER_IDX = 2
 NUM_LAYERS = 24
 PROMPT = "The future of AI is"
+LONG_PROMPT = "The quick brown fox jumps over the lazy dog. " * 20
+CAPTURE_LAYERS = [LAYER_IDX, LAYER_IDX + 3]
 PROMPTS = [
     "The future of AI is",
     "Once upon a time in a land far away",
@@ -47,6 +51,54 @@ def hf_model():
     del model, tokenizer
     gc.collect()
     torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module", params=[None, 64], ids=["single-pass", "chunked-64"])
+def capture_llm(request):
+    """Offline engine, with and without a 64-token prefill chunk."""
+    from vllm import LLM
+
+    kwargs = {}
+    if request.param is not None:
+        kwargs = {
+            "max_num_batched_tokens": request.param,
+            "enable_chunked_prefill": True,
+        }
+    engine = LLM(model=MODEL_NAME, dtype="auto", gpu_memory_utilization=0.3, **kwargs)
+    yield engine
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def fake_extension(
+    extras: dict[str, dict[str, Any] | None],
+    n_prompt: int = 10,
+    directions: dict[str, torch.Tensor] | None = None,
+) -> SimpleNamespace:
+    """A worker stand-in whose runner holds one request per entry of ``extras``, each with
+    ``n_prompt`` prompt tokens and none computed."""
+    requests = {
+        req_id: SimpleNamespace(
+            sampling_params=SimpleNamespace(extra_args=extra),
+            num_computed_tokens=0,
+            num_prompt_tokens=n_prompt,
+        )
+        for req_id, extra in extras.items()
+    }
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=len(extras), req_ids=list(extras)),
+        requests=requests,
+    )
+    return SimpleNamespace(
+        model_runner=runner,
+        rank=0,
+        _captured_states={},
+        _pooled_counts={},
+        _projections=set(),
+        _pending_collect=[],
+        _direction_tables=directions or {},
+    )
 
 
 @pytest.fixture(autouse=True, scope="module")

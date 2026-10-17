@@ -1,6 +1,9 @@
 ## Unreleased
 
 - Steering: Fixed `position_indices` during decode and chunked prefill. The absolute start of each forward pass was always 0, so a position in a later prefill chunk was never steered, and position 0 was steered again on every decode step. The start now comes from the request's computed-token count, which does not depend on the attention backend.
+- Capture: Added `output_residual_stream_pool` (`capture_pool` on the client). `"last"` returns the last prompt position and `"mean"` the mean over the prompt positions, as one row per layer.
+- Capture: Added `output_residual_stream_project` (`capture_project` on the client). The worker returns the projection of every position onto `(N, hidden)` directions and the norm of every position, in float32, in place of the residual. Each distinct direction set goes to the workers once, keyed by its hash, and is released when its last request finishes.
+- Capture: A step's captured rows go to the host in one queued copy into pinned memory, pooled rows are summed in one gather, and projections take one matmul per direction set, so the hooks do not wait for the GPU. The offline batch collection finds each request by its external id, and each worker writes the captures into a memfd of the `LLM` process, where they come back as views with no pickle or copy. The workers must run on the host and in the pid namespace of the `LLM` process.
 - Offline: `LLM.generate` and `LLM.chat` work on copies of the caller's `SamplingParams`. Before, they removed the steering vectors and hooks from the caller's `extra_args`, so a `SamplingParams` passed to a second call was not steered. The worker state of a call is released also when the call raises.
 - Plugin: `register()` attaches a stderr handler to the `vllm_lens` logger when it has none, so the INFO records of the package are no longer dropped. `VLLM_LENS_LOG_LEVEL` sets the level (default `INFO`).
 

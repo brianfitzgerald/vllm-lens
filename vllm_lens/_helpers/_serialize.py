@@ -102,6 +102,24 @@ def tensor_from_bytes(raw: bytes, meta: dict[str, Any]) -> torch.Tensor:
     return t
 
 
+def decode_layers(value: Any) -> list[int] | None:
+    """The layers of an ``output_residual_stream`` or ``output_qk`` value; None for every
+    layer. ``vllm_xargs`` sends the list as a JSON string."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return [int(layer) for layer in value] if isinstance(value, list) else None
+
+
+def deserialize_directions(value: str | dict[str, Any]) -> torch.Tensor:
+    """Decode an ``output_residual_stream_project`` value to float32 directions."""
+    return deserialize_tensor(
+        json.loads(value) if isinstance(value, str) else value
+    ).float()
+
+
 def serialize_activations(tensor_dict: dict[str, Any]) -> dict[str, Any]:
     """Convert a flat activations dict to a JSON-serializable form.
 
