@@ -8,6 +8,8 @@ Uses PyTorch forward hooks on each decoder layer for concurrency-safe,
 per-request activation capture and steering.  Each hook checks the
 request's ``extra_args["output_residual_stream"]`` to decide whether to
 capture, and reads from ``_steering_data`` to apply any steering vectors.
+Under CUDA graphs ``_graph_worker`` replaces the hooks and reuses the capture
+and steering helpers here.
 """
 
 from __future__ import annotations
@@ -1284,23 +1286,10 @@ class HiddenStatesExtension:
     # layer index (scale, sliding window, soft-cap, ... — see install_qk_hooks).
     _qk_layer_meta: dict[int, dict[str, Any]] = {}
 
-    def install_hooks(self) -> None:
-        """Register a forward hook on every decoder layer. Idempotent.
-
-        Hooks are installed on **all** TP ranks because steering must
-        modify hidden states everywhere.  Activation *capture* is gated
-        to rank 0 only via ``_should_capture``.
-
-        Requires ``enforce_eager=True`` in engine args — otherwise
-        ``@support_torch_compile`` would compile the forward graph and
-        hooks won't fire.
-        """
-        if self._hooks_installed:
-            return
-        self._hooks_installed = True
-        # Reset to instance-level dicts (class-level defaults are shared).
-        # Do NOT reset _persistent_hooks — they may have been set via
-        # set_persistent_hooks() before the first generate call.
+    def _reset_state(self) -> None:
+        """Create the per-instance state and decide which rank captures."""
+        # Instance-level dicts: the class-level defaults are shared. _persistent_hooks is
+        # kept, as set_persistent_hooks() may run before the first generate call.
         self._captured_states = {}
         self._pooled_counts = {}
         self._projections = set()
@@ -1320,6 +1309,22 @@ class HiddenStatesExtension:
         # TP ranks after all-reduce, so the data is identical.
         tp_size = self.parallel_config.tensor_parallel_size
         self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
+
+    def install_hooks(self) -> None:
+        """Register a forward hook on every decoder layer. Idempotent.
+
+        Hooks are installed on **all** TP ranks because steering must
+        modify hidden states everywhere.  Activation *capture* is gated
+        to rank 0 only via ``_should_capture``.
+
+        Requires ``enforce_eager=True`` in engine args — otherwise
+        ``@support_torch_compile`` would compile the forward graph and
+        hooks won't fire.
+        """
+        if self._hooks_installed:
+            return
+        self._hooks_installed = True
+        self._reset_state()
 
         # Hooks must be installed on ALL ranks so steering vectors are
         # applied everywhere (not just rank 0).

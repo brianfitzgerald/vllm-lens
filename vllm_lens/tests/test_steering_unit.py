@@ -1,10 +1,14 @@
-"""Steering lookup, the per-request row table, and the paths that apply it. No GPU."""
+"""Steering lookup, the per-request row table, and the two paths that apply it. No GPU."""
 
+from dataclasses import asdict
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
+import vllm_lens._graph_worker as graph_worker
+from vllm_lens._graph_worker import _fill_steer_buffers, _GraphBuffers
 from vllm_lens._helpers.types import SteeringVector
 from vllm_lens._worker_ext import (
     _apply_steering,
@@ -112,6 +116,148 @@ def test_table_rows_match_the_per_request_path(norm_match: bool, fused: bool):
     assert torch.equal(batched[4:6], output[4:6])
 
 
+def _fill(
+    extension: SimpleNamespace,
+    state: _GraphBuffers,
+    bounds: list[int],
+    keys: list[str | None],
+    step: int = 0,
+) -> None:
+    """Run one graph fill with ``keys[i]`` as request i's sentinel and ``bounds`` as its
+    layout. Request ids carry ``step``, as vLLM's do; the fill must not depend on it."""
+    requests = {
+        f"req-{step}-{i}": SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                extra_args={"_steering_id": key} if key else {}
+            ),
+            num_computed_tokens=0,
+        )
+        for i, key in enumerate(keys)
+    }
+    extension.model_runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=len(keys), req_ids=list(requests)),
+        requests=requests,
+        query_start_loc=SimpleNamespace(np=np.array(bounds, dtype=np.int32)),
+        model=torch.nn.Linear(1, 1),
+        model_config=SimpleNamespace(get_hidden_size=lambda: HIDDEN),
+    )
+    _fill_steer_buffers(extension, state, torch.tensor(bounds))
+
+
+def _buffers() -> _GraphBuffers:
+    """Graph buffers for one steered layer, on the CPU."""
+    return _GraphBuffers(
+        add=torch.zeros(1, MAX_TOKENS, HIDDEN),
+        norm=torch.zeros(1, MAX_TOKENS, HIDDEN),
+        capture=torch.zeros(0, MAX_TOKENS, HIDDEN),
+        steer_slots={LAYER: 0},
+        capture_slots={},
+    )
+
+
+def test_graph_rows_land_on_their_requests():
+    """Two steered requests around an unsteered one fill their own rows; a reused key takes
+    its new vector, and a step with no steering zeroes the last step's rows."""
+    state = _buffers()
+    added = _vector(0, scale=8.0)
+    matched = _vector(1, scale=4.0, norm_match=True)
+    extension = SimpleNamespace(
+        _steering_data={"_steer_0": [added], "_steer_2": [matched]}, _steer_table=None
+    )
+    _fill(extension, state, [0, 4, 6, 7], ["_steer_0", None, "_steer_2"])
+    direction = matched.activations[0]
+    unit = direction / (direction.norm() + 1e-6)
+    torch.testing.assert_close(
+        state.add[0, 0:4], (added.activations * 8.0).expand(4, -1)
+    )
+    assert state.add[0, 4:].abs().sum() == 0
+    torch.testing.assert_close(state.norm[0, 6:7], (unit * 4.0).unsqueeze(0))
+    assert state.norm[0, :6].abs().sum() == 0 and state.dirty == 7
+
+    # What set_steering_data does: new vectors under the key, and its row released.
+    second = _vector(2, scale=1.0)
+    extension._steering_data["_steer_0"] = [second]
+    extension._steer_table.release("_steer_0")
+    _fill(extension, state, [0, 2], ["_steer_0"], step=1)
+    torch.testing.assert_close(state.add[0, 0:2], second.activations.expand(2, -1))
+
+    _fill(extension, state, [0, 1], [None], step=2)
+    assert state.add.abs().sum() == 0 and state.norm.abs().sum() == 0
+    assert state.dirty == 0
+
+
+def test_a_position_specific_vector_fills_its_positions():
+    """A position-specific vector fills only the named positions of its request, the
+    ``norm_match`` one as unit rows in the norm buffer, on every step."""
+    state = _buffers()
+    vector = SteeringVector(
+        activations=torch.ones(1, 2, HIDDEN),
+        layer_indices=[LAYER],
+        position_indices=[1, 5],
+        scale=2.0,
+        norm_match=True,
+    )
+    extension = SimpleNamespace(
+        _steering_data={"_steer_0": [vector]}, _steer_table=None
+    )
+    for step in range(2):
+        _fill(extension, state, [0, 4], ["_steer_0"], step=step)
+        unit = torch.full((HIDDEN,), 2.0 / (HIDDEN**0.5 + 1e-6))
+        torch.testing.assert_close(state.norm[0, 1], unit)
+        assert state.norm[0, [0, 2, 3]].abs().sum() == 0 and state.add.abs().sum() == 0
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["plain", "fused-residual"])
+def test_the_lens_op_steers_then_captures(monkeypatch: pytest.MonkeyPatch, fused: bool):
+    """The op adds ``add + norm * ||stream||`` to the first ``n`` rows only, and captures the
+    steered stream; more rows than the buffers hold raise."""
+    generator = torch.Generator().manual_seed(0)
+    hidden = torch.randn(3, HIDDEN, generator=generator)
+    residual = torch.randn(3, HIDDEN, generator=generator) if fused else None
+    state = _GraphBuffers(
+        add=torch.randn(1, 4, HIDDEN, generator=generator),
+        norm=torch.randn(1, 4, HIDDEN, generator=generator),
+        capture=torch.zeros(1, 4, HIDDEN),
+        steer_slots={LAYER: 0},
+        capture_slots={LAYER: 0},
+    )
+    monkeypatch.setattr(graph_worker, "_BUFFERS", state)
+    stream = hidden + residual if residual is not None else hidden
+    expected = (
+        hidden
+        + state.add[0, :3]
+        + state.norm[0, :3] * stream.norm(dim=-1, keepdim=True)
+    )
+    steered = hidden.clone()
+    torch.ops.vllm_lens.lens(steered, residual, 0, 0)
+    torch.testing.assert_close(steered, expected)
+    captured = expected + residual if residual is not None else expected
+    torch.testing.assert_close(state.capture[0, :3], captured)
+    assert state.capture[0, 3].abs().sum() == 0
+    with pytest.raises(RuntimeError, match="max_num_batched_tokens"):
+        torch.ops.vllm_lens.lens(torch.zeros(5, HIDDEN), None, 0, -1)
+
+
+def test_a_bad_position_specific_vector_zeroes_its_span_only():
+    """A position-specific vector of the wrong width leaves its request unsteered and the
+    other request's rows as they were."""
+    state = _buffers()
+    good = _vector(0, scale=3.0)
+    bad = SteeringVector(
+        activations=torch.ones(1, 2, HIDDEN + 1),
+        layer_indices=[LAYER],
+        position_indices=[0, 1],
+    )
+    extension = SimpleNamespace(
+        _steering_data={"_steer_0": [good], "_steer_1": [bad]}, _steer_table=None
+    )
+    _fill(extension, state, [0, 2, 4], ["_steer_0", "_steer_1"])
+    torch.testing.assert_close(
+        state.add[0, 0:2], (good.activations * 3.0).expand(2, -1)
+    )
+    assert state.add[0, 2:4].abs().sum() == 0 and state.norm.abs().sum() == 0
+
+
 def test_clearing_a_request_releases_its_table_rows():
     """``clear_request_state`` gives a key's table row back and forgets a position-specific
     key."""
@@ -128,3 +274,61 @@ def test_clearing_a_request_releases_its_table_rows():
     worker.clear_request_state(["a", "p"], [], [])
     assert worker._steering_data == {} and table.free == [1]
     assert table.rows == {}
+
+
+def _graph_load(monkeypatch: pytest.MonkeyPatch, worker: SimpleNamespace) -> None:
+    """Run the patched ``Worker.load_model`` on ``worker``, with vLLM's worker classes stubbed."""
+    import sys
+    import types
+
+    import vllm_lens._graph_worker as graph_worker
+
+    stub_worker = type("Worker", (), {"load_model": lambda self: None})
+    stub_runner = type("GPUModelRunner", (), {"_model_forward": lambda self: None})
+    for name, cls in (
+        ("vllm.v1.worker.gpu_worker", stub_worker),
+        ("vllm.v1.worker.gpu_model_runner", stub_runner),
+    ):
+        module = types.ModuleType(name)
+        setattr(module, cls.__name__, cls)
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(graph_worker, "_enable_graph_buffers", lambda *args: None)
+    graph_worker.install_graph_patches()
+    stub_worker.load_model(worker)
+
+
+@pytest.mark.parametrize(
+    ("change", "error", "match"),
+    [
+        ({"extension": False}, RuntimeError, "worker extension"),
+        ({"layer": 40}, ValueError, "layers 0..23"),
+        ({"pp": 2}, RuntimeError, "pipeline parallelism"),
+        ({"dbo": True}, RuntimeError, "micro-batching"),
+        ({"sp": True}, RuntimeError, "sequence parallelism"),
+    ],
+    ids=["foreign-extension", "layer-out-of-range", "pp", "dbo", "sp"],
+)
+def test_the_graph_mode_refuses_what_it_cannot_serve(
+    monkeypatch: pytest.MonkeyPatch, change: dict, error: type, match: str
+):
+    """The load fails before any buffer is made, naming what is not served."""
+    from vllm_lens._cudagraph import CONFIG_KEY, LensGraphConfig
+
+    config = LensGraphConfig(steer_layers=(change.get("layer", LAYER),))
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            additional_config={CONFIG_KEY: asdict(config)},
+            compilation_config=SimpleNamespace(
+                pass_config=SimpleNamespace(enable_sp=change.get("sp", False))
+            ),
+        ),
+        model_config=SimpleNamespace(get_total_num_hidden_layers=lambda: 24),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=change.get("pp", 1),
+            use_ubatching=change.get("dbo", False),
+        ),
+    )
+    if change.get("extension", True):
+        worker._reset_state = lambda: None
+    with pytest.raises(error, match=match):
+        _graph_load(monkeypatch, worker)
