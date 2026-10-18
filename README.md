@@ -191,6 +191,8 @@ client.generate("I think the best dessert is", steering_vectors=[sv])
 
 `position_indices` are absolute positions in the sequence (prompt and generated tokens). Under async speculative decoding, a position in the generated tokens can be steered at a position that is off by the number of rejected draft tokens.
 
+A steered request shares the prefix cache only with requests that apply the same vectors, and a hooked request with none. An unsteered request never reads KV blocks a steered prefill wrote.
+
 ### Generic hooks
 
 Hooks let you run arbitrary Python functions on hidden states at specific layers during inference. They can capture data (via `ctx.saved`) and/or modify hidden states (by returning a tensor).

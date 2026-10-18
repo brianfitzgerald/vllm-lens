@@ -13,10 +13,12 @@ per-request activations for both online (async) and offline (sync) usage.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
 import pickle
+import uuid
 from importlib.metadata import PackageNotFoundError, version
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING, Any
@@ -52,6 +54,7 @@ _original_completion_response: Callable | None = None
 _original_chat_full_generator: Callable | None = None
 _original_chat_stream_generator: Callable | None = None
 _original_register_routers: Callable | None = None
+_original_process_inputs: Callable | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +380,32 @@ def _patched_create_engine_config(self, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 
+def _cache_salt(steering: bytes | None, hooked: bool) -> str | None:
+    """Prefix-cache salt: shared by requests with the same vectors, unique per hooked
+    request."""
+    if hooked:
+        return f"lens-request:{uuid.uuid4().hex}"
+    if steering is not None:
+        return f"lens-steer:{hashlib.blake2b(steering, digest_size=16).hexdigest()}"
+    return None
+
+
+def _patched_process_inputs(
+    self: Any, request_id: str, prompt: Any, params: Any, *args, **kwargs
+) -> Any:
+    """Build the request, then add the salt the generate patches put in ``extra_args``."""
+    assert _original_process_inputs is not None
+    request = _original_process_inputs(
+        self, request_id, prompt, params, *args, **kwargs
+    )
+    salt = (getattr(params, "extra_args", None) or {}).get("_lens_salt")
+    if salt:
+        request.cache_salt = (
+            f"{request.cache_salt}|{salt}" if request.cache_salt else salt
+        )
+    return request
+
+
 async def _patched_generate(
     self: AsyncLLM,
     prompt: str,
@@ -428,16 +457,21 @@ async def _patched_generate(
     skip_kv_cache = extra.pop("skip_reading_prefix_cache", None)
 
     has_persistent = getattr(self, "_has_persistent_hooks", False)
-    needs_hooks = (
-        wants_activations
-        or steering_vectors is not None
-        or hooks_list is not None
-        or has_persistent
-    )
-    if needs_hooks or wants_qk or skip_kv_cache:
+    hooked = hooks_list is not None or has_persistent
+    needs_hooks = wants_activations or steering_vectors is not None or hooked
+    if wants_activations or hooked or wants_qk or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
         # computation entirely, so force a fresh prefill for this request.
         effective_params.skip_reading_prefix_cache = True
+    steering_payload = (
+        pickle.dumps(steering_vectors) if steering_vectors is not None else None
+    )
+    # Steered or hooked prefills write KV blocks an unsteered request must not read.
+    salt = _cache_salt(steering_payload, hooked)
+    if salt is not None and built:
+        prompt.cache_salt = f"{prompt.cache_salt}|{salt}" if prompt.cache_salt else salt  # type: ignore[reportAttributeAccessIssue]
+    elif salt is not None:
+        extra["_lens_salt"] = salt
     if needs_hooks and not getattr(self, "_hooks_installed", False):
         await self.collective_rpc("install_hooks")
         setattr(self, "_hooks_installed", True)
@@ -446,10 +480,9 @@ async def _patched_generate(
         setattr(self, "_qk_hooks_installed", True)
 
     # Send steering data to workers before the forward pass begins.
-    if steering_vectors is not None:
+    if steering_payload is not None:
         await self.collective_rpc(
-            "set_steering_data",
-            args=(request_id, pickle.dumps(steering_vectors)),
+            "set_steering_data", args=(request_id, steering_payload)
         )
 
     # Send hook data to workers before the forward pass begins.
@@ -555,8 +588,9 @@ def _prepare_offline_params(
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
         if vectors is not None:
             steering_id = f"_steer_{idx}"
-            steering_payloads[steering_id] = pickle.dumps(vectors)
+            payload = steering_payloads[steering_id] = pickle.dumps(vectors)
             extra["_steering_id"] = steering_id
+            extra["_lens_salt"] = _cache_salt(payload, False)
 
     # Extract hooks per-request (same pattern as steering).
     hook_payloads: dict[str, bytes] = {}  # hook_id -> cloudpickled hooks
@@ -577,9 +611,19 @@ def _prepare_offline_params(
     has_hooks = len(hook_payloads) > 0
     has_persistent = getattr(self, "_has_persistent_hooks", False)
     needs_hooks = wants_activations or has_steering or has_hooks or has_persistent
-    if needs_hooks or wants_qk or any_skip_kv_cache:
+    if (
+        wants_activations
+        or has_hooks
+        or has_persistent
+        or wants_qk
+        or any_skip_kv_cache
+    ):
         for sp in params_list:
             sp.skip_reading_prefix_cache = True
+    # Steered or hooked prefills write KV blocks an unsteered request must not read.
+    for extra in extras:
+        if has_persistent or "_hook_id" in extra:
+            extra["_lens_salt"] = _cache_salt(None, True)
 
     if needs_hooks and not getattr(self, "_hooks_installed", False):
         self.collective_rpc("install_hooks")
@@ -980,13 +1024,19 @@ def register() -> None:
     global _original_completion_response, _original_chat_full_generator
     global _original_chat_stream_generator
     global _original_register_routers
+    global _original_process_inputs
 
     from vllm import LLM
     from vllm.engine.arg_utils import EngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
+    from vllm.v1.engine.input_processor import InputProcessor
 
     _original_create_engine_config = EngineArgs.create_engine_config
     EngineArgs.create_engine_config = _patched_create_engine_config
+
+    # Before any engine is built: InputProcessor binds process_inputs_async at __init__.
+    _original_process_inputs = InputProcessor.process_inputs
+    InputProcessor.process_inputs = _patched_process_inputs  # type: ignore[reportAttributeAccessIssue]
 
     _original_generate = AsyncLLM.generate
     AsyncLLM.generate = _patched_generate  # type: ignore[reportAttributeAccessIssue]
