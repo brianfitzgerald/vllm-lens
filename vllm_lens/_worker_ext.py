@@ -17,7 +17,8 @@ import logging
 import os
 import pickle
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import cloudpickle
 import numpy as np
@@ -259,6 +260,111 @@ def _decode_vectors(
     ]
 
 
+@dataclass
+class _SteerTable:
+    """Each stored request's summed float32 steering rows per layer, ``scale`` folded in:
+    ``add`` is added as is, ``norm`` is a unit row scaled by the stream norm. Row 0 is zero."""
+
+    device: torch.device
+    hidden: int
+    add: dict[int, torch.Tensor] = field(default_factory=dict)
+    norm: dict[int, torch.Tensor] = field(default_factory=dict)
+    capacity: int = 64
+    used: int = 1
+    free: list[int] = field(default_factory=list)
+    # The row of each payload digest; -1 when a vector is position-specific, 0 when it failed.
+    rows: dict[bytes, int] = field(default_factory=dict)
+
+    def row(self, key: bytes, configs: list[SteeringVector]) -> int:
+        """The row of ``key``, written from ``configs`` on first use. A vector that cannot be
+        written is logged and steers nothing, as one bad request must not stop the engine."""
+        row = self.rows.get(key)
+        if row is not None:
+            return row
+        if any(cfg.activations.dim() != 2 for cfg in configs):
+            self.rows[key] = -1
+            return -1
+        if self.free:
+            row = self.free.pop()
+        else:
+            if self.used == self.capacity:
+                self.capacity *= 2
+                for tables in (self.add, self.norm):
+                    for layer, table in tables.items():
+                        grown = table.new_zeros((self.capacity, self.hidden))
+                        grown[: self.used] = table
+                        tables[layer] = grown
+            row = self.used
+            self.used += 1
+        for table in (*self.add.values(), *self.norm.values()):
+            table[row].zero_()
+        self.rows[key] = row
+        try:
+            for cfg in configs:
+                for layer, index in cfg.layer_index_map.items():
+                    vec = cfg.activations[index].float()
+                    if cfg.norm_match:
+                        vec = vec / (vec.norm() + 1e-6)
+                    tables = self.norm if cfg.norm_match else self.add
+                    if layer not in tables:
+                        tables[layer] = torch.zeros(
+                            (self.capacity, self.hidden),
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                    tables[layer][row] += vec * cfg.scale
+        except Exception:
+            logger.warning(
+                "Steering failed for %s; it is not steered", key, exc_info=True
+            )
+            self.release(key)
+            self.rows[key] = 0
+            return 0
+        return row
+
+    def release(self, key: bytes) -> None:
+        """Give the row of ``key`` back."""
+        row = self.rows.pop(key, None)
+        if row is not None and row > 0:
+            self.free.append(row)
+
+
+def _steered_requests(
+    extension: HiddenStatesExtension,
+) -> list[tuple[int, int, list[SteeringVector]]]:
+    """``(batch index, table row, vectors)`` of each request of this step that has vectors."""
+    runner = extension.model_runner
+    steered: list[tuple[int, int, list[SteeringVector]]] = []
+    for i, req_id in enumerate(
+        runner.input_batch.req_ids[: runner.input_batch.num_reqs]
+    ):
+        configs = _request_payload(
+            extension, runner.requests.get(req_id), req_id, STEERING_PAYLOAD
+        )
+        if not configs:
+            continue
+        if extension._steer_table is None:
+            extension._steer_table = _SteerTable(
+                device=next(runner.model.parameters()).device,
+                hidden=runner.model_config.get_hidden_size(),
+            )
+        digest = extension._request_payloads[(STEERING_PAYLOAD, req_id)]
+        row = extension._steer_table.row(digest, configs)
+        if row != 0:
+            steered.append((i, row, configs))
+    return steered
+
+
+def _has_request_hooks(runner: Any) -> bool:
+    """Whether a request of this step has per-request hooks."""
+    for req_id in runner.input_batch.req_ids[: runner.input_batch.num_reqs]:
+        req_state = runner.requests.get(req_id)
+        params = req_state.sampling_params if req_state is not None else None
+        if params is not None and HOOKS_PAYLOAD in (params.extra_args or {}):
+            return True
+    return False
+
+
 def _request_payload(
     extension: HiddenStatesExtension,
     req_state: Any,
@@ -301,6 +407,8 @@ def _release_payloads(extension: HiddenStatesExtension, req_id: str) -> None:
         entry[1] -= 1
         if entry[1] == 0:
             del extension._payloads[held]
+            if extension._steer_table is not None:
+                extension._steer_table.release(held)
 
 
 def norm_match(
@@ -333,23 +441,8 @@ def _apply_steering(
     abs_start: int,
     norm_ref: torch.Tensor,
 ) -> None:
-    """Apply all matching steering vectors to a token slice *in-place*.
-
-    ``target`` is the (already-cloned) output tensor.  ``start``/``end``
-    are batch-relative indices, ``abs_start`` is the absolute sequence
-    position of the first token in ``target[start:end]``.
-
-    ``norm_ref`` is the tensor whose per-token L2 norm ``norm_match`` should
-    match.  For fused-residual models (e.g. Qwen3) the layer returns
-    ``(hidden_states, residual)`` and ``target`` is only ``hidden_states``
-    (the MLP-delta half); the *true* residual stream is
-    ``hidden_states + residual``, so ``norm_ref`` must be that full stream,
-    not the MLP-delta half, or the steering vector is scaled to a far smaller
-    norm than HF uses.  For non-fused / plain-tensor layers the caller passes
-    ``norm_ref = target``.  Required (no default) so a forgotten reference
-    fails at the call instead of silently scaling to the wrong
-    MLP-delta-half norm.
-    """
+    """Add matching vectors in place; abs_start is the slice's first sequence position.
+    norm_ref is the unsteered full residual stream."""
     n_tokens = end - start
     for cfg in configs:
         if layer_idx not in cfg.layer_index_map:
@@ -381,6 +474,33 @@ def _apply_steering(
                 if cfg.norm_match:
                     v = norm_match(norm_ref[rel], v)
                 target[rel] = target[rel] + v * cfg.scale
+
+
+def _batch_layout(
+    runner: Any, *, warn: bool
+) -> Int[torch.Tensor, "num_reqs_plus1"] | None:  # type: ignore[reportUndefinedVariable]
+    """``query_start_loc`` of this forward pass, or None when there is nothing to act on.
+    With ``warn``, attention metadata without ``query_start_loc`` is logged."""
+    if not is_forward_context_available() or runner.input_batch.num_reqs == 0:
+        return None
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, list):
+        attn_metadata = attn_metadata[0] if attn_metadata else None
+    if attn_metadata is None:
+        return None
+    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have several metadata
+    # entries, and some (like GDNAttentionMetadata) lack query_start_loc.
+    for meta in attn_metadata.values():
+        query_start_loc = getattr(meta, "query_start_loc", None)
+        if query_start_loc is not None:
+            return query_start_loc
+    if warn:
+        logger.warning(
+            "No attention metadata with query_start_loc found "
+            "(keys: %s). Skipping hook for this step.",
+            list(attn_metadata.keys()),
+        )
+    return None
 
 
 def _host_layout(
@@ -528,61 +648,114 @@ def _capture_rows(
             ).append(piece)
 
 
+class _PassPlan(NamedTuple):
+    """What one forward pass needs from the hooks, made on its first layer."""
+
+    context: Any
+    # The layers some request captures; None for every layer.
+    capture: set[int] | None
+    # Per layer, each steered request as (batch index, table row, vectors).
+    steered: dict[int, list[tuple[int, int, list[SteeringVector]]]]
+    # Every table-steered token of the pass and its table row, on the device.
+    table_layout: tuple[torch.Tensor, torch.Tensor] | None
+    # Whether a persistent or per-request hook runs in this pass.
+    hooks: bool
+
+
+def _apply_table_rows(
+    table: _SteerTable,
+    layer_idx: int,
+    layout: tuple[torch.Tensor, torch.Tensor],
+    target: torch.Tensor,
+    norm_ref: torch.Tensor,
+) -> None:
+    """Add each token's table row in one gather and one ``index_add_``:
+    ``h += add + norm * ||norm_ref||``."""
+    add = table.add.get(layer_idx)
+    norm = table.norm.get(layer_idx)
+    if add is None and norm is None:
+        return
+    tokens, rows = layout
+    delta = torch.zeros(
+        (tokens.shape[0], target.shape[-1]), dtype=torch.float32, device=target.device
+    )
+    if add is not None:
+        delta += add[rows]
+    if norm is not None:
+        stream_norm = torch.linalg.vector_norm(
+            norm_ref.index_select(0, tokens), dim=-1, keepdim=True, dtype=torch.float32
+        )
+        delta += norm[rows] * stream_norm
+    target.index_add_(0, tokens, delta.to(target.dtype))
+
+
 def _hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
     output: torch.Tensor | tuple[torch.Tensor, ...],
 ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
     """Core hook logic, separated so _make_hook can wrap it in try/except."""
-    if not is_forward_context_available():
+    query_start_loc = _batch_layout(extension.model_runner, warn=True)
+    if query_start_loc is None:
         return None
-
     runner = extension.model_runner
     num_reqs = runner.input_batch.num_reqs
-    if num_reqs == 0:
-        return None
-
     req_ids = runner.input_batch.req_ids
 
-    ctx = get_forward_context()
-    attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return None
-    if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return None
-    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
-    # attention metadata entries — some (like GDNAttentionMetadata) lack
-    # query_start_loc.  Find one that has it.
-    query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] | None = None  # type: ignore[reportUndefinedVariable]
-    for _meta in attn_metadata.values():
-        if hasattr(_meta, "query_start_loc"):
-            query_start_loc = getattr(_meta, "query_start_loc")
-            break
-    if query_start_loc is None:
-        logger.warning(
-            "No attention metadata with query_start_loc found "
-            "(keys: %s). Skipping hook for this step.",
-            list(attn_metadata.keys()),
+    context = get_forward_context()
+    plan = extension._pass_plan
+    if plan is None or plan.context is not context:
+        capture_layers: set[int] | None = set()
+        for req_id in runner.input_batch.req_ids[: runner.input_batch.num_reqs]:
+            req_state = runner.requests.get(req_id)
+            params = req_state.sampling_params if req_state is not None else None
+            extra = params.extra_args if params is not None else None
+            if (
+                capture_layers is None
+                or not extra
+                or extra.get("output_residual_stream") is None
+            ):
+                continue
+            layers = decode_layers(extra["output_residual_stream"])
+            if layers is None:
+                capture_layers = None
+            else:
+                capture_layers.update(layers)
+        steered_requests = _steered_requests(extension)
+        steered_by_layer: dict[int, list[tuple[int, int, list[SteeringVector]]]] = {}
+        for i, row, configs in steered_requests:
+            layers = {layer for cfg in configs for layer in cfg.layer_index_map}
+            for layer in layers:
+                steered_by_layer.setdefault(layer, []).append((i, row, configs))
+        # Every table-steered token and its row, for all layers: a row is zero on a layer
+        # its request does not steer.
+        table_spans = [(i, row) for i, row, _ in steered_requests if row > 0]
+        table_layout = None
+        if table_spans:
+            bounds = _host_layout(runner, query_start_loc, num_reqs)
+            table_layout = _token_layout(
+                [(bounds[i], bounds[i + 1]) for i, _ in table_spans],
+                [row for _, row in table_spans],
+                query_start_loc.device,
+            )
+        plan = _PassPlan(
+            context=context,
+            capture=capture_layers,
+            steered=steered_by_layer,
+            table_layout=table_layout,
+            hooks=bool(extension._persistent_hooks) or _has_request_hooks(runner),
         )
+        extension._pass_plan = plan
+    capture = extension._should_capture and (
+        plan.capture is None or layer_idx in plan.capture
+    )
+    steered = plan.steered.get(layer_idx, [])
+    # A layer with no capture, steering or hook in this pass is left untouched.
+    if not (capture or plan.hooks or steered):
         return None
 
-    # --- Phase 1: detect steering requests --------------------------
-    per_req_steering: list[list[SteeringVector]] = []
-    needs_steering = False
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        configs = _request_payload(
-            extension, runner.requests.get(req_id), req_id, STEERING_PAYLOAD
-        )
-        per_req_steering.append(configs)
-        if configs:
-            needs_steering = True
-
-    # --- Phase 2: apply steering ------------------------------------
     modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None = None
-    if needs_steering:
+    if steered:
         if isinstance(output, tuple):
             modified_output = (output[0].clone(), output[1])
             target = modified_output[0]
@@ -592,28 +765,29 @@ def _hook_inner(
         else:
             modified_output = output.clone()
             target = modified_output
-            norm_ref = target
-
-        for i in range(num_reqs):
-            if not per_req_steering[i]:
+            norm_ref = output
+        if plan.table_layout is not None and any(row > 0 for _, row, _ in steered):
+            assert extension._steer_table is not None
+            _apply_table_rows(
+                extension._steer_table, layer_idx, plan.table_layout, target, norm_ref
+            )
+        bounds = _host_layout(runner, query_start_loc, num_reqs)
+        # A request with a position-specific vector takes the per-request path.
+        for i, row, configs in steered:
+            req_state = runner.requests.get(req_ids[i])
+            if row > 0 or req_state is None:
                 continue
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
-            # The absolute position of the first token of this forward pass.
-            abs_start = runner.requests[req_ids[i]].num_computed_tokens
             _apply_steering(
-                per_req_steering[i], layer_idx, target, start, end, abs_start, norm_ref
+                configs,
+                layer_idx,
+                target,
+                bounds[i],
+                bounds[i + 1],
+                req_state.num_computed_tokens,
+                norm_ref,
             )
 
-    # --- Phase 2.5: run generic (post) hooks -------------------------
-    # Per-request and persistent hooks are stored in separate context
-    # dicts (per-request contexts are cleaned up after each request;
-    # persistent ones accumulate).  Within each dict, contexts are keyed
-    # by the hook's position in its category list — so a pre-hook and a
-    # post-hook at different positions never share a HookContext, and the
-    # returned result index ("0", "1", ...) is stable regardless of how
-    # many pre/post hooks a request mixes.  Pre-hooks are handled in
-    # _pre_hook_inner using the same position keys.
+    # Per-request and persistent hooks use separate context stores, keyed by hook position.
     per_req_hooks: list[list[Hook]] = []
     needs_hooks = False
     persistent_hooks = extension._persistent_hooks
@@ -627,7 +801,7 @@ def _hook_inner(
             needs_hooks = True
 
     if needs_hooks:
-        # Compute hidden_states (summed if tuple) same as Phase 3 does.
+        # Read the full residual stream for the hooks.
         hook_src = modified_output if modified_output is not None else output
         if isinstance(hook_src, tuple):
             hook_hidden = (
@@ -669,12 +843,13 @@ def _hook_inner(
                         output, modified_output, hook_hidden, start, end, result
                     )
 
+        bounds = _host_layout(runner, query_start_loc, num_reqs)
         for i in range(num_reqs):
             if not (persistent_hooks or per_req_hooks[i]):
                 continue
             req_id = req_ids[i]
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
+            start = bounds[i]
+            end = bounds[i + 1]
             # Persistent hooks fire first (base layer); per-request hooks
             # see the persistent-modified state.
             _run_post_category(
@@ -688,8 +863,7 @@ def _hook_inner(
                 per_req_hooks[i], extension._hook_contexts, req_id, start, end
             )
 
-    # --- Phase 3: capture activations (rank 0 only) -----------------
-    if getattr(extension, "_should_capture", True):
+    if capture:
         capture_src = modified_output if modified_output is not None else output
         hidden_states: Float[torch.Tensor, "total_tokens hidden_dim"]  # type: ignore[reportUndefinedVariable]
         if isinstance(capture_src, tuple):
@@ -711,35 +885,16 @@ def _pre_hook_inner(
     input_tensor: torch.Tensor,
 ) -> torch.Tensor | None:
     """Run generic pre-hooks on the layer input."""
-    if not is_forward_context_available():
+    if not (extension._persistent_hooks or _has_request_hooks(extension.model_runner)):
         return None
-
-    runner = extension.model_runner
-    num_reqs = runner.input_batch.num_reqs
-    if num_reqs == 0:
-        return None
-
-    req_ids = runner.input_batch.req_ids
-    ctx = get_forward_context()
-    attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return None
-    if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return None
-    query_start_loc: torch.Tensor | None = None
-    for _meta in attn_metadata.values():
-        if hasattr(_meta, "query_start_loc"):
-            query_start_loc = getattr(_meta, "query_start_loc")
-            break
+    query_start_loc = _batch_layout(extension.model_runner, warn=False)
     if query_start_loc is None:
         return None
+    runner = extension.model_runner
+    num_reqs = runner.input_batch.num_reqs
+    req_ids = runner.input_batch.req_ids
 
-    # Pre-hooks share the same context stores as post-hooks, keyed by the
-    # hook's position in its category list.  A hook at a given position is
-    # either pre or post (never both), so pre and post never collide on the
-    # same key — this is what lets a request mix pre- and post-hooks safely.
+    # Pre-hooks and post-hooks use their positions in the same context stores.
     persistent_hooks = extension._persistent_hooks
     modified = False
     working = input_tensor
@@ -773,6 +928,7 @@ def _pre_hook_inner(
                     modified = True
                 working[start:end] = result
 
+    bounds: list[int] | None = None
     for i in range(num_reqs):
         req_id = req_ids[i]
         per_req = _request_payload(
@@ -781,8 +937,9 @@ def _pre_hook_inner(
         if not any(h.pre for h in persistent_hooks) and not any(h.pre for h in per_req):
             continue
 
-        start = int(query_start_loc[i].item())
-        end = int(query_start_loc[i + 1].item())
+        if bounds is None:
+            bounds = _host_layout(runner, query_start_loc, num_reqs)
+        start, end = bounds[i], bounds[i + 1]
         _run_pre_category(
             persistent_hooks, extension._persistent_hook_contexts, req_id, start, end
         )
@@ -1077,6 +1234,10 @@ class HiddenStatesExtension:
     _payloads: dict[bytes, list[Any]] = {}
     # The digest each running request holds: (payload key, internal_req_id) -> digest.
     _request_payloads: dict[tuple[str, str], bytes] = {}
+    # The summed rows of each steering payload, made on the first steered step.
+    _steer_table: _SteerTable | None = None
+    # The plan of the last forward pass.
+    _pass_plan: _PassPlan | None = None
 
     # Persistent hooks (apply to every request, not auto-cleaned):
     _persistent_hooks: list[Hook] = []
@@ -1119,6 +1280,8 @@ class HiddenStatesExtension:
         self._projections = set()
         self._direction_tables = {}
         self._segment_fd = None
+        self._steer_table = None
+        self._pass_plan = None
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
             self._persistent_hooks = []
         self._hook_contexts = {}
