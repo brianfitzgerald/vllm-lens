@@ -10,6 +10,7 @@
 - Capture: Added `output_residual_stream_project` (`capture_project` on the client), which names a direction set registered with `LLM.set_projection(name, directions)`, `POST /v1/projections` or `VLLMLensClient.set_projection`. The worker returns the projection of every position onto the `(N, hidden)` directions and the norm of every position, in float32, in place of the residual. A request that names an unknown set fails before it reaches the engine.
 - Capture: A step's captured rows go to the host in one queued copy into pinned memory, mean rows are summed in one gather, and projections take one matmul per direction set, so the hooks do not wait for the GPU.
 - Capture: The offline batch collect is one RPC: each worker writes the captures into a new memfd, which the `LLM` process maps through `/proc`, where they come back as views with no pickle or copy. The workers must run on the host and in the pid namespace of the `LLM` process.
+- Plugin: Added a CUDA-graph mode for capture. A layer list in `additional_config["vllm_lens"]` (`capture_layers`; `vllm serve --additional-config`) keeps compilation and CUDA graphs on and is part of vLLM's compile cache key, and one custom op on each named layer copies the stream into a buffer inside the graph. Steering, hooks, Q/K capture and layers outside the list fail with an error.
 
 ## v1.3.0 (2 October 2026)
 

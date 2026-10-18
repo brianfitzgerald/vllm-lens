@@ -186,6 +186,7 @@ def test_invalid_capture_is_rejected(extra, match):
     """A capture that cannot be served raises before generation. No GPU."""
     processor = SimpleNamespace(
         _lens_projections={"known"},
+        vllm_config=SimpleNamespace(additional_config=None),
         model_config=SimpleNamespace(get_total_num_hidden_layers=lambda: 4),
     )
     params = SimpleNamespace(extra_args=extra, skip_reading_prefix_cache=False)

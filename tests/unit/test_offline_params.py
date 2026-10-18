@@ -15,6 +15,7 @@ from vllm_lens._helpers.types import HOOKS_PAYLOAD, STEERING_PAYLOAD
 def _processor(persistent: bool = False) -> SimpleNamespace:
     """An InputProcessor with a 4-layer model."""
     return SimpleNamespace(
+        vllm_config=SimpleNamespace(additional_config=None),
         model_config=SimpleNamespace(get_total_num_hidden_layers=lambda: 4),
         _lens_persistent_hooks=persistent,
     )
