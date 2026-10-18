@@ -18,9 +18,11 @@ import logging
 import os
 import pickle
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import cloudpickle
+import numpy as np
 import torch
 import zstandard as zstd
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -292,6 +294,8 @@ def _release_payloads(extension: HiddenStatesExtension, req_id: str) -> None:
         entry[1] -= 1
         if entry[1] == 0:
             del extension._payloads[held]
+            if extension._steer_table is not None:
+                extension._steer_table.release(held)
 
 
 def norm_match(
@@ -315,63 +319,215 @@ def norm_match(
     return (steering * (r_norm / (v_norm + eps))).to(residual.dtype)
 
 
-def _apply_steering(
-    configs: list[SteeringVector],
-    layer_idx: int,
-    target: torch.Tensor,
-    start: int,
-    end: int,
-    abs_start: int,
-    norm_ref: torch.Tensor,
-) -> None:
-    """Apply all matching steering vectors to a token slice *in-place*.
+# Rows after the request rows that hold the position-specific vectors of one step.
+SCRATCH_ROWS = 512
 
-    ``target`` is the (already-cloned) output tensor.  ``start``/``end``
-    are batch-relative indices, ``abs_start`` is the absolute sequence
-    position of the first token in ``target[start:end]``.
 
-    ``norm_ref`` is the tensor whose per-token L2 norm ``norm_match`` should
-    match.  For fused-residual models (e.g. Qwen3) the layer returns
-    ``(hidden_states, residual)`` and ``target`` is only ``hidden_states``
-    (the MLP-delta half); the *true* residual stream is
-    ``hidden_states + residual``, so ``norm_ref`` must be that full stream,
-    not the MLP-delta half, or the steering vector is scaled to a far smaller
-    norm than HF uses.  For non-fused / plain-tensor layers the caller passes
-    ``norm_ref = target``.  Required (no default) so a forgotten reference
-    fails at the call instead of silently scaling to the wrong
-    MLP-delta-half norm.
-    """
-    n_tokens = end - start
-    for cfg in configs:
-        if layer_idx not in cfg.layer_index_map:
-            continue
-        act_idx = cfg.layer_index_map[layer_idx]
-        vec = cfg.activations[act_idx].to(target.dtype)  # (hidden,) or (n_pos, hidden)
+@dataclass
+class _SteerTable:
+    """float32 steering rows per layer, ``scale`` folded in: ``add`` is added as is, ``norm`` is
+    a unit row scaled by the stream norm. Row 0 is zero, rows below ``n_rows`` hold one payload
+    each, and the ``SCRATCH_ROWS`` rows after them are written again each step."""
 
-        if vec.dim() == 1:
-            # 2D: broadcast to all positions
-            v = vec.unsqueeze(0)
-            if cfg.norm_match:
-                v = norm_match(norm_ref[start:end], v)
-            target[start:end] = target[start:end] + v * cfg.scale
-        else:
-            # 3D: position-specific
-            pos_indices = (
-                cfg.position_indices
-                if cfg.position_indices is not None
-                else list(range(vec.shape[0]))
+    device: torch.device
+    hidden: int
+    n_rows: int
+    add: dict[int, torch.Tensor] = field(default_factory=dict)
+    norm: dict[int, torch.Tensor] = field(default_factory=dict)
+    free: list[int] = field(default_factory=list)
+    # The row of each payload digest: 0 when it has no 2-D vector or cannot be steered.
+    rows: dict[bytes, int] = field(default_factory=dict)
+    # The position-specific (3-D) vectors of each payload digest.
+    positional: dict[bytes, list[SteeringVector]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.free = list(range(self.n_rows - 1, 0, -1))
+
+    def layer(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """The ``add`` and ``norm`` tables of ``layer``, allocated on first use."""
+        if layer not in self.add:
+            shape = (self.n_rows + SCRATCH_ROWS, self.hidden)
+            self.add[layer] = torch.zeros(
+                shape, dtype=torch.float32, device=self.device
             )
-            abs_end = abs_start + n_tokens
-            for pi, abs_pos in enumerate(pos_indices):
-                if pi >= vec.shape[0]:
-                    break
-                if abs_pos < abs_start or abs_pos >= abs_end:
+            self.norm[layer] = torch.zeros(
+                shape, dtype=torch.float32, device=self.device
+            )
+        return self.add[layer], self.norm[layer]
+
+    def row(self, key: bytes, configs: list[SteeringVector]) -> int:
+        """The row of ``key``, written from its 2-D vectors on first use. A payload that cannot
+        be written is logged and steers nothing, as one bad request must not stop the engine."""
+        row = self.rows.get(key)
+        if row is not None:
+            return row
+        flat = [cfg for cfg in configs if cfg.activations.dim() == 2]
+        row = 0
+        try:
+            for cfg in configs:
+                if cfg.activations.shape[-1] != self.hidden:
+                    raise ValueError(
+                        f"vector width {cfg.activations.shape[-1]}, model width {self.hidden}"
+                    )
+                for layer in cfg.layer_index_map:
+                    self.layer(layer)
+            if flat and not self.free:
+                logger.warning(
+                    "All %d steering rows are in use; a request is not steered",
+                    self.n_rows - 1,
+                )
+                self.rows[key] = 0
+                return 0
+            if flat:
+                row = self.rows[key] = self.free.pop()
+                for table in (*self.add.values(), *self.norm.values()):
+                    table[row].zero_()
+            for cfg in flat:
+                for layer, index in cfg.layer_index_map.items():
+                    vec = cfg.activations[index].float()
+                    if cfg.norm_match:
+                        vec = vec / (vec.norm() + 1e-6)
+                    tables = self.norm if cfg.norm_match else self.add
+                    tables[layer][row] += vec * cfg.scale
+        except Exception:
+            logger.warning(
+                "Steering failed for %s; it is not steered", key, exc_info=True
+            )
+            self.release(key)
+            self.rows[key] = 0
+            return 0
+        self.rows[key] = row
+        positional = [cfg for cfg in configs if cfg.activations.dim() != 2]
+        if positional:
+            self.positional[key] = positional
+        return row
+
+    def release(self, key: bytes) -> None:
+        """Give the row of ``key`` back."""
+        row = self.rows.pop(key, None)
+        self.positional.pop(key, None)
+        if row:
+            self.free.append(row)
+
+
+class _SteerPass(NamedTuple):
+    """The steering of one forward pass: the table row of each token, and the layers to steer."""
+
+    rows: torch.Tensor
+    layers: frozenset[int]
+
+
+def _steer_pass(extension: HiddenStatesExtension) -> _SteerPass | None:
+    """The token -> row index of this forward pass: a steered request's tokens take its row,
+    and each in-step position of a position-specific vector takes a scratch row."""
+    runner = extension.model_runner
+    query_start_loc = _batch_layout(runner, warn=False)
+    if query_start_loc is None:
+        return None
+    num_reqs = runner.input_batch.num_reqs
+    req_ids = runner.input_batch.req_ids
+    steered: list[tuple[int, int, list[SteeringVector], list[SteeringVector]]] = []
+    for i in range(num_reqs):
+        configs = _request_payload(
+            extension, runner.requests.get(req_ids[i]), req_ids[i], STEERING_PAYLOAD
+        )
+        if not configs:
+            continue
+        if extension._steer_table is None:
+            extension._steer_table = _SteerTable(
+                device=next(runner.model.parameters()).device,
+                hidden=runner.model_config.get_hidden_size(),
+                n_rows=1 + runner.scheduler_config.max_num_seqs,
+            )
+        table = extension._steer_table
+        digest = extension._request_payloads[(STEERING_PAYLOAD, req_ids[i])]
+        row = table.row(digest, configs)
+        positional = table.positional.get(digest, [])
+        if row or positional:
+            steered.append((i, row, configs, positional))
+    if not steered:
+        return None
+    table = extension._steer_table
+    assert table is not None
+    bounds = _host_layout(runner, query_start_loc, num_reqs)
+    index = np.zeros(bounds[num_reqs], dtype=np.int32)
+    layers: set[int] = set()
+    # The base row of each scratch row, and each vector's (scratch row, position) uses.
+    bases: list[int] = []
+    uses: dict[int, tuple[SteeringVector, list[int], list[int]]] = {}
+    skipped = 0
+    for i, row, configs, positional in steered:
+        start, end = bounds[i], bounds[i + 1]
+        index[start:end] = row
+        layers.update(layer for cfg in configs for layer in cfg.layer_index_map)
+        if not positional:
+            continue
+        abs_start = runner.requests[req_ids[i]].num_computed_tokens
+        at: dict[int, list[tuple[SteeringVector, int]]] = {}
+        for cfg in positional:
+            n_pos = cfg.activations.shape[1]
+            positions = (
+                range(n_pos) if cfg.position_indices is None else cfg.position_indices
+            )
+            for pi, pos in enumerate(positions[:n_pos]):
+                if abs_start <= pos < abs_start + end - start:
+                    at.setdefault(pos, []).append((cfg, pi))
+        for pos in sorted(at):
+            if len(bases) == SCRATCH_ROWS:
+                skipped += 1
+                continue
+            index[start + pos - abs_start] = table.n_rows + len(bases)
+            for cfg, pi in at[pos]:
+                use = uses.setdefault(id(cfg), (cfg, [], []))
+                use[1].append(len(bases))
+                use[2].append(pi)
+            bases.append(row)
+    if skipped:
+        logger.warning(
+            "%d steered positions in one step are over the %d scratch rows; "
+            "they are not steered",
+            skipped,
+            SCRATCH_ROWS,
+        )
+    if bases:
+        device = table.device
+        base = torch.tensor(bases, device=device)
+        targets = torch.arange(table.n_rows, table.n_rows + len(bases), device=device)
+        for layer, add in table.add.items():
+            rows = {False: add[base], True: table.norm[layer][base]}
+            for cfg, slots, pis in uses.values():
+                if layer not in cfg.layer_index_map:
                     continue
-                rel = abs_pos - abs_start + start
-                v = vec[pi]
+                vecs = cfg.activations[cfg.layer_index_map[layer]][pis].float()
                 if cfg.norm_match:
-                    v = norm_match(norm_ref[rel], v)
-                target[rel] = target[rel] + v * cfg.scale
+                    vecs = vecs / (vecs.norm(dim=-1, keepdim=True) + 1e-6)
+                rows[cfg.norm_match].index_add_(
+                    0, torch.tensor(slots, device=device), vecs * cfg.scale
+                )
+            add.index_copy_(0, targets, rows[False])
+            table.norm[layer].index_copy_(0, targets, rows[True])
+    host = torch.from_numpy(index)
+    if table.device.type == "cuda":
+        host = host.pin_memory()
+    return _SteerPass(host.to(table.device, non_blocking=True), frozenset(layers))
+
+
+def _steer(
+    hidden: torch.Tensor,
+    residual: torch.Tensor | None,
+    add: torch.Tensor,
+    norm: torch.Tensor,
+    index: torch.Tensor,
+) -> None:
+    """Add each token's row in place: ``add`` as is, ``norm`` times the norm of the unsteered
+    stream (``hidden + residual``), in float32."""
+    rows = index[: hidden.shape[0]]
+    n = rows.shape[0]
+    stream = hidden[:n] if residual is None else hidden[:n] + residual[:n]
+    stream_norm = torch.linalg.vector_norm(
+        stream, dim=-1, keepdim=True, dtype=torch.float32
+    )
+    hidden[:n] += (add[rows] + norm[rows] * stream_norm).to(hidden.dtype)
 
 
 def _batch_layout(
@@ -427,43 +583,20 @@ def _hook_inner(
     req_ids = runner.input_batch.req_ids
     bounds = _host_layout(runner, query_start_loc, num_reqs)
 
-    # --- Phase 1: detect steering requests --------------------------
-    per_req_steering: list[list[SteeringVector]] = []
-    needs_steering = False
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        configs = _request_payload(
-            extension, runner.requests.get(req_id), req_id, STEERING_PAYLOAD
-        )
-        per_req_steering.append(configs)
-        if configs:
-            needs_steering = True
-
-    # --- Phase 2: apply steering ------------------------------------
+    # --- Phase 1: steering, from the rows this forward pass planned --
     modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None = None
-    if needs_steering:
+    plan = extension._steer_pass
+    table = extension._steer_table
+    if plan is not None and table is not None and layer_idx in plan.layers:
+        add, norm = table.layer(layer_idx)
         if isinstance(output, tuple):
-            modified_output = (output[0].clone(), output[1])
-            target = modified_output[0]
-            # Fused-residual layers: true residual stream is output[0]+output[1].
-            # norm_match must reference the full stream, not the MLP-delta half.
-            norm_ref = output[0] + output[1] if output[1] is not None else output[0]
+            modified_output = (output[0].clone(), *output[1:])
+            _steer(modified_output[0], output[1], add, norm, plan.rows)
         else:
             modified_output = output.clone()
-            target = modified_output
-            norm_ref = target
+            _steer(modified_output, None, add, norm, plan.rows)
 
-        for i in range(num_reqs):
-            if not per_req_steering[i]:
-                continue
-            start, end = bounds[i], bounds[i + 1]
-            # The absolute position of the first token of this forward pass.
-            abs_start = runner.requests[req_ids[i]].num_computed_tokens
-            _apply_steering(
-                per_req_steering[i], layer_idx, target, start, end, abs_start, norm_ref
-            )
-
-    # --- Phase 2.5: run generic (post) hooks -------------------------
+    # --- Phase 2: run generic (post) hooks ---------------------------
     # Per-request and persistent hooks are stored in separate context
     # dicts (per-request contexts are cleaned up after each request;
     # persistent ones accumulate).  Within each dict, contexts are keyed
@@ -910,6 +1043,9 @@ class HiddenStatesExtension:
     _payloads: dict[bytes, list[Any]] = {}
     # The digest each running request holds: (payload key, internal_req_id) -> digest.
     _request_payloads: dict[tuple[str, str], bytes] = {}
+    # The steering rows of the stored payloads, and the steering of the current forward pass.
+    _steer_table: _SteerTable | None = None
+    _steer_pass: _SteerPass | None = None
 
     # Persistent hooks (apply to every request, not auto-cleaned):
     _persistent_hooks: list[Hook] = []
@@ -944,6 +1080,8 @@ class HiddenStatesExtension:
         self._captured_states = {}
         self._payloads = {}
         self._request_payloads = {}
+        self._steer_table = None
+        self._steer_pass = None
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
             self._persistent_hooks = []
         self._hook_contexts = {}
@@ -963,6 +1101,23 @@ class HiddenStatesExtension:
             removed(req_id, req_state)
 
         runner._on_request_state_removed = _on_request_state_removed
+        model_forward = runner._model_forward
+
+        def _model_forward(*args: Any, **kwargs: Any) -> Any:
+            """Plan this forward pass's steering, then run it."""
+            try:
+                self._steer_pass = _steer_pass(self)
+            except Exception:
+                # As for a bad hook: one request must not stop the engine.
+                logger.warning("Steering failed for this step", exc_info=True)
+                self._steer_pass = None
+            try:
+                return model_forward(*args, **kwargs)
+            finally:
+                # A forward pass outside this wrapper (a dummy run) steers nothing.
+                self._steer_pass = None
+
+        runner._model_forward = _model_forward
 
     def install_hooks(self) -> None:
         """Install decoder-layer hooks on every rank and reset per-instance state once."""
