@@ -40,6 +40,16 @@ from vllm_lens._helpers.types import (
 # A child of vLLM's logger, so vLLM's handler, format and VLLM_LOGGING_LEVEL apply.
 logger = logging.getLogger("vllm.lens")
 
+try:
+    from vllm.exceptions import VLLMValidationError
+except ImportError:  # The CPU tests run without vLLM.
+    VLLMValidationError = type("VLLMValidationError", (Exception,), {})
+
+
+class LensRequestError(VLLMValidationError, ValueError):
+    """A request vllm-lens cannot serve. vLLM passes it to the caller and HTTP returns 400."""
+
+
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
 
@@ -399,13 +409,16 @@ def _patched_process_inputs(
     # Only this function sets the payload keys; a client cannot send its own.
     for key in (STEERING_PAYLOAD, HOOKS_PAYLOAD, "activations_transport"):
         extra.pop(key, None)
-    vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
-    hooks = _decode_hooks(extra.pop("apply_hooks", None))
-    n_layers = self.model_config.get_total_num_hidden_layers()
-    for item in (*(vectors or []), *(hooks or [])):
-        outside = [idx for idx in item.layer_indices if not 0 <= idx < n_layers]
-        if outside:
-            raise ValueError(f"layer_index {outside} out of range [0, {n_layers})")
+    try:
+        vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
+        hooks = _decode_hooks(extra.pop("apply_hooks", None))
+        n_layers = self.model_config.get_total_num_hidden_layers()
+        for item in (*(vectors or []), *(hooks or [])):
+            outside = [idx for idx in item.layer_indices if not 0 <= idx < n_layers]
+            if outside:
+                raise ValueError(f"layer_index {outside} out of range [0, {n_layers})")
+    except ValueError as error:
+        raise LensRequestError(str(error)) from error
     if vectors is not None:
         # A copy of each tensor: a view pickles the whole storage it belongs to.
         extra[STEERING_PAYLOAD] = pickle.dumps(
