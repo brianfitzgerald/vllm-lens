@@ -40,10 +40,13 @@ from vllm_lens._helpers.types import (
 # A child of vLLM's logger, so vLLM's handler, format and VLLM_LOGGING_LEVEL apply.
 logger = logging.getLogger("vllm.lens")
 
-try:
+if TYPE_CHECKING:
     from vllm.exceptions import VLLMValidationError
-except ImportError:  # The CPU tests run without vLLM.
-    VLLMValidationError = type("VLLMValidationError", (Exception,), {})
+else:
+    try:
+        from vllm.exceptions import VLLMValidationError
+    except ImportError:  # The CPU tests run without vLLM.
+        VLLMValidationError = type("VLLMValidationError", (Exception,), {})
 
 
 class LensRequestError(VLLMValidationError, ValueError):
