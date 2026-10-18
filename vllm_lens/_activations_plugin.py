@@ -31,7 +31,7 @@ from vllm_lens._helpers._serialize import (
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("vllm.lens")
 
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()

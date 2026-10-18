@@ -1,6 +1,7 @@
 ## Unreleased
 
 - Steering: Fixed `position_indices` during decode and chunked prefill: the start of each forward pass was always 0, so position 0 was steered again on every decode step and positions in later prefill chunks were never steered. With async speculative decoding, a position-specific vector fails at submission.
+- Plugin: The package logs through the `vllm.lens` logger, a child of vLLM's `vllm` logger, so vLLM's handler, format and `VLLM_LOGGING_LEVEL` apply. Before, its INFO records were dropped.
 
 ## v1.3.0 (2 October 2026)
 
