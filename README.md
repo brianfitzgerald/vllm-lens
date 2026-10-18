@@ -121,6 +121,8 @@ print(out.activations["residual_stream"].shape)
 
 Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 only (residual streams are identical across TP ranks after all-reduce).
 
+Generation uses copies of the supplied `SamplingParams`, so they can be reused.
+
 #### Binary transport for large captures
 
 By default activations come back base64-encoded inside the JSON response, which adds ~33% overhead on top of the zstd compression and materializes the whole blob in one piece on both ends. For large all-layer captures, pass `activations_transport="binary"` to fetch the raw bytes out-of-band instead:

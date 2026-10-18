@@ -95,7 +95,7 @@ async def register_hooks(raw_request: Request):
     payload = cloudpickle.dumps(hooks)
     engine = _engine_client(raw_request)
     await engine.collective_rpc("set_persistent_hooks", args=(payload,))
-    engine._has_persistent_hooks = True
+    engine.input_processor._lens_persistent_hooks = True
     prefetch = body.get("prefetch_params")
     if prefetch:
         await engine.collective_rpc("prefetch_parameters", args=(prefetch,))
@@ -138,7 +138,7 @@ async def collect_hook_results(raw_request: Request):
 async def clear_hooks(raw_request: Request):
     engine = _engine_client(raw_request)
     await engine.collective_rpc("clear_persistent_hooks")
-    engine._has_persistent_hooks = False
+    engine.input_processor._lens_persistent_hooks = False
     return JSONResponse({"status": "ok"})
 
 

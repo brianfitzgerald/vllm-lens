@@ -12,6 +12,7 @@ per-request activations for both online (async) and offline (sync) usage.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -29,9 +30,28 @@ from vllm_lens._helpers._serialize import (
     serialize_activations_binary,
     serialize_hook_results,
 )
-from vllm_lens._helpers.types import Hook, SteeringVector
+from vllm_lens._helpers.types import (
+    HOOKS_PAYLOAD,
+    STEERING_PAYLOAD,
+    Hook,
+    SteeringVector,
+)
 
+# A child of vLLM's logger, so vLLM's handler, format and VLLM_LOGGING_LEVEL apply.
 logger = logging.getLogger("vllm.lens")
+
+if TYPE_CHECKING:
+    from vllm.exceptions import VLLMValidationError
+else:
+    try:
+        from vllm.exceptions import VLLMValidationError
+    except ImportError:  # The CPU tests run without vLLM.
+        VLLMValidationError = type("VLLMValidationError", (Exception,), {})
+
+
+class LensRequestError(VLLMValidationError, ValueError):
+    """A request vllm-lens cannot serve. vLLM passes it to the caller and HTTP returns 400."""
+
 
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
@@ -51,6 +71,7 @@ _original_completion_response: Callable | None = None
 _original_chat_full_generator: Callable | None = None
 _original_chat_stream_generator: Callable | None = None
 _original_register_routers: Callable | None = None
+_original_process_inputs: Callable | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +397,75 @@ def _patched_create_engine_config(self, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 
+def _patched_process_inputs(
+    self: Any, request_id: str, prompt: Any, params: Any, *args, **kwargs
+) -> Any:
+    """Check a request's vectors and hooks and move them into a copy of its ``extra_args`` as
+    pickled bytes, which reach the workers with the request. Shared by every entry point."""
+    assert _original_process_inputs is not None
+    extra = dict(getattr(params, "extra_args", None) or {})
+    persistent = getattr(self, "_lens_persistent_hooks", False)
+    if not extra and not persistent:
+        return _original_process_inputs(
+            self, request_id, prompt, params, *args, **kwargs
+        )
+    # Only this function sets the payload keys; a client cannot send its own.
+    for key in (STEERING_PAYLOAD, HOOKS_PAYLOAD, "activations_transport"):
+        extra.pop(key, None)
+    try:
+        vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
+        hooks = _decode_hooks(extra.pop("apply_hooks", None))
+        n_layers = self.model_config.get_total_num_hidden_layers()
+        for item in (*(vectors or []), *(hooks or [])):
+            outside = [idx for idx in item.layer_indices if not 0 <= idx < n_layers]
+            if outside:
+                raise ValueError(f"layer_index {outside} out of range [0, {n_layers})")
+    except ValueError as error:
+        raise LensRequestError(str(error)) from error
+    if vectors is not None:
+        # A copy of each tensor: a view pickles the whole storage it belongs to.
+        extra[STEERING_PAYLOAD] = pickle.dumps(
+            [
+                sv.model_copy(
+                    update={"activations": sv.activations.detach().cpu().clone()}
+                )
+                for sv in vectors
+            ]
+        )
+    if hooks is not None:
+        extra[HOOKS_PAYLOAD] = cloudpickle.dumps(hooks)
+    params = copy.copy(params)
+    params.extra_args = extra
+    # Prefix-cached tokens skip the forward pass, so the hooks would not see them.
+    if (
+        extra.pop("skip_reading_prefix_cache", None)
+        or vectors is not None
+        or hooks is not None
+        or persistent
+        or extra.get("output_residual_stream") is not None
+        or extra.get("output_qk") is not None
+    ):
+        params.skip_reading_prefix_cache = True
+    return _original_process_inputs(self, request_id, prompt, params, *args, **kwargs)
+
+
+def _lens_flags(extra: dict[str, Any] | None, persistent: bool) -> dict[str, bool]:
+    """What a request needs from the workers: hooks installed, and which results to collect."""
+    extra = extra or {}
+    flags = {
+        "activations": extra.get("output_residual_stream") is not None,
+        "qk": extra.get("output_qk") is not None,
+        "hooks": extra.get("apply_hooks") is not None,
+    }
+    flags["install"] = (
+        flags["activations"]
+        or flags["hooks"]
+        or persistent
+        or extra.get("apply_steering_vectors") is not None
+    )
+    return flags
+
+
 async def _patched_generate(
     self: AsyncLLM,
     prompt: str,
@@ -383,86 +473,24 @@ async def _patched_generate(
     request_id: str,
     **kwargs,
 ) -> AsyncIterator:
-    """Wrap generate to install hooks, apply steering, and attach activations.
-
-    On the first call that requests activations or steering, sends a
-    one-time RPC to install forward hooks on every decoder layer.
-
-    If ``apply_steering_vectors`` is present in ``extra_args``, the
-    steering data is sent to workers via RPC *before* generation starts
-    (tensors can't survive msgspec serialization in extra_args).
-
-    When generation finishes, retrieves the captured activations from
-    the worker and attaches them as ``output.activations``.
-    """
-    # In vLLM v1, the chat completion endpoint creates an
-    # EngineCoreRequest with a *cloned* SamplingParams before calling
-    # generate(). add_request() uses the clone from the
-    # EngineCoreRequest, ignoring the separately-passed sampling_params.
-    # We must read/modify the clone so our changes take effect.
-    effective_params = sampling_params
-    try:
-        from vllm.v1.engine import EngineCoreRequest
-
-        if isinstance(prompt, EngineCoreRequest) and prompt.sampling_params is not None:  # type: ignore[reportAttributeAccessIssue]
-            effective_params = prompt.sampling_params  # type: ignore[reportAttributeAccessIssue]
-    except ImportError:
-        pass
-
-    extra = effective_params.extra_args or {}
-    wants_activations = extra.get("output_residual_stream") is not None
+    """Run generation and attach the request's captures and hook results to its output."""
+    flags = _lens_flags(
+        sampling_params.extra_args,
+        getattr(self.input_processor, "_lens_persistent_hooks", False),
+    )
     # Response-transport negotiation (issue #31): "binary" parks activation
     # bytes in the process-local store and returns a handle instead of base64.
-    # Popped so it doesn't ride along to the workers with the SamplingParams.
-    activations_transport = extra.pop("activations_transport", None)
+    activations_transport = (sampling_params.extra_args or {}).get(
+        "activations_transport"
+    )
     if activations_transport == "binary":
         _warn_if_multi_api_server(self)
-    wants_qk = extra.get("output_qk") is not None
-    # Extract steering data and remove from extra_args before vLLM
-    # serialises the SamplingParams (tensors don't survive msgspec).
-    # When arriving via the OpenAI API (vllm_xargs), complex values
-    # are JSON-encoded strings; decode and validate as SteeringVector.
-    steering_vectors = _decode_steering_vectors(
-        extra.pop("apply_steering_vectors", None)
-    )
-
-    # Extract hooks (callables can't survive msgspec).
-    hooks_list = _decode_hooks(extra.pop("apply_hooks", None))
-
-    # Allow explicit prefix-cache bypass via extra_args.
-    skip_kv_cache = extra.pop("skip_reading_prefix_cache", None)
-
-    has_persistent = getattr(self, "_has_persistent_hooks", False)
-    needs_hooks = (
-        wants_activations
-        or steering_vectors is not None
-        or hooks_list is not None
-        or has_persistent
-    )
-    if needs_hooks or wants_qk or skip_kv_cache:
-        # Hooks rely on forward passes firing; prefix-cached tokens skip
-        # computation entirely, so force a fresh prefill for this request.
-        effective_params.skip_reading_prefix_cache = True
-    if needs_hooks and not getattr(self, "_hooks_installed", False):
+    if flags["install"] and not getattr(self, "_hooks_installed", False):
         await self.collective_rpc("install_hooks")
         setattr(self, "_hooks_installed", True)
-    if wants_qk and not getattr(self, "_qk_hooks_installed", False):
+    if flags["qk"] and not getattr(self, "_qk_hooks_installed", False):
         await self.collective_rpc("install_qk_hooks")
         setattr(self, "_qk_hooks_installed", True)
-
-    # Send steering data to workers before the forward pass begins.
-    if steering_vectors is not None:
-        await self.collective_rpc(
-            "set_steering_data",
-            args=(request_id, pickle.dumps(steering_vectors)),
-        )
-
-    # Send hook data to workers before the forward pass begins.
-    if hooks_list is not None:
-        await self.collective_rpc(
-            "set_hook_data",
-            args=(request_id, cloudpickle.dumps(hooks_list)),
-        )
 
     assert _original_generate is not None
     try:
@@ -470,7 +498,7 @@ async def _patched_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
             if output.finished:
-                if wants_activations:
+                if flags["activations"]:
                     states = await self.collective_rpc(
                         "get_captured_states", args=(request_id,)
                     )
@@ -481,7 +509,7 @@ async def _patched_generate(
                         _trim_activations(activations, n_prompt + n_gen - 1)
                         output.activations = activations
                         output._vllm_lens_transport = activations_transport
-                if wants_qk:
+                if flags["qk"]:
                     qk_states = await self.collective_rpc(
                         "get_captured_qk", args=(request_id,)
                     )
@@ -493,7 +521,7 @@ async def _patched_generate(
                         merged_acts = getattr(output, "activations", None) or {}
                         merged_acts.update(qk)
                         output.activations = merged_acts
-                if hooks_list is not None:
+                if flags["hooks"]:
                     raw_results = await self.collective_rpc(
                         "get_hook_results", args=(request_id,)
                     )
@@ -502,15 +530,9 @@ async def _patched_generate(
                         output.hook_results = merged
             yield output
     finally:
-        if steering_vectors is not None:
-            await self.collective_rpc("clear_steering_data", args=(request_id,))
-        if wants_activations:
-            await self.collective_rpc("clear_captured_states", args=(request_id,))
-        if wants_qk:
-            await self.collective_rpc("clear_captured_qk", args=(request_id,))
-        if hooks_list is not None:
-            await self.collective_rpc("clear_hook_data", args=(request_id,))
-            await self.collective_rpc("clear_hook_contexts", args=(request_id,))
+        # An aborted request leaves its captures and hook contexts on the workers.
+        if flags["activations"] or flags["qk"] or flags["hooks"]:
+            await self.collective_rpc("clear_request_state", args=([request_id],))
 
 
 # ---------------------------------------------------------------------------
@@ -518,119 +540,9 @@ async def _patched_generate(
 # ---------------------------------------------------------------------------
 
 
-def _prepare_offline_params(
-    self: LLM,
-    sampling_params: SamplingParams | Sequence[SamplingParams] | None,
-) -> dict[str, Any]:
-    """Shared pre-processing for the patched offline entry points.
-
-    Pops steering vectors and hooks from ``extra_args`` before vLLM
-    serialises the SamplingParams (tensors/callables don't survive
-    msgspec), decoding the JSON-string wire format where present.
-    Because the offline API auto-assigns request IDs internally, the
-    payloads are keyed by synthetic ``_steering_id`` / ``_hook_id``
-    sentinels stored in ``extra_args`` (lightweight strings that survive
-    msgspec serialization), then shipped to workers via RPC.
-
-    Returns the state dict consumed by :func:`_finalize_offline_outputs`.
-    """
-    if isinstance(sampling_params, Sequence):
-        params_list = list(sampling_params)
-    elif sampling_params is not None:
-        params_list = [sampling_params]
-    else:
-        params_list = []
-
-    wants_activations = any(
-        (sp.extra_args or {}).get("output_residual_stream") is not None
-        for sp in params_list
-    )
-    wants_qk = any(
-        (sp.extra_args or {}).get("output_qk") is not None for sp in params_list
-    )
-
-    # Extract steering vectors per-request.  We must pop them from
-    # extra_args before vLLM serialises SamplingParams, but keep them
-    # for the RPC call.
-    steering_payloads: dict[str, bytes] = {}  # steering_id -> pickled vectors
-    for idx, sp in enumerate(params_list):
-        extra = sp.extra_args or {}
-        vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
-        if vectors is not None:
-            steering_id = f"_steer_{idx}"
-            steering_payloads[steering_id] = pickle.dumps(vectors)
-            if sp.extra_args is None:
-                sp.extra_args = {}
-            sp.extra_args["_steering_id"] = steering_id
-
-    # Extract hooks per-request (same pattern as steering).
-    hook_payloads: dict[str, bytes] = {}  # hook_id -> cloudpickled hooks
-    for idx, sp in enumerate(params_list):
-        extra = sp.extra_args or {}
-        hooks = _decode_hooks(extra.pop("apply_hooks", None))
-        if hooks is not None:
-            hook_id = f"_hook_{idx}"
-            hook_payloads[hook_id] = cloudpickle.dumps(hooks)
-            if sp.extra_args is None:
-                sp.extra_args = {}
-            sp.extra_args["_hook_id"] = hook_id
-
-    # Pop skip_reading_prefix_cache from extra_args for each request.
-    any_skip_kv_cache = False
-    for sp in params_list:
-        if (sp.extra_args or {}).pop("skip_reading_prefix_cache", None):
-            any_skip_kv_cache = True
-
-    has_steering = len(steering_payloads) > 0
-    has_hooks = len(hook_payloads) > 0
-    has_persistent = getattr(self, "_has_persistent_hooks", False)
-    needs_hooks = wants_activations or has_steering or has_hooks or has_persistent
-    if needs_hooks or wants_qk or any_skip_kv_cache:
-        for sp in params_list:
-            sp.skip_reading_prefix_cache = True
-
-    if needs_hooks and not getattr(self, "_hooks_installed", False):
-        self.collective_rpc("install_hooks")
-        self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
-
-    if wants_qk and not getattr(self, "_qk_hooks_installed", False):
-        self.collective_rpc("install_qk_hooks")
-        self._qk_hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
-
-    # Send steering data to workers before generation.
-    for sid, payload in steering_payloads.items():
-        self.collective_rpc("set_steering_data", args=(sid, payload))
-
-    # Send hook data to workers before generation.
-    for hid, payload in hook_payloads.items():
-        self.collective_rpc("set_hook_data", args=(hid, payload))
-
-    return {
-        "wants_activations": wants_activations,
-        "wants_qk": wants_qk,
-        "steering_payloads": steering_payloads,
-        "hook_payloads": hook_payloads,
-    }
-
-
-def _finalize_offline_outputs(
-    self: LLM,
-    outputs: list,
-    state: dict[str, Any],
-) -> list:
-    """Shared post-processing for the patched offline entry points.
-
-    Attaches captured activations and hook results to the outputs, then
-    clears per-request worker state set up by
-    :func:`_prepare_offline_params`.
-    """
-    wants_activations = state["wants_activations"]
-    wants_qk = state.get("wants_qk", False)
-    steering_payloads = state["steering_payloads"]
-    hook_payloads = state["hook_payloads"]
-    has_hooks = len(hook_payloads) > 0
-
-    if wants_activations:
+def _finalize_offline_outputs(self: LLM, outputs: list, flags: dict[str, bool]) -> list:
+    """Attach captured activations and hook results to offline outputs."""
+    if flags["activations"]:
         req_ids = [output.request_id for output in outputs]
         states_per_rank = self.collective_rpc(
             "get_captured_states_batch", args=(req_ids,)
@@ -644,7 +556,7 @@ def _finalize_offline_outputs(
                 _trim_activations(activations, n_prompt + n_gen - 1)
                 output.activations = activations
 
-    if wants_qk:
+    if flags["qk"]:
         req_ids = [output.request_id for output in outputs]
         qk_per_rank = self.collective_rpc("get_captured_qk_batch", args=(req_ids,))
         qk_by_id = _merge_captured_qk_batch(qk_per_rank, req_ids)
@@ -658,7 +570,7 @@ def _finalize_offline_outputs(
                 merged_acts.update(qk)
                 output.activations = merged_acts
 
-    if has_hooks:
+    if flags["hooks"]:
         for output in outputs:
             req_id = output.request_id
             raw_results = self.collective_rpc("get_hook_results", args=(req_id,))
@@ -666,18 +578,40 @@ def _finalize_offline_outputs(
             if merged is not None:
                 output.hook_results = merged
 
-    # Clean up steering data.
-    for sid in steering_payloads:
-        self.collective_rpc("clear_steering_data", args=(sid,))
-
-    # Clean up hook data and contexts.
-    for hid in hook_payloads:
-        self.collective_rpc("clear_hook_data", args=(hid,))
-    if has_hooks:
-        for output in outputs:
-            self.collective_rpc("clear_hook_contexts", args=(output.request_id,))
-
     return outputs
+
+
+def _run_offline(
+    self: LLM,
+    original: Callable[..., list],
+    first: Any,
+    sampling_params: SamplingParams | Sequence[SamplingParams] | None,
+    args: tuple,
+    kwargs: dict[str, Any],
+) -> list:
+    """Run an offline entry point and attach its results; after a failure, drop the captures
+    and hook contexts of every request (the offline call holds the engine)."""
+    if isinstance(sampling_params, Sequence):
+        params_list = list(sampling_params)
+    else:
+        params_list = [sampling_params] if sampling_params is not None else []
+    persistent = getattr(
+        self.llm_engine.input_processor, "_lens_persistent_hooks", False
+    )
+    per_request = [_lens_flags(sp.extra_args, persistent) for sp in params_list]
+    flags = {key: any(f[key] for f in per_request) for key in _lens_flags(None, False)}
+    if flags["install"] and not getattr(self, "_hooks_installed", False):
+        self.collective_rpc("install_hooks")
+        self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
+    if flags["qk"] and not getattr(self, "_qk_hooks_installed", False):
+        self.collective_rpc("install_qk_hooks")
+        self._qk_hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
+    try:
+        outputs = original(self, first, sampling_params, *args, **kwargs)
+        return _finalize_offline_outputs(self, outputs, flags)
+    except BaseException:
+        self.collective_rpc("clear_request_state", args=(None,))
+        raise
 
 
 def _patched_llm_generate(
@@ -687,15 +621,11 @@ def _patched_llm_generate(
     *args,
     **kwargs,
 ) -> list:
-    """Wrap ``LLM.generate`` to install hooks, apply steering, and attach activations.
-
-    Same logic as the async variant but for the synchronous offline API;
-    see :func:`_prepare_offline_params` for the mechanics.
-    """
-    state = _prepare_offline_params(self, sampling_params)
+    """Run offline generation with capture, steering, and hooks."""
     assert _original_llm_generate is not None
-    outputs = _original_llm_generate(self, prompts, sampling_params, *args, **kwargs)
-    return _finalize_offline_outputs(self, outputs, state)
+    return _run_offline(
+        self, _original_llm_generate, prompts, sampling_params, args, kwargs
+    )
 
 
 def _patched_llm_chat(
@@ -705,19 +635,11 @@ def _patched_llm_chat(
     *args,
     **kwargs,
 ) -> list:
-    """Wrap ``LLM.chat`` to install hooks, apply steering, and attach activations.
-
-    ``LLM.chat`` does not route through ``LLM.generate`` (it renders the
-    conversation and submits to the engine directly), so it needs the
-    same treatment as :func:`_patched_llm_generate`.  On vLLM versions
-    where chat *does* delegate to ``LLM.generate``, the double
-    pre-processing is harmless: the inner call finds ``extra_args``
-    already stripped and the worker-side clear RPCs are idempotent.
-    """
-    state = _prepare_offline_params(self, sampling_params)
+    """Run offline chat with capture, steering, and hooks."""
     assert _original_llm_chat is not None
-    outputs = _original_llm_chat(self, messages, sampling_params, *args, **kwargs)
-    return _finalize_offline_outputs(self, outputs, state)
+    return _run_offline(
+        self, _original_llm_chat, messages, sampling_params, args, kwargs
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -895,7 +817,7 @@ def _llm_register_hooks(
     self.collective_rpc("set_persistent_hooks", args=(cloudpickle.dumps(hooks),))
     if prefetch_params:
         self.collective_rpc("prefetch_parameters", args=(prefetch_params,))
-    self._has_persistent_hooks = True  # type: ignore[reportAttributeAccessIssue]
+    self.llm_engine.input_processor._lens_persistent_hooks = True  # type: ignore[reportAttributeAccessIssue]
 
 
 def _llm_collect_hook_results(self: LLM) -> dict:
@@ -910,7 +832,7 @@ def _llm_collect_hook_results(self: LLM) -> dict:
 def _llm_clear_hooks(self: LLM) -> None:
     """Remove persistent hooks and all accumulated contexts."""
     self.collective_rpc("clear_persistent_hooks")
-    self._has_persistent_hooks = False  # type: ignore[reportAttributeAccessIssue]
+    self.llm_engine.input_processor._lens_persistent_hooks = False  # type: ignore[reportAttributeAccessIssue]
 
 
 def _llm_prefetch_params(self: LLM, names: list[str]) -> None:
@@ -954,25 +876,7 @@ def _report_integration_failure(component: str, error: Exception) -> None:
 
 
 def register() -> None:
-    """Entry point called by vLLM's plugin system at engine startup.
-
-    Patches ``EngineArgs.create_engine_config`` to inject the worker
-    extension and eager mode, ``AsyncLLM.generate``, ``LLM.generate``,
-    and ``LLM.chat`` to retrieve per-request activations for both online
-    and offline usage.  Also patches the OpenAI-compatible response
-    builders so activations are included in HTTP responses from
-    ``vllm serve``.
-
-    Use ``extra_args={"output_residual_stream": True | list[int]}`` in
-    SamplingParams to request activations.
-
-    Opt-out: set ``VLLM_LENS_DISABLE=1`` to make this a no-op. This plugin
-    auto-loads in *every* vLLM process via the ``vllm.general_plugins`` entry
-    point, and its patches force ``enforce_eager=True`` (disabling CUDA graphs)
-    on all engines. The kill switch lets vllm-lens be installed alongside a
-    trainer's inference server (e.g. prime-rl rollouts) without perturbing it.
-    Unset => unchanged default-on behaviour.
-    """
+    """Install the plugin unless VLLM_LENS_DISABLE is set."""
     if os.environ.get("VLLM_LENS_DISABLE", "").strip().lower() in (
         "1",
         "true",
@@ -987,13 +891,19 @@ def register() -> None:
     global _original_completion_response, _original_chat_full_generator
     global _original_chat_stream_generator
     global _original_register_routers
+    global _original_process_inputs
 
     from vllm import LLM
     from vllm.engine.arg_utils import EngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
+    from vllm.v1.engine.input_processor import InputProcessor
 
     _original_create_engine_config = EngineArgs.create_engine_config
     EngineArgs.create_engine_config = _patched_create_engine_config
+
+    # Before any engine is built: InputProcessor binds process_inputs_async at __init__.
+    _original_process_inputs = InputProcessor.process_inputs
+    InputProcessor.process_inputs = _patched_process_inputs  # type: ignore[reportAttributeAccessIssue]
 
     _original_generate = AsyncLLM.generate
     AsyncLLM.generate = _patched_generate  # type: ignore[reportAttributeAccessIssue]
