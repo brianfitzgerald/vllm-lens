@@ -66,6 +66,14 @@ vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` e
 VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
+## Logging
+
+The plugin logs through the `vllm.lens` logger, a child of vLLM's `vllm` logger, so vLLM's handler and format apply. `VLLM_LOGGING_LEVEL` sets the level, and `VLLM_LOGGING_CONFIG_PATH` can name a config file that sets `vllm.lens` alone:
+
+```bash
+VLLM_LOGGING_LEVEL=DEBUG vllm serve meta-llama/Llama-3.1-8B-Instruct
+```
+
 ## Examples
 
 Runnable examples live in [`examples/`](examples/) — each is standalone; run any
@@ -180,6 +188,8 @@ Via the client (or `vllm_xargs` over HTTP):
 ```python
 client.generate("I think the best dessert is", steering_vectors=[sv])
 ```
+
+`position_indices` are absolute positions in the sequence (prompt and generated tokens). Under async speculative decoding, a position in the generated tokens can be steered at a position that is off by the number of rejected draft tokens. Prompt positions are correct.
 
 ### Generic hooks
 
