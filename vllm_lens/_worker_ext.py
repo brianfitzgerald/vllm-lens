@@ -1173,6 +1173,8 @@ class HiddenStatesExtension:
     def set_projection(self, name: str, payload: str) -> None:
         """Hold the ``(N, hidden)`` directions of a ``serialize_tensor`` payload under
         ``name``; requests name it in ``output_residual_stream_project``."""
+        # Installing the hooks resets the worker state, so it must come first.
+        self.install_hooks()
         device = next(self.model_runner.model.parameters()).device
         self._direction_tables[name] = deserialize_directions(payload).to(device)
 

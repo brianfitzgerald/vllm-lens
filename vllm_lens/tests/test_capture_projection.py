@@ -123,6 +123,7 @@ def test_direction_sets_are_set_and_cleared():
     worker = HiddenStatesExtension.__new__(HiddenStatesExtension)
     worker.model_runner = SimpleNamespace(model=torch.nn.Linear(2, 2))  # type: ignore[reportAttributeAccessIssue]
     worker._direction_tables = {}
+    worker._hooks_installed = True
     worker.set_projection("a", json.dumps(serialize_tensor(torch.randn(2, 8).half())))
     worker.set_projection("b", json.dumps(serialize_tensor(torch.randn(3, 8))))
     assert worker._direction_tables["a"].dtype == torch.float32
