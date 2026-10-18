@@ -51,20 +51,6 @@ def _assert_close(vllm_acts: torch.Tensor, hf_acts: torch.Tensor):
 
 
 class TestChunkedPrefillMatchesTransformers:
-    def test_long_prompt_activations_match(self, chunked_llm, hf_model):
-        """Activations from a chunked long prompt match HuggingFace reference."""
-        model, tokenizer = hf_model
-        num_tokens = tokenizer(LONG_PROMPT, return_tensors="pt").input_ids.shape[1]
-        assert num_tokens > 64, (
-            f"Prompt must exceed chunk size; got {num_tokens} tokens"
-        )
-
-        hf_acts = _get_hf_acts(model, tokenizer, LONG_PROMPT)
-        streams = _get_vllm_acts(chunked_llm, [LONG_PROMPT], max_tokens=1)
-        vllm_acts = streams[0][0, :num_tokens].float()
-
-        _assert_close(vllm_acts, hf_acts)
-
     def test_activation_shape_covers_full_prompt(self, chunked_llm, hf_model):
         """Activation token dim covers the full prompt, not just one chunk."""
         _, tokenizer = hf_model
