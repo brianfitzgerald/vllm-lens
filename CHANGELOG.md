@@ -5,6 +5,7 @@
 - Plugin: The package logs through the `vllm.lens` logger, a child of vLLM's `vllm` logger, so vLLM's handler, format and `VLLM_LOGGING_LEVEL` apply. Before, its INFO records were dropped.
 - Plugin: Generation uses copies of the supplied `SamplingParams`. Before, the entry points popped the vectors and hooks from the caller's `extra_args`, so a reused `SamplingParams` steered only its first call.
 - Plugin: Steered and hooked requests use a unique prefix-cache salt per request, so other requests cannot reuse their KV blocks. These requests still skip prefix-cache reads.
+- Steering: Vectors are prepared once per request and applied to token slices per layer.
 
 ## v1.3.0 (2 October 2026)
 
