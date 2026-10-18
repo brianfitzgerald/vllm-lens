@@ -33,15 +33,20 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import requests
 
+from vllm_lens._helpers._positions import POSITIONS_KEY
 from vllm_lens._helpers._serialize import (
     decode_activations,
     deserialize_hook_results,
+    serialize_tensor,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -102,6 +107,9 @@ class VLLMLensClient:
         steering_vectors: list[SteeringVector] | None,
         activations_transport: str | None = None,
         capture_qk: list[int] | bool | None = None,
+        capture_pool: Literal["mean"] | None = None,
+        capture_project: str | None = None,
+        capture_positions: str | list[int] | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
@@ -110,6 +118,16 @@ class VLLMLensClient:
             xargs["activations_transport"] = activations_transport
         if capture_qk is not None:
             xargs["output_qk"] = json.dumps(capture_qk)
+        if capture_pool is not None:
+            xargs["output_residual_stream_pool"] = capture_pool
+        if capture_project is not None:
+            xargs["output_residual_stream_project"] = capture_project
+        if capture_positions is not None:
+            xargs[POSITIONS_KEY] = (
+                capture_positions
+                if isinstance(capture_positions, str)
+                else json.dumps(list(capture_positions))
+            )
         if hooks is not None:
             xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
         if steering_vectors is not None:
@@ -169,6 +187,9 @@ class VLLMLensClient:
         capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
+        capture_pool: Literal["mean"] | None = None,
+        capture_project: str | None = None,
+        capture_positions: str | list[int] | None = None,
         logprobs: int | None = None,
         echo: bool = False,
         **kwargs: Any,
@@ -185,6 +206,11 @@ class VLLMLensClient:
         ``capture_qk`` captures post-RoPE attention Q/K for the given
         layers (or all layers with ``True``); reconstruct patterns with
         :func:`vllm_lens.attention.attention_patterns`.
+
+        ``capture_pool="mean"`` returns the prompt mean as one row per layer;
+        ``capture_positions`` keeps ``"last_prompt_token"`` or a list of absolute positions and
+        adds ``residual_stream_positions``; ``capture_project`` names a set from :meth:`set_projection` and returns
+        the projection of every position onto its rows and the norm of every position.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -199,7 +225,14 @@ class VLLMLensClient:
             body["echo"] = True
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
+            hooks,
+            capture_layers,
+            steering_vectors,
+            activations_transport,
+            capture_qk,
+            capture_pool,
+            capture_project,
+            capture_positions,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -220,6 +253,9 @@ class VLLMLensClient:
         capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
+        capture_pool: Literal["mean"] | None = None,
+        capture_project: str | None = None,
+        capture_positions: str | list[int] | None = None,
         **kwargs: Any,
     ) -> GenerateOutput:
         """Generate a chat completion from a list of messages.
@@ -242,7 +278,14 @@ class VLLMLensClient:
         }
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
+            hooks,
+            capture_layers,
+            steering_vectors,
+            activations_transport,
+            capture_qk,
+            capture_pool,
+            capture_project,
+            capture_positions,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -251,6 +294,27 @@ class VLLMLensClient:
             f"{self.base_url}/v1/chat/completions", json=body, timeout=self._timeout
         ).json()
         return self._parse_response(resp)
+
+    # ------------------------------------------------------------------
+    # Projection directions
+    # ------------------------------------------------------------------
+
+    def set_projection(self, name: str, directions: torch.Tensor) -> None:
+        """Hold ``(N, hidden)`` directions on the server under ``name``, for
+        ``capture_project=name``."""
+        resp = self._session.post(
+            f"{self.base_url}/v1/projections",
+            json={"name": name, "directions": serialize_tensor(directions.float())},
+            timeout=self._timeout,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Failed to set projection {name!r}: {resp.text}")
+
+    def clear_projection(self, name: str) -> None:
+        """Drop the directions under ``name``."""
+        self._session.delete(
+            f"{self.base_url}/v1/projections/{name}", timeout=self._timeout
+        )
 
     # ------------------------------------------------------------------
     # Persistent hooks

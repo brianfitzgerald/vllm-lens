@@ -119,6 +119,28 @@ out = client.generate("Hello world", capture_layers=[15, 20])
 print(out.activations["residual_stream"].shape)
 ```
 
+To get the mean over the prompt positions as one row per layer, also pass `output_residual_stream_pool="mean"` (the client's `capture_pool`). The result has shape `(n_layers, 1, hidden_dim)`. Generated positions are not included, and the result is the same with chunked prefill.
+
+To keep only some positions, pass `output_residual_stream_positions` (the client's `capture_positions`): `"last_prompt_token"` or a list of absolute positions. The response then also holds `residual_stream_positions`, the position of each row:
+
+```python
+out = client.generate("Hello world", capture_layers=[15, 20], capture_positions="last_prompt_token")
+out.activations["residual_stream"].shape      # (2, 1, hidden_dim)
+out.activations["residual_stream_positions"]  # [n_prompt - 1]
+```
+
+Positions index the model input: prompt tokens are `0 .. n_prompt - 1`, and `n_prompt + k` is the state computed when generated token `k` is fed back. The last generated token is never processed, so it has no row. Rows come back in ascending position order with duplicates removed. A position that is never computed is absent, so a selector that matches nothing gives a `(n_layers, 0, hidden_dim)` tensor. Negative positions, unknown strings and a selector without `output_residual_stream` fail when the request is submitted.
+
+To get the projection of every position onto a few directions in place of the residual, register the `(N, hidden_dim)` directions under a name once, then pass the name in `output_residual_stream_project` (the client's `capture_project`). The response then holds `residual_stream_projection` with shape `(n_layers, total_pos, N)` and `residual_stream_norm` (the L2 norm of each position) with shape `(n_layers, total_pos)`, both float32, in place of `residual_stream`. Register offline with `llm.set_projection(name, directions)`, over HTTP with `POST /v1/projections` (`{"name": ..., "directions": serialize_tensor(directions)}`); `clear_projection(name)` and `DELETE /v1/projections/{name}` drop a set.
+
+```python
+client.set_projection("probes", directions)
+out = client.generate("Hello world", capture_layers=[15], capture_project="probes")
+print(out.activations["residual_stream_projection"].shape)  # (1, total_pos, N)
+```
+
+`output_residual_stream_pool`, `output_residual_stream_positions` and `output_residual_stream_project` cannot be combined.
+
 Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 only (residual streams are identical across TP ranks after all-reduce).
 
 Generation uses copies of the supplied `SamplingParams`, so they can be reused.

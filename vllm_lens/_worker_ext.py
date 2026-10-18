@@ -13,7 +13,6 @@ capture, and decodes the request's steering vectors and hooks from its ``extra_a
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import pickle
@@ -29,6 +28,13 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_lens._helpers._hook_output import _replace_hook_output
+from vllm_lens._helpers._positions import (
+    POSITIONS_KEY,
+    POSITIONS_META_KEY,
+    order_positions,
+    positions_in_slice,
+)
+from vllm_lens._helpers._serialize import decode_layers, deserialize_directions
 from vllm_lens._helpers.types import (
     HOOKS_PAYLOAD,
     STEERING_PAYLOAD,
@@ -569,6 +575,156 @@ def _host_layout(
     return query_start_loc[: num_reqs + 1].tolist()
 
 
+def _token_layout(
+    spans: list[tuple[int, int]], labels: list[int], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The batch index of every token in ``spans`` and the label of its span, on ``device``,
+    through one pinned copy that does not wait for the stream."""
+    lengths = np.asarray([end - start for start, end in spans], dtype=np.int64)
+    starts = np.repeat(
+        np.asarray([start for start, _ in spans], dtype=np.int64), lengths
+    )
+    offsets = np.arange(lengths.sum(), dtype=np.int64) - np.repeat(
+        np.cumsum(lengths) - lengths, lengths
+    )
+    layout = torch.from_numpy(
+        np.stack(
+            [starts + offsets, np.repeat(np.asarray(labels, dtype=np.int64), lengths)]
+        )
+    )
+    if device.type == "cuda":
+        layout = layout.pin_memory()
+    tokens, segments = layout.to(device, non_blocking=True)
+    return tokens, segments
+
+
+def _to_host(rows: torch.Tensor) -> torch.Tensor:
+    """Queue a copy of ``rows`` into pinned host memory and return it without waiting.
+    The engine syncs each step's output before the request finishes."""
+    if not rows.is_cuda:
+        return rows
+    host = torch.empty(rows.shape, dtype=rows.dtype, pin_memory=True)
+    host.copy_(rows, non_blocking=True)
+    return host
+
+
+def _capture_rows(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """Store the requested rows of one layer: every or the selected positions, the sum of the
+    prompt rows for a mean, or the projections onto a registered direction set."""
+    runner = extension.model_runner
+    num_reqs = runner.input_batch.num_reqs
+    req_ids = runner.input_batch.req_ids
+    bounds: list[int] | None = None
+    # Full and position-selected captures: each request's batch rows.
+    picked: list[tuple[str, np.ndarray]] = []
+    pooled: list[tuple[str, int, int, int]] = []
+    projected: dict[str, list[tuple[str, int, int]]] = {}
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = runner.requests.get(req_id)
+        if req_state is None or req_state.sampling_params is None:
+            continue
+        extra = req_state.sampling_params.extra_args
+        if not extra or extra.get("output_residual_stream") is None:
+            continue
+        layers = decode_layers(extra["output_residual_stream"])
+        if layers is not None and layer_idx not in layers:
+            continue
+        if bounds is None:
+            bounds = _host_layout(runner, query_start_loc, num_reqs)
+        start, end = bounds[i], bounds[i + 1]
+        # Positions [first, ...) of the request are rows [start, ...) of this step.
+        first = req_state.num_computed_tokens
+        selector = extra.get(POSITIONS_KEY)
+        projection = extra.get("output_residual_stream_project")
+        # The front end validates these values.
+        if extra.get("output_residual_stream_pool") == "mean":
+            high = min(first + end - start, req_state.num_prompt_tokens)
+            if high > first:
+                pooled.append((req_id, start, start - first + high, first))
+                # The mean is the sum over the prompt divided at collection.
+                extension._pooled[req_id] = (
+                    hidden_states.dtype,
+                    req_state.num_prompt_tokens,
+                )
+        elif projection is not None:
+            projected.setdefault(projection, []).append((req_id, start, end))
+        elif selector is not None:
+            positions = positions_in_slice(
+                selector, first, end - start, req_state.num_prompt_tokens
+            )
+            extension._captured_positions.setdefault(req_id, {}).setdefault(
+                layer_idx, []
+            ).extend(positions)
+            picked.append(
+                (req_id, np.asarray(positions, dtype=np.int64) + start - first)
+            )
+        else:
+            picked.append((req_id, np.arange(start, end, dtype=np.int64)))
+
+    for projection, spans in projected.items():
+        directions = extension._direction_tables.get(projection)
+        if directions is None:
+            # The set was cleared while the requests ran.
+            logger.warning(
+                "No projection %r for requests %s; their capture is skipped",
+                projection,
+                [req_id for req_id, _, _ in spans],
+            )
+            continue
+        rows = torch.cat([hidden_states[start:end] for _, start, end in spans]).float()
+        # Each position is stored as its N projections and its norm, in float32.
+        host = _to_host(
+            torch.cat([rows @ directions.T, rows.norm(dim=-1, keepdim=True)], dim=1)
+        )
+        for (req_id, start, end), piece in zip(
+            spans, host.split([end - start for _, start, end in spans])
+        ):
+            extension._projections.add(req_id)
+            extension._captured_states.setdefault(req_id, {}).setdefault(
+                layer_idx, []
+            ).append(piece)
+    if pooled:
+        tokens, segments = _token_layout(
+            [(low, high) for _, low, high, _ in pooled],
+            list(range(len(pooled))),
+            hidden_states.device,
+        )
+        # The sums stay on the device until collection, so the hook does not wait for the GPU.
+        sums = torch.zeros(
+            (len(pooled), hidden_states.shape[-1]),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        ).index_add_(0, segments, hidden_states.index_select(0, tokens).float())
+        for row, (req_id, _, _, first) in enumerate(pooled):
+            total = sums[row : row + 1]
+            states = extension._captured_states.setdefault(req_id, {})
+            # A prefill from position 0 (also after a preemption) starts a new sum.
+            if first > 0 and layer_idx in states:
+                total = states[layer_idx][0] + total
+            states[layer_idx] = [total]
+    if picked:
+        index = torch.from_numpy(np.concatenate([rows for _, rows in picked]))
+        if hidden_states.is_cuda:
+            index = index.pin_memory()
+        host = _to_host(
+            hidden_states.index_select(
+                0, index.to(hidden_states.device, non_blocking=True)
+            )
+        )
+        for (req_id, _), piece in zip(
+            picked, host.split([len(rows) for _, rows in picked])
+        ):
+            extension._captured_states.setdefault(req_id, {}).setdefault(
+                layer_idx, []
+            ).append(piece)
+
+
 def _hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
@@ -690,41 +846,7 @@ def _hook_inner(
         else:
             hidden_states = capture_src
 
-        for i in range(num_reqs):
-            req_id = req_ids[i]
-            req_state = runner.requests.get(req_id)
-            if req_state is None or req_state.sampling_params is None:
-                continue
-            extra = req_state.sampling_params.extra_args
-            if not extra:
-                continue
-
-            output_residual_stream = extra.get("output_residual_stream")
-            if output_residual_stream is None:
-                continue
-            # vllm_xargs passes values as strings; parse JSON lists.
-            if isinstance(output_residual_stream, str):
-                try:
-                    output_residual_stream = json.loads(output_residual_stream)
-                except (json.JSONDecodeError, ValueError):
-                    pass  # treat as truthy (capture all layers)
-            if (
-                isinstance(output_residual_stream, list)
-                and layer_idx not in output_residual_stream
-            ):
-                continue
-
-            start, end = bounds[i], bounds[i + 1]
-            activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
-                start:end
-            ].cpu()
-
-            if req_id not in extension._captured_states:
-                extension._captured_states[req_id] = {}
-            layer_states = extension._captured_states[req_id]
-            if layer_idx not in layer_states:
-                layer_states[layer_idx] = []
-            layer_states[layer_idx].append(activation)
+        _capture_rows(extension, layer_idx, hidden_states, query_start_loc)
 
     return modified_output
 
@@ -943,16 +1065,10 @@ def _qk_hook_inner(
         if not extra:
             continue
 
-        output_qk = extra.get("output_qk")
-        if output_qk is None:
+        if extra.get("output_qk") is None:
             continue
-        # vllm_xargs passes values as strings; parse JSON lists.
-        if isinstance(output_qk, str):
-            try:
-                output_qk = json.loads(output_qk)
-            except (json.JSONDecodeError, ValueError):
-                pass  # treat as truthy (capture all layers)
-        if isinstance(output_qk, list) and layer_idx not in output_qk:
+        layers = decode_layers(extra["output_qk"])
+        if layers is not None and layer_idx not in layers:
             continue
 
         if bounds is None:
@@ -1036,6 +1152,16 @@ class HiddenStatesExtension:
         str,
         dict[int, list[Float[torch.Tensor, "seq_len hidden_dim"]]],  # type: ignore[reportUndefinedVariable]
     ] = {}
+    # Pooled capture: _captured_states holds one float32 sum row per layer.
+    # internal_req_id -> (capture dtype, divisor of the sum)
+    _pooled: dict[str, tuple[torch.dtype, int]] = {}
+    # Position-selected capture: the absolute position of each captured row.
+    # internal_req_id -> { layer_idx -> [position, ...] }
+    _captured_positions: dict[str, dict[int, list[int]]] = {}
+    # Projected capture: the internal ids whose rows hold projections and a norm.
+    _projections: set[str] = set()
+    # Registered direction sets by name.
+    _direction_tables: dict[str, torch.Tensor] = {}
     _hooks_installed: bool = False
 
     # Decoded steering and hook payloads by the hash of their bytes, with the number of
@@ -1078,6 +1204,10 @@ class HiddenStatesExtension:
         # Instance-level dicts: the class-level defaults are shared. _persistent_hooks is
         # kept, as set_persistent_hooks() may run before the first generate call.
         self._captured_states = {}
+        self._pooled = {}
+        self._captured_positions = {}
+        self._projections = set()
+        self._direction_tables = {}
         self._payloads = {}
         self._request_payloads = {}
         self._steer_table = None
@@ -1137,31 +1267,73 @@ class HiddenStatesExtension:
         """Drop the captures and hook contexts of ``external_ids``; None drops those of every
         request (a failed offline call)."""
         wanted = None if external_ids is None else set(external_ids)
-        for store in (self._captured_states, self._captured_qk, self._hook_contexts):
+        for store in (
+            self._captured_states,
+            self._pooled,
+            self._captured_positions,
+            self._captured_qk,
+            self._hook_contexts,
+        ):
             for req_id in list(store):
                 if wanted is None or req_id.rpartition("-")[0] in wanted:
                     del store[req_id]
+        self._projections = {
+            req_id
+            for req_id in self._projections
+            if wanted is not None and req_id.rpartition("-")[0] not in wanted
+        }
 
-    def _build_payload(
-        self, internal_req_id: str
-    ) -> dict[str, dict[str, "Float[torch.Tensor, 'n_layers total_pos hidden_dim']"]]:  # type: ignore[reportUndefinedVariable]
-        """Materialise the stacked-tensor payload for one internal request id.
+    # ------------------------------------------------------------------
+    # Projection directions (called via collective_rpc)
+    # ------------------------------------------------------------------
 
-        Pops the entry from ``_captured_states`` so successive calls do not
-        re-emit the same data. Shared by :meth:`get_captured_states` and
-        :meth:`get_captured_states_batch`.
-        """
+    def set_projection(self, name: str, payload: str) -> None:
+        """Hold the ``(N, hidden)`` directions of a ``serialize_tensor`` payload under
+        ``name``; requests name it in ``output_residual_stream_project``."""
+        # Installing the hooks resets the worker state, so it must come first.
+        self.install_hooks()
+        device = next(self.model_runner.model.parameters()).device
+        self._direction_tables[name] = deserialize_directions(payload).to(device)
+
+    def clear_projection(self, name: str | None) -> None:
+        """Drop the directions under ``name``; None drops every set."""
+        if name is None:
+            self._direction_tables = {}
+        else:
+            self._direction_tables.pop(name, None)
+
+    def _build_payload(self, internal_req_id: str) -> dict[str, dict[str, Any]]:
+        """Pop one internal request id's capture as host tensors: a pooled capture is one mean
+        row per layer in the capture dtype, a projected capture its scores and its norms, and a
+        position-selected capture one row per position in ascending order."""
         layer_dict = self._captured_states.pop(internal_req_id)
-        sorted_indices = sorted(layer_dict.keys())
-        per_layer: list[Float[torch.Tensor, "total_pos hidden_dim"]] = [  # type: ignore[reportUndefinedVariable]
-            torch.cat(layer_dict[idx], dim=0) for idx in sorted_indices
-        ]
-        stacked: Float[torch.Tensor, "n_layers total_pos hidden_dim"] = (  # type: ignore[reportUndefinedVariable]
-            torch.stack(per_layer, dim=0)
-        )
-        if stacked.is_cuda:
-            stacked = stacked.cpu()
-        return {"activations": {"residual_stream": stacked}}
+        pooled = self._pooled.pop(internal_req_id, None)
+        positions = self._captured_positions.pop(internal_req_id, None)
+        projected = internal_req_id in self._projections
+        self._projections.discard(internal_req_id)
+        layers = sorted(layer_dict)
+        if pooled is not None:
+            # Each layer holds one float32 sum row; divide to get the mean.
+            dtype, divisor = pooled
+            sums = torch.stack([layer_dict[layer][0] for layer in layers])
+            return {
+                "activations": {"residual_stream": (sums / divisor).to(dtype).cpu()}
+            }
+        stacked = torch.stack([torch.cat(layer_dict[layer]) for layer in layers])
+        activations: dict[str, Any] = {}
+        if positions is not None:
+            # A position computed twice (after a preemption) keeps its latest row.
+            ordered, keep = order_positions(positions[layers[0]])
+            if keep != list(range(stacked.shape[1])):
+                stacked = stacked[:, keep]
+            activations[POSITIONS_META_KEY] = ordered
+        if projected:
+            # Each row holds the N projections, then the norm.
+            activations["residual_stream_projection"] = stacked[..., :-1]
+            activations["residual_stream_norm"] = stacked[..., -1]
+        else:
+            activations["residual_stream"] = stacked
+        return {"activations": activations}
 
     def get_captured_states(self, external_req_id: str) -> bytes | None:
         """Retrieve captured activations for a specific request.

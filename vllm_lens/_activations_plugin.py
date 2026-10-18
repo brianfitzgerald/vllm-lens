@@ -26,7 +26,14 @@ import cloudpickle
 import torch
 import zstandard as zstd
 
+from vllm_lens._helpers._positions import (
+    POSITIONS_KEY,
+    POSITIONS_META_KEY,
+    normalize_capture_positions,
+)
 from vllm_lens._helpers._serialize import (
+    deserialize_directions,
+    serialize_tensor,
     serialize_activations,
     serialize_activations_binary,
     serialize_hook_results,
@@ -146,10 +153,20 @@ def _merge_captured_states(
     ]
     if not parts:
         return None
+    return _merge_rank_activations([p["activations"] for p in parts])
+
+
+def _merge_rank_activations(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Concatenate the tensors of each pipeline rank along the layer dim; the positions list
+    is the same on every rank."""
     if len(parts) == 1:
-        return parts[0]["activations"]
-    merged = torch.cat([p["activations"]["residual_stream"] for p in parts], dim=0)
-    return {"residual_stream": merged}
+        return parts[0]
+    return {
+        key: torch.cat([p[key] for p in parts])
+        if isinstance(value, torch.Tensor)
+        else value
+        for key, value in parts[0].items()
+    }
 
 
 def _merge_captured_states_batch(
@@ -182,14 +199,7 @@ def _merge_captured_states_batch(
         per_rank = [d[req_id] for d in rank_dicts if req_id in d]
         if not per_rank:
             continue
-        if len(per_rank) == 1:
-            out[req_id] = per_rank[0]["activations"]
-        else:
-            merged = torch.cat(
-                [p["activations"]["residual_stream"] for p in per_rank],
-                dim=0,
-            )
-            out[req_id] = {"residual_stream": merged}
+        out[req_id] = _merge_rank_activations([p["activations"] for p in per_rank])
     return out
 
 
@@ -312,6 +322,23 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
     return [h if isinstance(h, Hook) else Hook.model_validate(h) for h in value]
 
 
+def _check_directions(value: Any, hidden: int) -> str:
+    """The wire string of projection directions; ``ValueError`` unless they are finite
+    ``(N, hidden)``."""
+    payload = value if isinstance(value, str) else json.dumps(value)
+    directions = deserialize_directions(payload)
+    if (
+        directions.ndim != 2
+        or directions.shape[1] != hidden
+        or not torch.isfinite(directions).all()
+    ):
+        raise ValueError(
+            f"projection directions must be finite (N, {hidden}), "
+            f"got {tuple(directions.shape)}"
+        )
+    return payload
+
+
 def _trim_activations(
     activations: dict[str, Any],
     expected_len: int,
@@ -327,10 +354,22 @@ def _trim_activations(
     during that extra pass.  This trims the surplus positions so the
     residual stream shape is always deterministic.
     """
-    rs = activations.get("residual_stream")
-    if rs is not None and rs.shape[1] > expected_len:
-        activations["residual_stream"] = rs[:, :expected_len, :]
-    for key in ("attn_q", "attn_k"):
+    positions = activations.get(POSITIONS_META_KEY)
+    if positions is not None:
+        # Selected rows are sparse: a row of the extra pass is at or past expected_len.
+        keep = [
+            row for row, position in enumerate(positions) if position < expected_len
+        ]
+        if len(keep) < len(positions):
+            activations["residual_stream"] = activations["residual_stream"][:, keep]
+            activations[POSITIONS_META_KEY] = [positions[row] for row in keep]
+    for key in (
+        *(() if positions is not None else ("residual_stream",)),
+        "residual_stream_projection",
+        "residual_stream_norm",
+        "attn_q",
+        "attn_k",
+    ):
         t = activations.get(key)
         if t is not None and t.shape[1] > expected_len:
             activations[key] = t[:, :expected_len]
@@ -417,6 +456,31 @@ def _patched_process_inputs(
     for key in (STEERING_PAYLOAD, HOOKS_PAYLOAD, "activations_transport"):
         extra.pop(key, None)
     try:
+        pool = extra.get("output_residual_stream_pool")
+        if pool not in (None, "mean"):
+            raise ValueError(
+                f"output_residual_stream_pool must be 'mean', got {pool!r}"
+            )
+        project = extra.get("output_residual_stream_project")
+        normalize_capture_positions(extra)
+        chosen = [
+            key
+            for key, value in (
+                ("output_residual_stream_pool", pool),
+                ("output_residual_stream_project", project),
+                (POSITIONS_KEY, extra.get(POSITIONS_KEY)),
+            )
+            if value is not None
+        ]
+        if len(chosen) > 1:
+            raise ValueError(f"{' and '.join(chosen)} cannot be combined")
+        if project is not None and project not in getattr(
+            self, "_lens_projections", ()
+        ):
+            raise ValueError(
+                f"output_residual_stream_project names {project!r}, which is not "
+                "registered: register it with LLM.set_projection or POST /v1/projections"
+            )
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
         hooks = _decode_hooks(extra.pop("apply_hooks", None))
         n_layers = self.model_config.get_total_num_hidden_layers()
@@ -813,11 +877,12 @@ def _patched_register_routers(app):
     """Inject vllm-lens hook router after vLLM registers its own routes."""
     assert _original_register_routers is not None
     _original_register_routers(app)
-    from vllm_lens._hooks_router import activations_router
+    from vllm_lens._hooks_router import activations_router, projections_router
     from vllm_lens._hooks_router import router as hooks_router
 
     app.include_router(hooks_router)
     app.include_router(activations_router)
+    app.include_router(projections_router)
 
 
 # ---------------------------------------------------------------------------
@@ -838,6 +903,24 @@ def _llm_register_hooks(
     if prefetch_params:
         self.collective_rpc("prefetch_parameters", args=(prefetch_params,))
     self.llm_engine.input_processor._lens_persistent_hooks = True  # type: ignore[reportAttributeAccessIssue]
+
+
+def _llm_set_projection(self: LLM, name: str, directions: torch.Tensor) -> None:
+    """Hold ``(N, hidden)`` directions on the workers under ``name``, for requests that name
+    it in ``output_residual_stream_project``."""
+    processor = self.llm_engine.input_processor
+    hidden = processor.model_config.get_hidden_size()
+    payload = _check_directions(serialize_tensor(directions.float()), hidden)
+    self.collective_rpc("set_projection", args=(name, payload))
+    processor._lens_projections = {*getattr(processor, "_lens_projections", ()), name}  # type: ignore[reportAttributeAccessIssue]
+
+
+def _llm_clear_projection(self: LLM, name: str | None = None) -> None:
+    """Drop the directions under ``name``; None drops every set."""
+    processor = self.llm_engine.input_processor
+    self.collective_rpc("clear_projection", args=(name,))
+    held = getattr(processor, "_lens_projections", set())
+    processor._lens_projections = set() if name is None else held - {name}  # type: ignore[reportAttributeAccessIssue]
 
 
 def _llm_collect_hook_results(self: LLM) -> dict:
@@ -942,6 +1025,8 @@ def register() -> None:
     LLM.clear_hooks = _llm_clear_hooks  # type: ignore[reportAttributeAccessIssue]
     LLM.prefetch_params = _llm_prefetch_params  # type: ignore[reportAttributeAccessIssue]
     LLM.clear_prefetched = _llm_clear_prefetched  # type: ignore[reportAttributeAccessIssue]
+    LLM.set_projection = _llm_set_projection  # type: ignore[reportAttributeAccessIssue]
+    LLM.clear_projection = _llm_clear_projection  # type: ignore[reportAttributeAccessIssue]
 
     # Patch OpenAI-compatible response builders so activations survive
     # HTTP serialization.  Wrapped in try/except because these modules

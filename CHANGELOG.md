@@ -5,6 +5,10 @@
 - Plugin: The package logs through the `vllm.lens` logger, a child of vLLM's `vllm` logger, so vLLM's handler, format and `VLLM_LOGGING_LEVEL` apply. Before, its INFO records were dropped.
 - Plugin: Steered requests salt the prefix cache with the digest of their vectors, and hooked requests with their request id. Before, a steered prefill wrote KV blocks that a later unsteered request with the same prefix read. Steered requests now read the prefix cache of requests with the same vectors. A vector or hook payload over 2 GiB fails with an error, below msgspec's 4 GiB message limit.
 - Steering: The 2-D vectors of each distinct payload are summed once into a float32 row per layer, and each forward pass gives every token its request's row, so a steered layer does one gather. Position-specific vectors use rows written for the step. Behavior change: `norm_match` scales every vector on a layer by the norm of the unsteered stream; before, on layers without a fused residual, a second vector was scaled by the stream that already held the first.
+- Capture: Added `output_residual_stream_pool="mean"` (`capture_pool` on the client), which returns the mean over the prompt positions as one row per layer.
+- Capture: Added `output_residual_stream_positions` (`capture_positions` on the client), the selector of upstream #50: `"last_prompt_token"` or a list of absolute positions. The response carries `residual_stream_positions`.
+- Capture: Added `output_residual_stream_project` (`capture_project` on the client), which names a direction set registered with `LLM.set_projection(name, directions)`, `POST /v1/projections` or `VLLMLensClient.set_projection`. The worker returns the projection of every position onto the `(N, hidden)` directions and the norm of every position, in float32, in place of the residual. A request that names an unknown set fails before it reaches the engine.
+- Capture: A step's captured rows go to the host in one queued copy into pinned memory, mean rows are summed in one gather, and projections take one matmul per direction set, so the hooks do not wait for the GPU.
 
 ## v1.3.0 (2 October 2026)
 

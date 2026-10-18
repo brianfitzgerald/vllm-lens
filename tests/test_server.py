@@ -8,7 +8,13 @@ import json
 
 import requests
 import torch
-from vllm_lens import Hook, deserialize_hook_results, deserialize_tensor, SteeringVector
+from vllm_lens import (
+    Hook,
+    SteeringVector,
+    deserialize_hook_results,
+    deserialize_tensor,
+    serialize_tensor,
+)
 
 from .conftest import MODEL
 
@@ -34,6 +40,40 @@ def test_activation_extraction(vllm_server):
     rs = deserialize_tensor(resp["activations"]["residual_stream"])
     assert rs.ndim == 3
     assert rs.shape[2] == 4096  # Llama 8B hidden dim
+
+
+def test_projected_capture_matches_the_full_capture(vllm_server):
+    """The projections and norms equal those of the full capture of the same prompt."""
+    directions = torch.randn(2, 4096, generator=torch.Generator().manual_seed(0))
+
+    def capture(xargs: dict[str, str]) -> dict:
+        resp = requests.post(
+            f"{vllm_server}/v1/completions",
+            json={
+                "model": MODEL,
+                "prompt": "The future of AI is",
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "vllm_xargs": {"output_residual_stream": "[15]", **xargs},
+            },
+        ).json()
+        assert "error" not in resp, resp
+        return {name: deserialize_tensor(t) for name, t in resp["activations"].items()}
+
+    full = capture({})["residual_stream"][0].float()
+    registered = requests.post(
+        f"{vllm_server}/v1/projections",
+        json={"name": "server-test", "directions": serialize_tensor(directions)},
+    )
+    assert registered.status_code == 200, registered.text
+    projected = capture({"output_residual_stream_project": "server-test"})
+    requests.delete(f"{vllm_server}/v1/projections/server-test")
+    scores = projected["residual_stream_projection"][0]
+    norms = projected["residual_stream_norm"][0]
+    assert scores.dtype == norms.dtype == torch.float32
+    expected = full @ directions.T
+    assert ((scores - expected).norm() / expected.norm()).item() < 1e-4
+    assert ((norms - full.norm(dim=-1)).norm() / full.norm()).item() < 1e-4
 
 
 # ---------------------------------------------------------------------------
