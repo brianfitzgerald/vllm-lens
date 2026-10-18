@@ -1,13 +1,11 @@
 """Tests for capture under CUDA graphs via ``additional_config["vllm_lens"]``."""
 
 import gc
-import json
 
 import pytest
 import torch
 from vllm import LLM, SamplingParams
 
-from vllm_lens._helpers._serialize import serialize_tensor
 
 from .conftest import LONG_PROMPT, NUM_LAYERS, PROMPT, make_llm
 
@@ -49,9 +47,8 @@ def _capture(engine: LLM, layers: list[int] | bool, pool: str | None, max_tokens
     if pool == "project":
         hidden = engine.llm_engine.vllm_config.model_config.get_hidden_size()
         directions = torch.randn(2, hidden, generator=torch.Generator().manual_seed(0))
-        extra_args["output_residual_stream_project"] = json.dumps(
-            serialize_tensor(directions)
-        )
+        engine.set_projection("fixed", directions)  # type: ignore[attr-defined]
+        extra_args["output_residual_stream_project"] = "fixed"
     elif pool is not None:
         extra_args["output_residual_stream_pool"] = pool
     params = SamplingParams(

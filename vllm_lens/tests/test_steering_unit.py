@@ -174,7 +174,7 @@ def _fill(
         for i, v in enumerate(vectors)
     }
     extension.model_runner = SimpleNamespace(
-        input_batch=SimpleNamespace(num_reqs=len(keys), req_ids=list(requests)),
+        input_batch=SimpleNamespace(num_reqs=len(vectors), req_ids=list(requests)),
         requests=requests,
         query_start_loc=SimpleNamespace(np=np.array(bounds, dtype=np.int32)),
         model=torch.nn.Linear(1, 1),
