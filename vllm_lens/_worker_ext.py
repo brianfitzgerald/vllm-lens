@@ -35,6 +35,14 @@ from vllm_lens._helpers._positions import (
     positions_in_slice,
 )
 from vllm_lens._helpers._serialize import decode_layers, deserialize_directions
+from vllm_lens._helpers._transport import (
+    Packed,
+    PackEntry,
+    Segment,
+    pack_chunks,
+    shared_segment,
+    shared_size,
+)
 from vllm_lens._helpers.types import (
     HOOKS_PAYLOAD,
     STEERING_PAYLOAD,
@@ -1162,6 +1170,8 @@ class HiddenStatesExtension:
     _projections: set[str] = set()
     # Registered direction sets by name.
     _direction_tables: dict[str, torch.Tensor] = {}
+    # The memfd of the last batch collect, open until the caller has mapped it.
+    _segment_fd: int | None = None
     _hooks_installed: bool = False
 
     # Decoded steering and hook payloads by the hash of their bytes, with the number of
@@ -1208,6 +1218,7 @@ class HiddenStatesExtension:
         self._captured_positions = {}
         self._projections = set()
         self._direction_tables = {}
+        self._segment_fd = None
         self._payloads = {}
         self._request_payloads = {}
         self._steer_table = None
@@ -1266,6 +1277,7 @@ class HiddenStatesExtension:
     def clear_request_state(self, external_ids: list[str] | None) -> None:
         """Drop the captures and hook contexts of ``external_ids``; None drops those of every
         request (a failed offline call)."""
+        self._close_segment()
         wanted = None if external_ids is None else set(external_ids)
         for store in (
             self._captured_states,
@@ -1362,36 +1374,73 @@ class HiddenStatesExtension:
                 return _ZSTD_COMPRESSOR.compress(pickle.dumps(payload))
         return None
 
-    def get_captured_states_batch(self, external_req_ids: list[str]) -> bytes | None:
-        """Retrieve captured activations for many requests in one RPC.
+    def _close_segment(self) -> None:
+        """Close the memfd of the last batch collect; the caller's mapping keeps its memory."""
+        if self._segment_fd is not None:
+            os.close(self._segment_fd)
+            self._segment_fd = None
 
-        Equivalent to calling :meth:`get_captured_states` once per id, but
-        emits a single payload covering every request that has data. At
-        large batch sizes the per-request ``collective_rpc`` roundtrip is
-        the dominant cost on the offline ``LLM.generate`` path; batching it
-        cuts N round-trips to one.
-
-        Returns ``pickle.dumps({external_req_id: payload, ...})`` where
-        each ``payload`` is ``{"activations": {"residual_stream": Tensor}}``.
-        Missing or unmatched ids are simply absent; ``None`` if nothing
-        matched at all.
-
-        We deliberately don't ``zstd``-compress here: this RPC only fires
-        on the offline ``LLM.generate`` path, which is in-process IPC,
-        not HTTP. ``get_captured_states`` keeps zstd for the OpenAI/Inspect
-        path where the response crosses the network.
-        """
-        if not external_req_ids:
-            return None
-        out: dict[str, dict[str, Any]] = {}
+    def get_captured_states_batch(
+        self, external_req_ids: list[str]
+    ) -> tuple[Segment | None, Packed] | None:
+        """Pop the captures of ``external_req_ids`` into a new memfd that the caller maps
+        through ``/proc``, and return it with their index; None if there are none."""
+        self._close_segment()
         wanted = set(external_req_ids)
+        found: set[str] = set()
+        entries: list[PackEntry] = []
+        # An internal id is its external id, "-" and a suffix without "-".
         for req_id in list(self._captured_states):
             external_req_id = req_id.rpartition("-")[0]
-            if external_req_id in wanted and external_req_id not in out:
-                out[external_req_id] = self._build_payload(req_id)
-        if not out:
+            if external_req_id not in wanted or external_req_id in found:
+                continue
+            found.add(external_req_id)
+            plain = not (
+                req_id in self._pooled
+                or req_id in self._projections
+                or req_id in self._captured_positions
+            )
+            if plain:
+                # A full capture's per-step pieces go into the segment with no stacking copy.
+                layer_dict = self._captured_states.pop(req_id)
+                layers = sorted(layer_dict)
+                first = layer_dict[layers[0]]
+                shape = [
+                    len(layers),
+                    sum(p.shape[0] for p in first),
+                    first[0].shape[-1],
+                ]
+                pieces = [piece for layer in layers for piece in layer_dict[layer]]
+                entries.append(
+                    PackEntry(
+                        external_req_id,
+                        "residual_stream",
+                        first[0].dtype,
+                        shape,
+                        pieces,
+                    )
+                )
+                continue
+            for key, value in self._build_payload(req_id)["activations"].items():
+                tensor = (
+                    value
+                    if isinstance(value, torch.Tensor)
+                    else torch.tensor(value, dtype=torch.int64)
+                )
+                entries.append(
+                    PackEntry(
+                        external_req_id, key, tensor.dtype, list(tensor.shape), [tensor]
+                    )
+                )
+        if not entries:
             return None
-        return pickle.dumps(out, protocol=pickle.HIGHEST_PROTOCOL)
+        size = shared_size(entries)
+        if not size:
+            return None, pack_chunks(entries, None)
+        segment, region = shared_segment(size)
+        self._segment_fd = segment.fd
+        with region:
+            return segment, pack_chunks(entries, region)
 
     def _debug_captured_states_count(self) -> int:
         """Return the number of entries in _captured_states (for testing)."""

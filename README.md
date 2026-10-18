@@ -145,6 +145,8 @@ Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 onl
 
 Generation uses copies of the supplied `SamplingParams`, so they can be reused.
 
+The tensors of one offline call are views of one shared memory segment per rank, which is freed with the last of them; `clone()` a tensor to keep it alone. The offline collect needs every worker on the host and in the pid namespace of the `LLM` process.
+
 #### Binary transport for large captures
 
 By default activations come back base64-encoded inside the JSON response, which adds ~33% overhead on top of the zstd compression and materializes the whole blob in one piece on both ends. For large all-layer captures, pass `activations_transport="binary"` to fetch the raw bytes out-of-band instead:

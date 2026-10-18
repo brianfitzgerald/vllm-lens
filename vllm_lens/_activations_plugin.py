@@ -16,6 +16,7 @@ import copy
 import hashlib
 import json
 import logging
+import mmap
 import os
 import pickle
 from importlib.metadata import PackageNotFoundError, version
@@ -38,6 +39,7 @@ from vllm_lens._helpers._serialize import (
     serialize_activations_binary,
     serialize_hook_results,
 )
+from vllm_lens._helpers._transport import Packed, Segment, open_segment, unpack_payloads
 from vllm_lens._helpers.types import (
     HOOKS_PAYLOAD,
     STEERING_PAYLOAD,
@@ -170,36 +172,25 @@ def _merge_rank_activations(parts: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _merge_captured_states_batch(
-    states_per_rank: list[bytes | None] | None,
+    states_per_rank: list[Packed | None],
     external_req_ids: Sequence[str],
+    shared: Sequence[mmap.mmap | None],
 ) -> dict[str, dict[str, Any]]:
-    """Merge a batched ``get_captured_states_batch`` response across PP ranks.
-
-    Each rank returns either ``None`` or pickled bytes encoding
-    ``{external_req_id → {"activations": {"residual_stream": Tensor}}}``.
-
-    For PP > 1 we concatenate the per-id residual streams along dim 0 in
-    rank order — same convention as :func:`_merge_captured_states`, just
-    done per request.
-
-    The output is keyed by ``external_req_id`` and contains the inner
-    dict shape ``{"residual_stream": Tensor}`` that callers already
-    expect. Requests with no captured data (no rank emitted a payload
-    for that id) are simply absent from the returned dict.
-    """
-    if not states_per_rank:
-        return {}
+    """Merge each request's shared-memory captures in pipeline-rank order."""
     rank_dicts: list[dict[str, dict[str, Any]]] = [
-        _decode_rank_payload(s) for s in states_per_rank if s is not None
+        unpack_payloads(s, shared[rank])
+        for rank, s in enumerate(states_per_rank)
+        if s is not None
     ]
-    if not rank_dicts:
-        return {}
     out: dict[str, dict[str, Any]] = {}
     for req_id in external_req_ids:
         per_rank = [d[req_id] for d in rank_dicts if req_id in d]
         if not per_rank:
             continue
         out[req_id] = _merge_rank_activations([p["activations"] for p in per_rank])
+        positions = out[req_id].get(POSITIONS_META_KEY)
+        if positions is not None:
+            out[req_id][POSITIONS_META_KEY] = positions.tolist()
     return out
 
 
@@ -628,10 +619,18 @@ def _finalize_offline_outputs(self: LLM, outputs: list, flags: dict[str, bool]) 
     """Attach captured activations and hook results to offline outputs."""
     if flags["activations"]:
         req_ids = [output.request_id for output in outputs]
-        states_per_rank = self.collective_rpc(
-            "get_captured_states_batch", args=(req_ids,)
+        # Each rank writes its captures into a memfd that this process maps through /proc.
+        results = self.collective_rpc("get_captured_states_batch", args=(req_ids,))
+        states_per_rank: list[Packed | None] = []
+        regions: list[mmap.mmap | None] = []
+        for result in results:
+            segment, packed = result if result is not None else (None, None)
+            states_per_rank.append(packed)
+            # msgpack sends the NamedTuple as a list.
+            regions.append(open_segment(Segment(*segment)) if segment else None)
+        activations_by_id = _merge_captured_states_batch(
+            states_per_rank, req_ids, regions
         )
-        activations_by_id = _merge_captured_states_batch(states_per_rank, req_ids)
         for output in outputs:
             activations = activations_by_id.get(output.request_id)
             if activations is not None:

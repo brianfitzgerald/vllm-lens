@@ -98,6 +98,8 @@ def fake_extension(
         _captured_positions={},
         _projections=set(),
         _direction_tables=directions or {},
+        _segment_fd=None,
+        _close_segment=lambda: None,
     )
 
 
