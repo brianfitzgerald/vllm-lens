@@ -15,6 +15,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import mmap
 import os
 import pickle
 from importlib.metadata import PackageNotFoundError, version
@@ -26,10 +27,13 @@ import torch
 import zstandard as zstd
 
 from vllm_lens._helpers._serialize import (
+    deserialize_directions,
+    serialize_tensor,
     serialize_activations,
     serialize_activations_binary,
     serialize_hook_results,
 )
+from vllm_lens._helpers._transport import Packed, Segment, open_segment, unpack_payloads
 from vllm_lens._helpers.types import (
     HOOKS_PAYLOAD,
     STEERING_PAYLOAD,
@@ -144,35 +148,23 @@ def _merge_captured_states(
         return None
     if len(parts) == 1:
         return parts[0]["activations"]
-    merged = torch.cat([p["activations"]["residual_stream"] for p in parts], dim=0)
-    return {"residual_stream": merged}
+    return {
+        key: torch.cat([p["activations"][key] for p in parts], dim=0)
+        for key in parts[0]["activations"]
+    }
 
 
 def _merge_captured_states_batch(
-    states_per_rank: list[bytes | None] | None,
+    states_per_rank: list[Packed | None],
     external_req_ids: Sequence[str],
+    shared: Sequence[mmap.mmap | None],
 ) -> dict[str, dict[str, Any]]:
-    """Merge a batched ``get_captured_states_batch`` response across PP ranks.
-
-    Each rank returns either ``None`` or pickled bytes encoding
-    ``{external_req_id → {"activations": {"residual_stream": Tensor}}}``.
-
-    For PP > 1 we concatenate the per-id residual streams along dim 0 in
-    rank order — same convention as :func:`_merge_captured_states`, just
-    done per request.
-
-    The output is keyed by ``external_req_id`` and contains the inner
-    dict shape ``{"residual_stream": Tensor}`` that callers already
-    expect. Requests with no captured data (no rank emitted a payload
-    for that id) are simply absent from the returned dict.
-    """
-    if not states_per_rank:
-        return {}
+    """Merge each request's shared-memory captures in pipeline-rank order."""
     rank_dicts: list[dict[str, dict[str, Any]]] = [
-        _decode_rank_payload(s) for s in states_per_rank if s is not None
+        unpack_payloads(s, shared[rank])
+        for rank, s in enumerate(states_per_rank)
+        if s is not None
     ]
-    if not rank_dicts:
-        return {}
     out: dict[str, dict[str, Any]] = {}
     for req_id in external_req_ids:
         per_rank = [d[req_id] for d in rank_dicts if req_id in d]
@@ -181,11 +173,10 @@ def _merge_captured_states_batch(
         if len(per_rank) == 1:
             out[req_id] = per_rank[0]["activations"]
         else:
-            merged = torch.cat(
-                [p["activations"]["residual_stream"] for p in per_rank],
-                dim=0,
-            )
-            out[req_id] = {"residual_stream": merged}
+            out[req_id] = {
+                key: torch.cat([p["activations"][key] for p in per_rank], dim=0)
+                for key in per_rank[0]["activations"]
+            }
     return out
 
 
@@ -308,25 +299,35 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
     return [h if isinstance(h, Hook) else Hook.model_validate(h) for h in value]
 
 
+def _check_directions(value: Any, hidden: int) -> str:
+    """The wire string of projection directions; ``ValueError`` unless they are finite
+    ``(N, hidden)``."""
+    payload = value if isinstance(value, str) else json.dumps(value)
+    directions = deserialize_directions(payload)
+    if (
+        directions.ndim != 2
+        or directions.shape[1] != hidden
+        or not torch.isfinite(directions).all()
+    ):
+        raise ValueError(
+            f"projection directions must be finite (N, {hidden}), "
+            f"got {tuple(directions.shape)}"
+        )
+    return payload
+
+
 def _trim_activations(
     activations: dict[str, Any],
     expected_len: int,
 ) -> None:
-    """Trim residual stream activations and input_ids to the expected length.
-
-    The vLLM v1 scheduler may execute one extra forward pass after the EOS
-    stop condition is hit, because ``schedule()`` commits the next step
-    before ``update_from_output()`` checks stop conditions.  vLLM itself
-    discards the extra output tokens
-    (``vllm.v1.core.sched.scheduler.Scheduler.update_from_output`` skips
-    already-finished requests), but our activation capture hooks still fire
-    during that extra pass.  This trims the surplus positions so the
-    residual stream shape is always deterministic.
-    """
-    rs = activations.get("residual_stream")
-    if rs is not None and rs.shape[1] > expected_len:
-        activations["residual_stream"] = rs[:, :expected_len, :]
-    for key in ("attn_q", "attn_k"):
+    """Trim captured positions to the expected sequence length."""
+    for key in (
+        "residual_stream",
+        "residual_stream_projection",
+        "residual_stream_norm",
+        "attn_q",
+        "attn_k",
+    ):
         t = activations.get(key)
         if t is not None and t.shape[1] > expected_len:
             activations[key] = t[:, :expected_len]
@@ -413,6 +414,23 @@ def _patched_process_inputs(
     for key in (STEERING_PAYLOAD, HOOKS_PAYLOAD, "activations_transport"):
         extra.pop(key, None)
     try:
+        pool = extra.get("output_residual_stream_pool")
+        if pool not in (None, "last", "mean"):
+            raise ValueError(
+                f"output_residual_stream_pool must be 'last' or 'mean', got {pool!r}"
+            )
+        project = extra.get("output_residual_stream_project")
+        if project is not None:
+            if pool is not None:
+                raise ValueError(
+                    "output_residual_stream_project cannot be combined with "
+                    "output_residual_stream_pool"
+                )
+            if project not in getattr(self, "_lens_projections", ()):
+                raise ValueError(
+                    f"output_residual_stream_project names {project!r}, which is not "
+                    "registered: register it with LLM.set_projection or POST /v1/projections"
+                )
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
         hooks = _decode_hooks(extra.pop("apply_hooks", None))
         n_layers = self.model_config.get_total_num_hidden_layers()
@@ -544,10 +562,18 @@ def _finalize_offline_outputs(self: LLM, outputs: list, flags: dict[str, bool]) 
     """Attach captured activations and hook results to offline outputs."""
     if flags["activations"]:
         req_ids = [output.request_id for output in outputs]
-        states_per_rank = self.collective_rpc(
-            "get_captured_states_batch", args=(req_ids,)
+        # Each rank writes its captures into a memfd that this process maps through /proc.
+        results = self.collective_rpc("get_captured_states_batch", args=(req_ids,))
+        states_per_rank: list[Packed | None] = []
+        regions: list[mmap.mmap | None] = []
+        for result in results:
+            segment, packed = result if result is not None else (None, None)
+            states_per_rank.append(packed)
+            # msgpack sends the NamedTuple as a list.
+            regions.append(open_segment(Segment(*segment)) if segment else None)
+        activations_by_id = _merge_captured_states_batch(
+            states_per_rank, req_ids, regions
         )
-        activations_by_id = _merge_captured_states_batch(states_per_rank, req_ids)
         for output in outputs:
             activations = activations_by_id.get(output.request_id)
             if activations is not None:
@@ -793,11 +819,12 @@ def _patched_register_routers(app):
     """Inject vllm-lens hook router after vLLM registers its own routes."""
     assert _original_register_routers is not None
     _original_register_routers(app)
-    from vllm_lens._hooks_router import activations_router
+    from vllm_lens._hooks_router import activations_router, projections_router
     from vllm_lens._hooks_router import router as hooks_router
 
     app.include_router(hooks_router)
     app.include_router(activations_router)
+    app.include_router(projections_router)
 
 
 # ---------------------------------------------------------------------------
@@ -818,6 +845,24 @@ def _llm_register_hooks(
     if prefetch_params:
         self.collective_rpc("prefetch_parameters", args=(prefetch_params,))
     self.llm_engine.input_processor._lens_persistent_hooks = True  # type: ignore[reportAttributeAccessIssue]
+
+
+def _llm_set_projection(self: LLM, name: str, directions: torch.Tensor) -> None:
+    """Hold ``(N, hidden)`` directions on the workers under ``name``, for requests that name
+    it in ``output_residual_stream_project``."""
+    processor = self.llm_engine.input_processor
+    hidden = processor.model_config.get_hidden_size()
+    payload = _check_directions(serialize_tensor(directions.float()), hidden)
+    self.collective_rpc("set_projection", args=(name, payload))
+    processor._lens_projections = {*getattr(processor, "_lens_projections", ()), name}  # type: ignore[reportAttributeAccessIssue]
+
+
+def _llm_clear_projection(self: LLM, name: str | None = None) -> None:
+    """Drop the directions under ``name``; None drops every set."""
+    processor = self.llm_engine.input_processor
+    self.collective_rpc("clear_projection", args=(name,))
+    held = getattr(processor, "_lens_projections", set())
+    processor._lens_projections = set() if name is None else held - {name}  # type: ignore[reportAttributeAccessIssue]
 
 
 def _llm_collect_hook_results(self: LLM) -> dict:
@@ -922,6 +967,8 @@ def register() -> None:
     LLM.clear_hooks = _llm_clear_hooks  # type: ignore[reportAttributeAccessIssue]
     LLM.prefetch_params = _llm_prefetch_params  # type: ignore[reportAttributeAccessIssue]
     LLM.clear_prefetched = _llm_clear_prefetched  # type: ignore[reportAttributeAccessIssue]
+    LLM.set_projection = _llm_set_projection  # type: ignore[reportAttributeAccessIssue]
+    LLM.clear_projection = _llm_clear_projection  # type: ignore[reportAttributeAccessIssue]
 
     # Patch OpenAI-compatible response builders so activations survive
     # HTTP serialization.  Wrapped in try/except because these modules
