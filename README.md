@@ -68,23 +68,24 @@ VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 
 ## CUDA graphs
 
-Name the layers to capture in vLLM's `additional_config` under `vllm_lens` to keep compilation and CUDA graphs on:
+Name the layers to steer and capture in vLLM's `additional_config` under `vllm_lens` to keep compilation and CUDA graphs on:
 
 ```bash
 vllm serve meta-llama/Llama-3.1-8B-Instruct \
-  --additional-config '{"vllm_lens": {"capture_layers": [15, 20]}}'
+  --additional-config '{"vllm_lens": {"steer_layers": [18], "capture_layers": [15, 20]}}'
 ```
 
 Offline, pass `additional_config={"vllm_lens": {...}}` to `LLM(...)`.
 
-A forward hook on each named layer calls one custom op, `vllm_lens::capture`, which the compiler keeps inside the graph. The op copies the stream into a buffer of that layer; after each forward pass the plugin reads the rows of the requests that asked for them. The request format does not change. Tested on Qwen2.5 and Gemma2.
+Forward hooks on each named layer call custom ops that the compiler keeps inside the graph. `vllm_lens::steer` adds each token's row of the steering table, the same table eager mode uses, and `vllm_lens::capture` then copies the stream into a buffer of that layer. Before each forward pass the plugin writes the table row of every token into a fixed index buffer; after it, the plugin reads the captured rows of the requests that asked for them. Row 0 is zero, so requests with and without steering share a batch. The request format does not change. Tested on Qwen2.5 and Gemma2.
 
 Limits:
 
-- A capture layer that is not in the list, `output_residual_stream=True` (all layers), steering, hooks and Q/K capture fail with an error, as does the registration of a persistent hook.
+- A capture or steering layer that is not in the lists, `output_residual_stream=True` (all layers), hooks and Q/K capture fail with an error, as does the registration of a persistent hook.
 - The engine refuses to load with pipeline parallelism, micro-batching (DBO), sequence parallelism or breakable CUDA graphs, and a forward pass of more than `max_num_batched_tokens` tokens fails.
-- The buffers are allocated when the model loads, before vLLM sizes the KV cache: one `(max_num_batched_tokens, hidden_size)` buffer per captured layer, in the model dtype.
-- The layer list is part of vLLM's compile cache key, so each set gets its own compiled graph.
+- The buffers are allocated when the model loads, before vLLM sizes the KV cache: one `(max_num_batched_tokens, hidden_size)` buffer per captured layer in the model dtype, and two float32 `(1 + max_num_seqs + 512, hidden_size)` tables per steered layer.
+- The layer lists are part of vLLM's compile cache key, so each set gets its own compiled graph.
+- Position-specific vectors that target generated tokens have the speculative decoding limit of the Steering vectors section.
 
 ## Logging
 

@@ -1,5 +1,5 @@
-"""CUDA-graph mode on the worker: an op inside the graph copies the stream of each named
-layer into a fixed buffer of that layer, which the forward wrapper reads after the pass."""
+"""CUDA-graph mode on the worker: ops inside the graph steer each named layer from the
+steering row table and copy its stream into a fixed buffer, read after the pass."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from vllm_lens._worker_ext import (
     _capture_rows,
     _discover_layer_modules,
     _get_total_num_layers,
+    _steer,
+    _SteerTable,
 )
 
 logger = logging.getLogger("vllm.lens")
@@ -40,6 +42,38 @@ def _capture_fake(
 ) -> None:
     """Shape propagation only."""
     return None
+
+
+@torch.library.custom_op("vllm_lens::steer", mutates_args=("hidden_states",))
+def _steer_op(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    add: torch.Tensor,
+    norm: torch.Tensor,
+    rows: torch.Tensor,
+) -> None:
+    """Add each token's table row to the stream in place; row 0 steers nothing."""
+    _steer(hidden_states, residual, add, norm, rows)
+
+
+@_steer_op.register_fake
+def _steer_op_fake(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor | None,
+    add: torch.Tensor,
+    norm: torch.Tensor,
+    rows: torch.Tensor,
+) -> None:
+    """Shape propagation only."""
+    return None
+
+
+def _steer_hook(module: Any, args: Any, output: Any) -> None:
+    """Call the steer op on the layer output; Dynamo traces this body into the graph."""
+    hidden, residual = output if isinstance(output, tuple) else (output, None)
+    torch.ops.vllm_lens.steer(
+        hidden, residual, module._lens_add, module._lens_norm, module._lens_rows
+    )
 
 
 def _capture_hook(module: Any, args: Any, output: Any) -> None:
@@ -71,9 +105,8 @@ def install_graph_patches() -> None:
                 "but worker_extension_cls names another class."
             )
         n_layers = _get_total_num_layers(self)
-        outside = [
-            layer for layer in config.capture_layers if not 0 <= layer < n_layers
-        ]
+        named = (*config.capture_layers, *config.steer_layers)
+        outside = [layer for layer in named if not 0 <= layer < n_layers]
         if outside:
             raise ValueError(
                 f"additional_config['vllm_lens'] names layer(s) {outside}, but the "
@@ -107,6 +140,33 @@ def install_graph_patches() -> None:
         hidden = runner.model_config.get_hidden_size()
         dtype = runner.model_config.dtype
         device = next(runner.model.parameters()).device
+        if config.steer_layers:
+            # The op reads the eager table, allocated once so its address stays fixed.
+            table = self._steer_table = _SteerTable(
+                device=device,
+                hidden=hidden,
+                n_rows=1 + runner.scheduler_config.max_num_seqs,
+            )
+            rows = torch.zeros(max_tokens, dtype=torch.int32, device=device)
+            for layer_idx in config.steer_layers:
+                add, norm = table.layer(layer_idx)
+                layer = layer_map[layer_idx]
+                layer.register_buffer("_lens_add", add, persistent=False)
+                layer.register_buffer("_lens_norm", norm, persistent=False)
+                layer.register_buffer("_lens_rows", rows, persistent=False)
+                # Registered first, so a layer steers before it captures.
+                layer.register_forward_hook(_steer_hook)
+
+            def _fill_rows(plan: Any) -> None:
+                """Write each token's table row where the op reads it; padding takes row 0."""
+                # A graph capture must not record this write into the graph.
+                if torch.cuda.is_current_stream_capturing():
+                    return
+                rows.zero_()
+                if plan is not None:
+                    rows[: plan.rows.shape[0]].copy_(plan.rows)
+
+            self._on_steer_pass = _fill_rows
         buffers = {
             layer_idx: torch.zeros((max_tokens, hidden), dtype=dtype, device=device)
             for layer_idx in capture_layers
@@ -117,7 +177,8 @@ def install_graph_patches() -> None:
             )
             layer_map[layer_idx].register_forward_hook(_capture_hook)
         logger.info(
-            "CUDA-graph buffers: capture layers %s, %.0f MB",
+            "CUDA-graph mode: steer layers %s, capture layers %s, %.0f MB of capture buffers",
+            list(config.steer_layers),
             list(capture_layers),
             len(capture_layers) * max_tokens * hidden * dtype.itemsize / 2**20,
         )

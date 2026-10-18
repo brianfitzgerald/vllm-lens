@@ -13,8 +13,8 @@ def _config_hash(lens: dict[str, list[int]]) -> str:
 
 
 def test_each_layer_set_gets_its_own_compile_key():
-    """Two capture sets give two keys; the same set gives the same key."""
-    sets = [{"capture_layers": [2]}, {"capture_layers": [5]}]
+    """Two steer sets and a capture set give three keys; the same set gives the same key."""
+    sets = [{"steer_layers": [2]}, {"steer_layers": [5]}, {"capture_layers": [2]}]
     keys = [_config_hash(lens) for lens in sets]
-    assert len(set(keys)) == 2
+    assert len(set(keys)) == 3
     assert _config_hash(sets[0]) == keys[0]

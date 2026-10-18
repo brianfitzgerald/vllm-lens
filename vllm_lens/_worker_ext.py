@@ -1182,6 +1182,8 @@ class HiddenStatesExtension:
     # The steering rows of the stored payloads, and the steering of the current forward pass.
     _steer_table: _SteerTable | None = None
     _steer_pass: _SteerPass | None = None
+    # Called with each forward pass's steering plan; the CUDA-graph mode copies its rows.
+    _on_steer_pass: Callable[[_SteerPass | None], None] | None = None
 
     # Persistent hooks (apply to every request, not auto-cleaned):
     _persistent_hooks: list[Hook] = []
@@ -1252,6 +1254,8 @@ class HiddenStatesExtension:
                 # As for a bad hook: one request must not stop the engine.
                 logger.warning("Steering failed for this step", exc_info=True)
                 self._steer_pass = None
+            if self._on_steer_pass is not None:
+                self._on_steer_pass(self._steer_pass)
             try:
                 return model_forward(*args, **kwargs)
             finally:
