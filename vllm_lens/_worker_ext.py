@@ -374,45 +374,58 @@ def _apply_steering(
                 target[rel] = target[rel] + v * cfg.scale
 
 
+def _batch_layout(
+    runner: Any, *, warn: bool
+) -> Int[torch.Tensor, "num_reqs_plus1"] | None:  # type: ignore[reportUndefinedVariable]
+    """``query_start_loc`` of this forward pass, or None when there is nothing to act on.
+    With ``warn``, attention metadata without ``query_start_loc`` is logged."""
+    if not is_forward_context_available() or runner.input_batch.num_reqs == 0:
+        return None
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, list):
+        attn_metadata = attn_metadata[0] if attn_metadata else None
+    if attn_metadata is None:
+        return None
+    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have several metadata
+    # entries, and some (like GDNAttentionMetadata) lack query_start_loc.
+    for meta in attn_metadata.values():
+        query_start_loc = getattr(meta, "query_start_loc", None)
+        if query_start_loc is not None:
+            return query_start_loc
+    if warn:
+        logger.warning(
+            "No attention metadata with query_start_loc found "
+            "(keys: %s). Skipping hook for this step.",
+            list(attn_metadata.keys()),
+        )
+    return None
+
+
+def _host_layout(
+    runner: Any, query_start_loc: torch.Tensor, num_reqs: int
+) -> list[int]:
+    """``query_start_loc`` on the host: the runner's pinned copy when the forward pass uses the
+    runner's buffer, which needs no GPU sync; else a read of the device tensor."""
+    buffer = getattr(runner, "query_start_loc", None)
+    gpu = getattr(buffer, "gpu", None)
+    if gpu is not None and gpu.data_ptr() == query_start_loc.data_ptr():
+        return buffer.np[: num_reqs + 1].tolist()  # type: ignore[union-attr]
+    return query_start_loc[: num_reqs + 1].tolist()
+
+
 def _hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
     output: torch.Tensor | tuple[torch.Tensor, ...],
 ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
     """Core hook logic, separated so _make_hook can wrap it in try/except."""
-    if not is_forward_context_available():
-        return None
-
     runner = extension.model_runner
-    num_reqs = runner.input_batch.num_reqs
-    if num_reqs == 0:
-        return None
-
-    req_ids = runner.input_batch.req_ids
-
-    ctx = get_forward_context()
-    attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return None
-    if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return None
-    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
-    # attention metadata entries — some (like GDNAttentionMetadata) lack
-    # query_start_loc.  Find one that has it.
-    query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] | None = None  # type: ignore[reportUndefinedVariable]
-    for _meta in attn_metadata.values():
-        if hasattr(_meta, "query_start_loc"):
-            query_start_loc = getattr(_meta, "query_start_loc")
-            break
+    query_start_loc = _batch_layout(runner, warn=True)
     if query_start_loc is None:
-        logger.warning(
-            "No attention metadata with query_start_loc found "
-            "(keys: %s). Skipping hook for this step.",
-            list(attn_metadata.keys()),
-        )
         return None
+    num_reqs = runner.input_batch.num_reqs
+    req_ids = runner.input_batch.req_ids
+    bounds = _host_layout(runner, query_start_loc, num_reqs)
 
     # --- Phase 1: detect steering requests --------------------------
     per_req_steering: list[list[SteeringVector]] = []
@@ -443,8 +456,7 @@ def _hook_inner(
         for i in range(num_reqs):
             if not per_req_steering[i]:
                 continue
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
+            start, end = bounds[i], bounds[i + 1]
             # The absolute position of the first token of this forward pass.
             abs_start = runner.requests[req_ids[i]].num_computed_tokens
             _apply_steering(
@@ -519,8 +531,7 @@ def _hook_inner(
             if not (persistent_hooks or per_req_hooks[i]):
                 continue
             req_id = req_ids[i]
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
+            start, end = bounds[i], bounds[i + 1]
             # Persistent hooks fire first (base layer); per-request hooks
             # see the persistent-modified state.
             _run_post_category(
@@ -570,8 +581,7 @@ def _hook_inner(
             ):
                 continue
 
-            start = query_start_loc[i].item()
-            end = query_start_loc[i + 1].item()
+            start, end = bounds[i], bounds[i + 1]
             activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
                 start:end
             ].cpu()
@@ -592,30 +602,13 @@ def _pre_hook_inner(
     input_tensor: torch.Tensor,
 ) -> torch.Tensor | None:
     """Run generic pre-hooks on the layer input."""
-    if not is_forward_context_available():
-        return None
-
     runner = extension.model_runner
-    num_reqs = runner.input_batch.num_reqs
-    if num_reqs == 0:
-        return None
-
-    req_ids = runner.input_batch.req_ids
-    ctx = get_forward_context()
-    attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return None
-    if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return None
-    query_start_loc: torch.Tensor | None = None
-    for _meta in attn_metadata.values():
-        if hasattr(_meta, "query_start_loc"):
-            query_start_loc = getattr(_meta, "query_start_loc")
-            break
+    query_start_loc = _batch_layout(runner, warn=False)
     if query_start_loc is None:
         return None
+    num_reqs = runner.input_batch.num_reqs
+    req_ids = runner.input_batch.req_ids
+    bounds: list[int] | None = None
 
     # Pre-hooks share the same context stores as post-hooks, keyed by the
     # hook's position in its category list.  A hook at a given position is
@@ -662,8 +655,9 @@ def _pre_hook_inner(
         if not any(h.pre for h in persistent_hooks) and not any(h.pre for h in per_req):
             continue
 
-        start = int(query_start_loc[i].item())
-        end = int(query_start_loc[i + 1].item())
+        if bounds is None:
+            bounds = _host_layout(runner, query_start_loc, num_reqs)
+        start, end = bounds[i], bounds[i + 1]
         _run_pre_category(
             persistent_hooks, extension._persistent_hook_contexts, req_id, start, end
         )
@@ -796,6 +790,7 @@ def _qk_hook_inner(
         return
 
     req_ids = runner.input_batch.req_ids
+    bounds: list[int] | None = None
 
     # Inputs are (num_tokens, heads * head_size), post-RoPE (the model
     # applies rotary embeddings before calling the Attention wrapper);
@@ -827,8 +822,9 @@ def _qk_hook_inner(
         if isinstance(output_qk, list) and layer_idx not in output_qk:
             continue
 
-        start = int(query_start_loc[i].item())
-        end = int(query_start_loc[i + 1].item())
+        if bounds is None:
+            bounds = _host_layout(runner, query_start_loc, num_reqs)
+        start, end = bounds[i], bounds[i + 1]
 
         if req_id not in extension._captured_qk:
             extension._captured_qk[req_id] = {}
@@ -941,23 +937,10 @@ class HiddenStatesExtension:
     # layer index (scale, sliding window, soft-cap, ... — see install_qk_hooks).
     _qk_layer_meta: dict[int, dict[str, Any]] = {}
 
-    def install_hooks(self) -> None:
-        """Register a forward hook on every decoder layer. Idempotent.
-
-        Hooks are installed on **all** TP ranks because steering must
-        modify hidden states everywhere.  Activation *capture* is gated
-        to rank 0 only via ``_should_capture``.
-
-        Requires ``enforce_eager=True`` in engine args — otherwise
-        ``@support_torch_compile`` would compile the forward graph and
-        hooks won't fire.
-        """
-        if self._hooks_installed:
-            return
-        self._hooks_installed = True
-        # Reset to instance-level dicts (class-level defaults are shared).
-        # Do NOT reset _persistent_hooks — they may have been set via
-        # set_persistent_hooks() before the first generate call.
+    def _reset_state(self) -> None:
+        """Create the per-instance state and decide which rank captures."""
+        # Instance-level dicts: the class-level defaults are shared. _persistent_hooks is
+        # kept, as set_persistent_hooks() may run before the first generate call.
         self._captured_states = {}
         self._payloads = {}
         self._request_payloads = {}
@@ -971,13 +954,6 @@ class HiddenStatesExtension:
         tp_size = self.parallel_config.tensor_parallel_size
         self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
 
-        # Hooks must be installed on ALL ranks so steering vectors are
-        # applied everywhere (not just rank 0).
-        layer_map = _discover_layer_modules(self)
-        for layer_idx, layer in sorted(layer_map.items()):
-            layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
-            layer.register_forward_hook(_make_hook(self, layer_idx))
-
         # The runner calls this for every request that leaves it, finished or aborted.
         runner = self.model_runner
         removed = runner._on_request_state_removed
@@ -987,6 +963,20 @@ class HiddenStatesExtension:
             removed(req_id, req_state)
 
         runner._on_request_state_removed = _on_request_state_removed
+
+    def install_hooks(self) -> None:
+        """Install decoder-layer hooks on every rank and reset per-instance state once."""
+        if self._hooks_installed:
+            return
+        self._hooks_installed = True
+        self._reset_state()
+
+        # Hooks must be installed on ALL ranks so steering vectors are
+        # applied everywhere (not just rank 0).
+        layer_map = _discover_layer_modules(self)
+        for layer_idx, layer in sorted(layer_map.items()):
+            layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
+            layer.register_forward_hook(_make_hook(self, layer_idx))
 
     def clear_request_state(self, external_ids: list[str] | None) -> None:
         """Drop the captures and hook contexts of ``external_ids``; None drops those of every
