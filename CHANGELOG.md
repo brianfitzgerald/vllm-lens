@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Steering: Fixed `position_indices` during decode and chunked prefill: the start of each forward pass was always 0, so position 0 was steered again on every decode step and positions in later prefill chunks were never steered.
+
 ## v1.3.0 (2 October 2026)
 
 - Compatibility: Pin vLLM to the GPU-validated **0.30.0** release, with V1/eager execution. Add CPU regression CI and reproducible Slurm smoke/TP/PP suites; FP32 reference parity retains the 0.01 threshold and BF16 functional checks remain. See `docs/compatibility.md` for exact environments and coverage. (#39, #41)
