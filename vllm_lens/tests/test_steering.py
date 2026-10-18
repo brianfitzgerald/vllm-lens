@@ -279,6 +279,35 @@ class TestSteering:
         )
         assert steered.outputs[0].text == baseline_text
 
+    async def test_steered_prefix_is_not_reused_unsteered(self, vllm_model):
+        """An unsteered request must not read KV blocks that a steered prefill wrote."""
+        prompt = f"Prefix cache check. {LONG_PROMPT}"
+        capture = await _generate(
+            vllm_model,
+            PROMPT,
+            "salt-dim-probe",
+            max_tokens=1,
+            extra_args={"output_residual_stream": [LAYER_IDX]},
+        )
+        hidden_dim = capture.activations["residual_stream"].shape[-1]  # type: ignore[reportAttributeAccessIssue]
+        vectors = _make_steering_vector(hidden_dim, [LAYER_IDX], scale=10.0)
+        await _generate(
+            vllm_model,
+            prompt,
+            "salt-steered",
+            max_tokens=1,
+            extra_args={"apply_steering_vectors": vectors},
+        )
+        cached = await _generate(vllm_model, prompt, "salt-cached", max_tokens=20)
+        fresh = await _generate(
+            vllm_model,
+            prompt,
+            "salt-fresh",
+            max_tokens=20,
+            extra_args={"skip_reading_prefix_cache": True},
+        )
+        assert cached.outputs[0].token_ids == fresh.outputs[0].token_ids
+
     async def test_steering_with_capture(self, vllm_model):
         """Steering + capture: captured activations should reflect the
         steered hidden states (not the original)."""
