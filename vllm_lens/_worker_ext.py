@@ -560,11 +560,7 @@ def _pre_hook_inner(
     layer_idx: int,
     input_tensor: torch.Tensor,
 ) -> torch.Tensor | None:
-    """Run pre-hooks (hook.pre=True) on the layer input.
-
-    Only runs generic hooks — steering and activation capture are
-    post-hook operations and are not affected.
-    """
+    """Run generic pre-hooks on the layer input."""
     if not is_forward_context_available():
         return None
 

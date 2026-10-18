@@ -384,33 +384,20 @@ async def _patched_generate(
     request_id: str,
     **kwargs,
 ) -> AsyncIterator:
-    """Wrap generate to install hooks, apply steering, and attach activations.
-
-    On the first call that requests activations or steering, sends a
-    one-time RPC to install forward hooks on every decoder layer.
-
-    If ``apply_steering_vectors`` is present in ``extra_args``, the
-    steering data is sent to workers via RPC *before* generation starts
-    (tensors can't survive msgspec serialization in extra_args).
-
-    When generation finishes, retrieves the captured activations from
-    the worker and attaches them as ``output.activations``.
-    """
-    # In vLLM v1, the chat completion endpoint creates an
-    # EngineCoreRequest with a *cloned* SamplingParams before calling
-    # generate(). add_request() uses the clone from the
-    # EngineCoreRequest, ignoring the separately-passed sampling_params.
-    # We must read/modify the clone so our changes take effect.
-    effective_params = sampling_params
+    """Run generation with per-request capture, steering, and hooks."""
+    effective_params = copy.copy(sampling_params)
     try:
         from vllm.v1.engine import EngineCoreRequest
 
         if isinstance(prompt, EngineCoreRequest) and prompt.sampling_params is not None:  # type: ignore[reportAttributeAccessIssue]
-            effective_params = prompt.sampling_params  # type: ignore[reportAttributeAccessIssue]
+            prompt = copy.copy(prompt)
+            effective_params = copy.copy(prompt.sampling_params)  # type: ignore[reportAttributeAccessIssue]
+            prompt.sampling_params = effective_params  # type: ignore[reportAttributeAccessIssue]
     except ImportError:
         pass
 
-    extra = effective_params.extra_args or {}
+    extra = dict(effective_params.extra_args or {})
+    effective_params.extra_args = extra
     # The workers trust these sentinels, so a client must not send them.
     for sentinel in ("_steering_id", "_hook_id"):
         extra.pop(sentinel, None)
@@ -468,7 +455,7 @@ async def _patched_generate(
                 args=(request_id, cloudpickle.dumps(hooks_list)),
             )
         async for output in _original_generate(
-            self, prompt, sampling_params, request_id, **kwargs
+            self, prompt, effective_params, request_id, **kwargs
         ):
             if output.finished:
                 if wants_activations:
@@ -524,18 +511,7 @@ def _prepare_offline_params(
     self: LLM,
     sampling_params: SamplingParams | Sequence[SamplingParams] | None,
 ) -> dict[str, Any]:
-    """Shared pre-processing for the patched offline entry points.
-
-    Pops steering vectors and hooks from ``extra_args`` before vLLM
-    serialises the SamplingParams (tensors/callables don't survive
-    msgspec), decoding the JSON-string wire format where present.
-    Because the offline API auto-assigns request IDs internally, the
-    payloads are keyed by synthetic ``_steering_id`` / ``_hook_id``
-    sentinels stored in ``extra_args`` (lightweight strings that survive
-    msgspec serialization), then shipped to workers via RPC.
-
-    Returns the state dict consumed by :func:`_finalize_offline_outputs`.
-    """
+    """Copy sampling parameters and send steering and hook data to the workers."""
     if isinstance(sampling_params, Sequence):
         params_list = list(sampling_params)
     elif sampling_params is not None:
@@ -634,10 +610,7 @@ def _finalize_offline_outputs(
     outputs: list,
     state: dict[str, Any],
 ) -> list:
-    """Shared post-processing for the patched offline entry points.
-
-    Attaches captured activations and hook results to the outputs.
-    """
+    """Attach captured activations and hook results to offline outputs."""
     wants_activations = state["wants_activations"]
     wants_qk = state["wants_qk"]
     has_hooks = len(state["hook_payloads"]) > 0
@@ -716,11 +689,7 @@ def _patched_llm_generate(
     *args,
     **kwargs,
 ) -> list:
-    """Wrap ``LLM.generate`` to install hooks, apply steering, and attach activations.
-
-    Same logic as the async variant but for the synchronous offline API;
-    see :func:`_prepare_offline_params` for the mechanics.
-    """
+    """Run offline generation with capture, steering, and hooks."""
     assert _original_llm_generate is not None
     return _run_offline(
         self, _original_llm_generate, prompts, sampling_params, args, kwargs
@@ -734,15 +703,7 @@ def _patched_llm_chat(
     *args,
     **kwargs,
 ) -> list:
-    """Wrap ``LLM.chat`` to install hooks, apply steering, and attach activations.
-
-    ``LLM.chat`` does not route through ``LLM.generate`` (it renders the
-    conversation and submits to the engine directly), so it needs the
-    same treatment as :func:`_patched_llm_generate`.  On vLLM versions
-    where chat *does* delegate to ``LLM.generate``, the double
-    pre-processing is harmless: the inner call finds ``extra_args``
-    already stripped and the worker-side clear RPCs are idempotent.
-    """
+    """Run offline chat with capture, steering, and hooks."""
     assert _original_llm_chat is not None
     return _run_offline(
         self, _original_llm_chat, messages, sampling_params, args, kwargs
@@ -1002,25 +963,7 @@ def _configure_logging() -> None:
 
 
 def register() -> None:
-    """Entry point called by vLLM's plugin system at engine startup.
-
-    Patches ``EngineArgs.create_engine_config`` to inject the worker
-    extension and eager mode, ``AsyncLLM.generate``, ``LLM.generate``,
-    and ``LLM.chat`` to retrieve per-request activations for both online
-    and offline usage.  Also patches the OpenAI-compatible response
-    builders so activations are included in HTTP responses from
-    ``vllm serve``.
-
-    Use ``extra_args={"output_residual_stream": True | list[int]}`` in
-    SamplingParams to request activations.
-
-    Opt-out: set ``VLLM_LENS_DISABLE=1`` to make this a no-op. This plugin
-    auto-loads in *every* vLLM process via the ``vllm.general_plugins`` entry
-    point, and its patches force ``enforce_eager=True`` (disabling CUDA graphs)
-    on all engines. The kill switch lets vllm-lens be installed alongside a
-    trainer's inference server (e.g. prime-rl rollouts) without perturbing it.
-    Unset => unchanged default-on behaviour.
-    """
+    """Install the plugin unless VLLM_LENS_DISABLE is set."""
     if os.environ.get("VLLM_LENS_DISABLE", "").strip().lower() in (
         "1",
         "true",
