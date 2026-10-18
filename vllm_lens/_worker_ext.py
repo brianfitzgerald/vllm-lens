@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     from jaxtyping import Float, Int
     from vllm.config import ParallelConfig
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("vllm.lens")
 
 _DTYPE_LIST = [
     torch.float32,
