@@ -68,10 +68,10 @@ VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 
 ## Logging
 
-vLLM configures only its own `vllm` logger, so the plugin attaches a stderr handler to the `vllm_lens` logger when it has none, and turns off propagation for it, as vLLM does for `vllm`. With `VLLM_LENS_DISABLE=1` the plugin does not change logging. Set `VLLM_LENS_LOG_LEVEL` to change the level (default `INFO`; a value that is not a level name is ignored):
+The plugin logs through the `vllm.lens` logger, a child of vLLM's `vllm` logger, so vLLM's handler and format apply. `VLLM_LOGGING_LEVEL` sets the level, and `VLLM_LOGGING_CONFIG_PATH` can name a config file that sets `vllm.lens` alone:
 
 ```bash
-VLLM_LENS_LOG_LEVEL=DEBUG vllm serve meta-llama/Llama-3.1-8B-Instruct
+VLLM_LOGGING_LEVEL=DEBUG vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
 ## Examples

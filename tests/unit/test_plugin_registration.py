@@ -23,6 +23,9 @@ def serving_surface(monkeypatch):
         "vllm.v1.engine.async_llm": {
             "AsyncLLM": type("AsyncLLM", (), {"generate": original})
         },
+        "vllm.v1.engine.input_processor": {
+            "InputProcessor": type("InputProcessor", (), {"process_inputs": original})
+        },
         "vllm.entrypoints.openai.completion.serving": {
             "OpenAIServingCompletion": type(
                 "Completion", (), {"request_output_to_completion_response": original}
@@ -62,8 +65,6 @@ def serving_surface(monkeypatch):
     monkeypatch.delenv("VLLM_LENS_DISABLE", raising=False)
     monkeypatch.delenv("VLLM_LENS_STRICT_COMPATIBILITY", raising=False)
     monkeypatch.setattr(plugin, "version", lambda _: "test-version")
-    # Its own handler stops propagation, so caplog would not see the warnings.
-    monkeypatch.setattr(plugin, "_configure_logging", lambda: None)
     return modules
 
 

@@ -7,11 +7,12 @@ stream in-flight.
 Uses PyTorch forward hooks on each decoder layer for concurrency-safe,
 per-request activation capture and steering.  Each hook checks the
 request's ``extra_args["output_residual_stream"]`` to decide whether to
-capture, and reads from ``_steering_data`` to apply any steering vectors.
+capture, and decodes the request's steering vectors and hooks from its ``extra_args``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -26,13 +27,20 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_lens._helpers._hook_output import _replace_hook_output
-from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
+from vllm_lens._helpers.types import (
+    HOOKS_PAYLOAD,
+    STEERING_PAYLOAD,
+    Hook,
+    HookContext,
+    SteeringVector,
+)
 
 if TYPE_CHECKING:
     from jaxtyping import Float, Int
     from vllm.config import ParallelConfig
 
-logger = logging.getLogger(__name__)
+# A child of vLLM's logger, so vLLM's handler, format and VLLM_LOGGING_LEVEL apply.
+logger = logging.getLogger("vllm.lens")
 
 _DTYPE_LIST = [
     torch.float32,
@@ -227,31 +235,63 @@ def _get_total_num_layers(worker: Any) -> int:
     return int(worker.model_config.get_total_num_hidden_layers())
 
 
-def _steering_key(
-    extension: HiddenStatesExtension,
-    internal_req_id: str,
-    extra_args: dict[str, Any] | None,
-) -> str | None:
-    """The ``_steering_data`` key of a request, or None without vectors: the offline
-    ``_steering_id`` sentinel, else the external id (the internal id before its last ``-``)."""
-    key = (extra_args or {}).get("_steering_id")
-    if key is None:
-        key = internal_req_id.rpartition("-")[0]
-    return key if key in extension._steering_data else None
+def _decode_vectors(
+    extension: HiddenStatesExtension, raw: bytes
+) -> list[SteeringVector]:
+    """Unpickle a request's vectors onto the model device and dtype."""
+    param = next(extension.model_runner.model.parameters())
+    return [
+        sv.model_copy(
+            update={
+                "activations": sv.activations.to(device=param.device, dtype=param.dtype)
+            }
+        )
+        for sv in pickle.loads(raw)
+    ]
 
 
-def _request_hooks(
+def _request_payload(
     extension: HiddenStatesExtension,
-    internal_req_id: str,
-    extra_args: dict[str, Any] | None,
-) -> list[Hook]:
-    """The per-request hooks of a request: the offline ``_hook_id`` sentinel, else its
-    external id (the internal id before its last ``-``)."""
-    data = extension._hook_data
-    hook_id = extra_args.get("_hook_id") if extra_args else None
-    if hook_id is not None:
-        return data.get(hook_id, [])
-    return data.get(internal_req_id.rpartition("-")[0], [])
+    req_state: Any,
+    req_id: str,
+    key: str,
+) -> list:
+    """The decoded ``extra_args[key]`` payload of a request, or [] without one. Requests with
+    the same bytes share one decoded copy, held until the last of them leaves the runner."""
+    held = extension._request_payloads.get((key, req_id))
+    if held is None:
+        params = req_state.sampling_params if req_state is not None else None
+        raw = (params.extra_args or {}).get(key) if params is not None else None
+        if raw is None:
+            return []
+        held = hashlib.blake2b(raw, digest_size=16).digest()
+        entry = extension._payloads.get(held)
+        if entry is None:
+            try:
+                if key == STEERING_PAYLOAD:
+                    decoded = _decode_vectors(extension, raw)
+                else:
+                    decoded = cloudpickle.loads(raw)
+            except Exception:
+                # As for a bad hook: one request must not stop the engine.
+                logger.warning("Could not decode %s of %s", key, req_id, exc_info=True)
+                decoded = []
+            entry = extension._payloads[held] = [decoded, 0]
+        entry[1] += 1
+        extension._request_payloads[(key, req_id)] = held
+    return extension._payloads[held][0]
+
+
+def _release_payloads(extension: HiddenStatesExtension, req_id: str) -> None:
+    """Drop a finished request's hold on its decoded payloads."""
+    for key in (STEERING_PAYLOAD, HOOKS_PAYLOAD):
+        held = extension._request_payloads.pop((key, req_id), None)
+        if held is None:
+            continue
+        entry = extension._payloads[held]
+        entry[1] -= 1
+        if entry[1] == 0:
+            del extension._payloads[held]
 
 
 def norm_match(
@@ -379,14 +419,9 @@ def _hook_inner(
     needs_steering = False
     for i in range(num_reqs):
         req_id = req_ids[i]
-        req_state = runner.requests.get(req_id)
-        extra = (
-            req_state.sampling_params.extra_args
-            if req_state and req_state.sampling_params
-            else None
+        configs = _request_payload(
+            extension, runner.requests.get(req_id), req_id, STEERING_PAYLOAD
         )
-        key = _steering_key(extension, req_id, extra)
-        configs = extension._steering_data[key] if key is not None else []
         per_req_steering.append(configs)
         if configs:
             needs_steering = True
@@ -430,13 +465,9 @@ def _hook_inner(
     persistent_hooks = extension._persistent_hooks
     for i in range(num_reqs):
         req_id = req_ids[i]
-        req_state = runner.requests.get(req_id)
-        extra = (
-            req_state.sampling_params.extra_args
-            if req_state and req_state.sampling_params
-            else None
+        hooks = _request_payload(
+            extension, runner.requests.get(req_id), req_id, HOOKS_PAYLOAD
         )
-        hooks = _request_hooks(extension, req_id, extra)
         per_req_hooks.append(hooks)
         if hooks or persistent_hooks:
             needs_hooks = True
@@ -625,13 +656,9 @@ def _pre_hook_inner(
 
     for i in range(num_reqs):
         req_id = req_ids[i]
-        req_state = runner.requests.get(req_id)
-        extra = (
-            req_state.sampling_params.extra_args
-            if req_state and req_state.sampling_params
-            else None
+        per_req = _request_payload(
+            extension, runner.requests.get(req_id), req_id, HOOKS_PAYLOAD
         )
-        per_req = _request_hooks(extension, req_id, extra)
         if not any(h.pre for h in persistent_hooks) and not any(h.pre for h in per_req):
             continue
 
@@ -882,13 +909,11 @@ class HiddenStatesExtension:
     ] = {}
     _hooks_installed: bool = False
 
-    # Per-request steering configs:
-    # key (external_req_id or _steering_id) → list of SteeringVector
-    _steering_data: dict[str, list[SteeringVector]] = {}
-
-    # Per-request hook definitions:
-    # key (external_req_id or _hook_id) → list of Hook
-    _hook_data: dict[str, list[Hook]] = {}
+    # Decoded steering and hook payloads by the hash of their bytes, with the number of
+    # requests that hold each: digest -> [decoded, count].
+    _payloads: dict[bytes, list[Any]] = {}
+    # The digest each running request holds: (payload key, internal_req_id) -> digest.
+    _request_payloads: dict[tuple[str, str], bytes] = {}
 
     # Persistent hooks (apply to every request, not auto-cleaned):
     _persistent_hooks: list[Hook] = []
@@ -934,8 +959,8 @@ class HiddenStatesExtension:
         # Do NOT reset _persistent_hooks — they may have been set via
         # set_persistent_hooks() before the first generate call.
         self._captured_states = {}
-        self._steering_data = {}
-        self._hook_data = {}
+        self._payloads = {}
+        self._request_payloads = {}
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
             self._persistent_hooks = []
         self._hook_contexts = {}
@@ -953,52 +978,19 @@ class HiddenStatesExtension:
             layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
             layer.register_forward_hook(_make_hook(self, layer_idx))
 
-    # ------------------------------------------------------------------
-    # Steering data management (called via collective_rpc)
-    # ------------------------------------------------------------------
+        # The runner calls this for every request that leaves it, finished or aborted.
+        runner = self.model_runner
+        removed = runner._on_request_state_removed
 
-    def set_steering_data(self, key: str, pickled_data: bytes) -> None:
-        """Receive and store steering vectors for a request.
+        def _on_request_state_removed(req_id: str, req_state: Any) -> None:
+            _release_payloads(self, req_id)
+            removed(req_id, req_state)
 
-        Called via ``collective_rpc`` before generation begins.  Unpickles
-        the list of ``SteeringVector`` instances, validates layer indices
-        against the model, moves activation tensors to GPU in the model's
-        dtype, and stores them keyed by *key* (an external request ID or a
-        synthetic ``_steering_id``).
-        """
-        sv_list: list[SteeringVector] = pickle.loads(pickled_data)
+        runner._on_request_state_removed = _on_request_state_removed
 
-        device = next(self.model_runner.model.parameters()).device
-        dtype = next(self.model_runner.model.parameters()).dtype
-
-        num_layers = _get_total_num_layers(self)
-        vectors: list[SteeringVector] = []
-
-        for sv in sv_list:
-            for idx in sv.layer_indices:
-                if idx < 0 or idx >= num_layers:
-                    raise ValueError(
-                        f"layer_index {idx} out of range [0, {num_layers})"
-                    )
-
-            vectors.append(
-                sv.model_copy(
-                    update={
-                        "activations": sv.activations.to(device=device, dtype=dtype)
-                    }
-                )
-            )
-
-        self._steering_data[key] = vectors
-
-    def clear_request_state(
-        self, keys: list[str], external_ids: list[str] | None
-    ) -> None:
-        """Drop the steering and hook data under ``keys``, and the captures and hook contexts
-        of ``external_ids``; None drops those of every request (a failed offline call)."""
-        for key in keys:
-            self._steering_data.pop(key, None)
-            self._hook_data.pop(key, None)
+    def clear_request_state(self, external_ids: list[str] | None) -> None:
+        """Drop the captures and hook contexts of ``external_ids``; None drops those of every
+        request (a failed offline call)."""
         wanted = None if external_ids is None else set(external_ids)
         for store in (self._captured_states, self._captured_qk, self._hook_contexts):
             for req_id in list(store):
@@ -1317,28 +1309,6 @@ class HiddenStatesExtension:
     def _debug_captured_qk_count(self) -> int:
         """Return the number of entries in _captured_qk (for testing)."""
         return len(self._captured_qk)
-
-    # ------------------------------------------------------------------
-    # Hook data management (called via collective_rpc)
-    # ------------------------------------------------------------------
-
-    def set_hook_data(self, key: str, pickled_data: bytes) -> None:
-        """Receive and store hook definitions for a request.
-
-        Called via ``collective_rpc`` before generation begins.  Unpickles
-        the list of ``Hook`` instances (using cloudpickle for the callable
-        ``fn``), validates layer indices against the model, and stores them
-        keyed by *key* (an external request ID or ``_hook_id`` sentinel).
-        """
-        hooks: list[Hook] = cloudpickle.loads(pickled_data)
-        num_layers = _get_total_num_layers(self)
-        for hook in hooks:
-            for idx in hook.layer_indices:
-                if idx < 0 or idx >= num_layers:
-                    raise ValueError(
-                        f"layer_index {idx} out of range [0, {num_layers})"
-                    )
-        self._hook_data[key] = hooks
 
     def get_hook_results(self, external_req_id: str) -> bytes | None:
         """Retrieve hook results (``ctx.saved`` dicts) for a request.

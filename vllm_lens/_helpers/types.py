@@ -18,6 +18,10 @@ from pydantic import (
 
 from vllm_lens._helpers._serialize import deserialize_tensor, serialize_tensor
 
+# The extra_args keys of a request's pickled vectors and hooks. Only the front end sets them.
+STEERING_PAYLOAD = "_lens_steering"
+HOOKS_PAYLOAD = "_lens_hooks"
+
 
 class SteeringVector(BaseModel):
     """A steering vector that modifies the residual stream during inference.
