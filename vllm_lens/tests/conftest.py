@@ -8,6 +8,9 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=True)
 
+# A forked engine core can deadlock after torch CPU ops in this process.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 import pytest
 import ray
 import torch
