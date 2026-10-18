@@ -1,14 +1,4 @@
-"""
-Worker extension that captures residual-stream activations from
-configurable layers during transformer forward passes, and optionally
-applies steering vectors (activation additions) to modify the residual
-stream in-flight.
-
-Uses PyTorch forward hooks on each decoder layer for concurrency-safe,
-per-request activation capture and steering.  Each hook checks the
-request's ``extra_args["output_residual_stream"]`` to decide whether to
-capture, and decodes the request's steering vectors and hooks from its ``extra_args``.
-"""
+"""Capture and steer per-request residual streams in eager and CUDA graph modes."""
 
 from __future__ import annotations
 
@@ -1265,14 +1255,10 @@ class HiddenStatesExtension:
     # layer index (scale, sliding window, soft-cap, ... — see install_qk_hooks).
     _qk_layer_meta: dict[int, dict[str, Any]] = {}
 
-    def install_hooks(self) -> None:
-        """Install decoder-layer hooks on every rank and reset per-instance state once."""
-        if self._hooks_installed:
-            return
-        self._hooks_installed = True
-        # Reset to instance-level dicts (class-level defaults are shared).
-        # Do NOT reset _persistent_hooks — they may have been set via
-        # set_persistent_hooks() before the first generate call.
+    def _reset_state(self) -> None:
+        """Create the per-instance state and decide which rank captures."""
+        # Instance-level dicts: the class-level defaults are shared. _persistent_hooks is
+        # kept, as set_persistent_hooks() may run before the first generate call.
         self._captured_states = {}
         self._payloads = {}
         self._request_payloads = {}
@@ -1292,13 +1278,6 @@ class HiddenStatesExtension:
         tp_size = self.parallel_config.tensor_parallel_size
         self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
 
-        # Hooks must be installed on ALL ranks so steering vectors are
-        # applied everywhere (not just rank 0).
-        layer_map = _discover_layer_modules(self)
-        for layer_idx, layer in sorted(layer_map.items()):
-            layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
-            layer.register_forward_hook(_make_hook(self, layer_idx))
-
         # The runner calls this for every request that leaves it, finished or aborted.
         runner = self.model_runner
         removed = runner._on_request_state_removed
@@ -1308,6 +1287,20 @@ class HiddenStatesExtension:
             removed(req_id, req_state)
 
         runner._on_request_state_removed = _on_request_state_removed
+
+    def install_hooks(self) -> None:
+        """Install decoder-layer hooks on every rank and reset per-instance state once."""
+        if self._hooks_installed:
+            return
+        self._hooks_installed = True
+        self._reset_state()
+
+        # Hooks must be installed on ALL ranks so steering vectors are
+        # applied everywhere (not just rank 0).
+        layer_map = _discover_layer_modules(self)
+        for layer_idx, layer in sorted(layer_map.items()):
+            layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
+            layer.register_forward_hook(_make_hook(self, layer_idx))
 
     def clear_request_state(self, external_ids: list[str] | None) -> None:
         """Drop the captures and hook contexts of ``external_ids``; None drops those of every

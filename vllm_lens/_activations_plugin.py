@@ -13,6 +13,7 @@ per-request activations for both online (async) and offline (sync) usage.
 from __future__ import annotations
 
 import copy
+from dataclasses import asdict
 import json
 import logging
 import mmap
@@ -26,6 +27,7 @@ import cloudpickle
 import torch
 import zstandard as zstd
 
+from vllm_lens._cudagraph import CONFIG_KEY, LensGraphConfig
 from vllm_lens._helpers._serialize import (
     deserialize_directions,
     serialize_tensor,
@@ -342,17 +344,16 @@ def _trim_activations(
 
 
 def _patched_create_engine_config(self, *args, **kwargs):
-    """Patch for ``EngineArgs.create_engine_config``.
-
-    Injects our worker extension and forces eager mode *before* the
-    ``VllmConfig`` is built, so the settings propagate through any
-    engine creation path (``AsyncLLM.from_engine_args``,
-    ``AsyncLLM.from_vllm_config``, ``vllm serve``, etc.) including
-    across subprocess boundaries.
-    """
+    """Configure the worker extension and execution mode before engine creation."""
     if not self.worker_extension_cls:
         self.worker_extension_cls = _WORKER_EXT
-    self.enforce_eager = True
+    graph_config = LensGraphConfig.from_env()
+    self.enforce_eager = self.enforce_eager or not graph_config.enabled
+    if graph_config.enabled:
+        self.additional_config = {
+            **(self.additional_config or {}),
+            CONFIG_KEY: asdict(graph_config),
+        }
 
     # Our capture/steering hooks read V1 model-runner internals (input_batch,
     # requests). vLLM's V2 runner — the default for dense models on vLLM 0.23+ —
@@ -433,6 +434,9 @@ def _patched_process_inputs(
                 )
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
         hooks = _decode_hooks(extra.pop("apply_hooks", None))
+        graph_config = LensGraphConfig.from_vllm_config(self.vllm_config)
+        graph_config.reject_hooks(hooks or [], qk=extra.get("output_qk") is not None)
+        graph_config.reject_request(extra.get("output_residual_stream"), vectors)
         n_layers = self.model_config.get_total_num_hidden_layers()
         for item in (*(vectors or []), *(hooks or [])):
             outside = [idx for idx in item.layer_indices if not 0 <= idx < n_layers]
@@ -838,6 +842,7 @@ def _llm_register_hooks(
     prefetch_params: list[str] | None = None,
 ) -> None:
     """Register persistent hooks that apply to every subsequent request."""
+    LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config).reject_hooks(hooks)
     if not getattr(self, "_hooks_installed", False):
         self.collective_rpc("install_hooks")
         self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
@@ -1011,3 +1016,10 @@ def register() -> None:
         _serve_mod.register_vllm_serve_api_routers = _patched_register_routers
     except Exception as error:
         _report_integration_failure("hook and activation HTTP routes", error)
+
+    try:
+        from vllm_lens._graph_worker import install_graph_patches
+
+        install_graph_patches()
+    except ImportError:
+        logger.debug("No vLLM GPU worker; the CUDA-graph mode is not available.")
