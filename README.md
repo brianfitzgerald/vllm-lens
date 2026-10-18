@@ -68,11 +68,14 @@ VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
 
 ## CUDA graphs
 
-Name the layers to serve in `VLLM_LENS_CAPTURE_LAYERS` and `VLLM_LENS_STEER_LAYERS` to keep compilation and CUDA graphs on:
+Name the layers to serve in vLLM's `additional_config` under `vllm_lens` to keep compilation and CUDA graphs on:
 
 ```bash
-VLLM_LENS_STEER_LAYERS=18 VLLM_LENS_CAPTURE_LAYERS=15,20 vllm serve meta-llama/Llama-3.1-8B-Instruct
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --additional-config '{"vllm_lens": {"steer_layers": [18], "capture_layers": [15, 20]}}'
 ```
+
+Offline, pass `additional_config={"vllm_lens": {...}}` to `LLM(...)`.
 
 A forward hook on each named layer calls one custom op, `vllm_lens::lens`, which the compiler keeps inside the graph. The op adds the layer's steering rows to the stream, then copies the stream into a capture buffer. Before each forward pass the plugin writes every token's steering rows; after it, the plugin reads the captured rows of the requests that asked for them. Zero rows change nothing, so requests with and without steering share a batch. The request format does not change. Tested on Qwen2.5 and Gemma2.
 

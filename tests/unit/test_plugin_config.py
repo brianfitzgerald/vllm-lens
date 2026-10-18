@@ -24,11 +24,11 @@ def patched(monkeypatch):
     monkeypatch.delenv("TRITON_F32_DEFAULT", raising=False)
     monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
 
-    def run(dtype):
+    def run(dtype, additional_config=None):
         args = SimpleNamespace(
             worker_extension_cls=None,
             enforce_eager=False,
-            additional_config=None,
+            additional_config=additional_config,
             _cfg=_fake_config(dtype),
         )
         plugin._patched_create_engine_config(args)
@@ -66,33 +66,48 @@ def test_still_forces_eager_and_worker_ext(patched):
 
 
 @pytest.mark.parametrize(
-    ("env", "enforce_eager"),
+    ("lens", "enforce_eager"),
     [
-        ({}, True),
-        ({"VLLM_LENS_CAPTURE_LAYERS": "2"}, False),
-        ({"VLLM_LENS_STEER_LAYERS": "3"}, False),
+        (None, True),
+        ({"capture_layers": [2]}, False),
+        ({"steer_layers": [3]}, False),
+        ({"capture_layers": []}, True),
     ],
-    ids=["default", "capture-layers", "steer-layers"],
+    ids=["default", "capture-layers", "steer-layers", "empty"],
 )
-def test_a_layer_list_keeps_compilation_on(patched, monkeypatch, env, enforce_eager):
-    """A layer list leaves enforce_eager off and stores the settings for the workers."""
-    for name in ("VLLM_LENS_CAPTURE_LAYERS", "VLLM_LENS_STEER_LAYERS"):
-        monkeypatch.delenv(name, raising=False)
-    for name, value in env.items():
-        monkeypatch.setenv(name, value)
-    args = patched(torch.bfloat16)
+def test_a_layer_list_keeps_compilation_on(patched, lens, enforce_eager):
+    """A layer list in additional_config leaves enforce_eager off."""
+    args = patched(torch.bfloat16, None if lens is None else {CONFIG_KEY: lens})
     assert args.enforce_eager is enforce_eager
-    assert (CONFIG_KEY in (args.additional_config or {})) is not enforce_eager
-    assert LensGraphConfig.from_vllm_config(args) == LensGraphConfig.from_env()
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        ({"capture_layers": [5, 2, 2]}, LensGraphConfig(capture_layers=(2, 5))),
+        ({"steer_layers": ["3"]}, LensGraphConfig(steer_layers=(3,))),
+        ({"steer_layers": ["x"]}, None),
+        ({"layers": [1]}, None),
+    ],
+    ids=["sorted", "string-int", "not-a-layer", "unknown-key"],
+)
+def test_layer_lists_are_read_and_checked(stored, expected):
+    """Layer lists are sorted and deduplicated; anything else raises ValueError."""
+    config = SimpleNamespace(additional_config={CONFIG_KEY: stored})
+    if expected is None:
+        with pytest.raises(ValueError, match="lists of layer numbers"):
+            LensGraphConfig.from_vllm_config(config)
+    else:
+        assert LensGraphConfig.from_vllm_config(config) == expected
 
 
 @pytest.mark.parametrize(
     ("residual_stream", "steering", "match"),
     [
         ("[2]", None, None),
-        ("[5]", None, "VLLM_LENS_CAPTURE_LAYERS"),
+        ("[5]", None, "capture_layers"),
         ("true", None, "must be a list"),
-        (None, [4], "VLLM_LENS_STEER_LAYERS"),
+        (None, [4], "steer_layers"),
     ],
     ids=["served", "other-layer", "all-layers", "unsteered-layer"],
 )

@@ -27,26 +27,19 @@ async def sweeps() -> dict[str, pd.DataFrame]:
     """The oracle sweep of each mode; in eager mode, `unsteered` is the same sweep with
     scale 0, which shows that steering is what names the philosophers."""
     ao_config = load_ao_config(LORA_PATH)
-    env = {
-        "VLLM_LENS_CAPTURE_LAYERS": str(LAYER),
-        "VLLM_LENS_STEER_LAYERS": str(ao_config.hook_onto_layer),
-    }
+    lens = {"capture_layers": [LAYER], "steer_layers": [ao_config.hook_onto_layer]}
     frames: dict[str, pd.DataFrame] = {}
     for mode in MODES:
-        with pytest.MonkeyPatch.context() as patch:
-            for name, value in env.items():
-                patch.delenv(name, raising=False)
-                if mode == "cudagraph":
-                    patch.setenv(name, value)
-            engine = AsyncLLMEngine.from_engine_args(
-                AsyncEngineArgs(
-                    model=MODEL_NAME,
-                    enable_lora=True,
-                    max_lora_rank=64,
-                    max_model_len=4096,
-                    gpu_memory_utilization=0.4,
-                )
+        engine = AsyncLLMEngine.from_engine_args(
+            AsyncEngineArgs(
+                model=MODEL_NAME,
+                enable_lora=True,
+                max_lora_rank=64,
+                max_model_len=4096,
+                gpu_memory_utilization=0.4,
+                additional_config={"vllm_lens": lens} if mode == "cudagraph" else {},
             )
+        )
         assert engine.vllm_config.model_config.enforce_eager == (mode == "eager")
         tokenizer = engine.tokenizer
         prompt_ids = get_target_prompt_input_ids(TARGET_MESSAGES, tokenizer)  # type: ignore[arg-type]

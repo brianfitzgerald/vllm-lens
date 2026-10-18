@@ -102,21 +102,20 @@ def fake_extension(
     )
 
 
-def make_llm(env: dict[str, str], **kwargs):
-    """Start an offline engine with ``env`` set while its config is created."""
+def make_llm(lens: dict[str, list[int]] | None = None, **kwargs):
+    """Start an offline engine; ``lens`` is its ``additional_config["vllm_lens"]``."""
     from vllm import LLM
 
     kwargs.setdefault("gpu_memory_utilization", 0.2)
-    with pytest.MonkeyPatch.context() as patch:
-        for name, value in env.items():
-            patch.setenv(name, value)
-        return LLM(model=MODEL_NAME, dtype="auto", **kwargs)
+    if lens:
+        kwargs["additional_config"] = {"vllm_lens": lens}
+    return LLM(model=MODEL_NAME, dtype="auto", **kwargs)
 
 
 @pytest.fixture(scope="module")
 def eager_llm():
     """The reference of the CUDA-graph tests: forward hooks in eager mode."""
-    engine = make_llm({}, enable_prefix_caching=False)
+    engine = make_llm(enable_prefix_caching=False)
     yield engine
     del engine
     gc.collect()

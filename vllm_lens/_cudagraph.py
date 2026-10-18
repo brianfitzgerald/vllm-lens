@@ -1,9 +1,8 @@
-"""CUDA-graph mode settings: read from the environment, stored in ``additional_config``, and
-checked against each request before generation."""
+"""CUDA-graph mode settings, read from ``additional_config["vllm_lens"]`` and checked against
+each request before generation."""
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -29,37 +28,29 @@ class LensGraphConfig:
         return bool(self.capture_layers or self.steer_layers)
 
     @classmethod
-    def from_env(cls) -> LensGraphConfig:
-        """Read the ``VLLM_LENS_CAPTURE_LAYERS`` and ``VLLM_LENS_STEER_LAYERS`` lists."""
-        layers: dict[str, tuple[int, ...]] = {}
-        for name in ("VLLM_LENS_CAPTURE_LAYERS", "VLLM_LENS_STEER_LAYERS"):
-            parts = [
-                part for part in os.environ.get(name, "").split(",") if part.strip()
-            ]
-            try:
-                layers[name] = tuple(sorted({int(part) for part in parts}))
-            except ValueError:
-                raise ValueError(
-                    f"{name} must be a comma-separated list of layer numbers, "
-                    f"got {os.environ[name]!r}."
-                ) from None
-        return cls(
-            capture_layers=layers["VLLM_LENS_CAPTURE_LAYERS"],
-            steer_layers=layers["VLLM_LENS_STEER_LAYERS"],
-        )
-
-    @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> LensGraphConfig:
-        """Read the settings that the plugin stored under ``CONFIG_KEY``."""
+        """Read ``additional_config["vllm_lens"]`` of an ``EngineArgs`` or ``VllmConfig``:
+        ``{"capture_layers": [...], "steer_layers": [...]}``."""
         stored = (getattr(vllm_config, "additional_config", None) or {}).get(CONFIG_KEY)
-        return cls(**{key: tuple(value) for key, value in (stored or {}).items()})
+        try:
+            return cls(
+                **{
+                    key: tuple(sorted({int(layer) for layer in value}))
+                    for key, value in (stored or {}).items()
+                }
+            )
+        except (TypeError, ValueError):
+            raise ValueError(
+                f'additional_config["{CONFIG_KEY}"] must map capture_layers and '
+                f"steer_layers to lists of layer numbers, got {stored!r}."
+            ) from None
 
     def reject_hooks(self, hooks: list[Hook], qk: bool = False) -> None:
         """Raise ``ValueError`` for hooks or Q/K capture, which need the forward hooks."""
         if self.enabled and (hooks or qk):
             raise ValueError(
-                "The CUDA-graph mode (VLLM_LENS_*_LAYERS) is on, so the vllm-lens forward "
-                "hooks do not run: hooks and Q/K capture are not available. Unset the "
+                "The CUDA-graph mode (additional_config['vllm_lens']) is on, so the vllm-lens forward "
+                "hooks do not run: hooks and Q/K capture are not available. Remove the "
                 "layer lists to serve this request in eager mode."
             )
 
@@ -75,7 +66,7 @@ class LensGraphConfig:
         if unsteered:
             raise ValueError(
                 f"apply_steering_vectors names layer(s) {unsteered}, but this server "
-                f"steers only the layers in VLLM_LENS_STEER_LAYERS: {list(self.steer_layers)}."
+                f"steers only its steer_layers: {list(self.steer_layers)}."
             )
         if residual_stream is None:
             return
@@ -84,12 +75,12 @@ class LensGraphConfig:
         if layers is None:
             raise ValueError(
                 "In the CUDA-graph mode, output_residual_stream must be a list of layers "
-                f"from VLLM_LENS_CAPTURE_LAYERS: {list(self.capture_layers)}."
+                f"from its capture_layers: {list(self.capture_layers)}."
             )
         outside = sorted(set(layers) - set(self.capture_layers))
         if outside:
             raise ValueError(
                 f"output_residual_stream names layer(s) {outside}, but this server "
-                "captures only the layers in VLLM_LENS_CAPTURE_LAYERS: "
+                "captures only its capture_layers: "
                 f"{list(self.capture_layers)}."
             )

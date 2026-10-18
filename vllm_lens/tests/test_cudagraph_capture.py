@@ -1,4 +1,4 @@
-"""Tests for capture under CUDA graphs via ``VLLM_LENS_CAPTURE_LAYERS``."""
+"""Tests for capture under CUDA graphs via ``additional_config["vllm_lens"]``."""
 
 import gc
 import json
@@ -17,7 +17,7 @@ GRAPH_LAYERS = [0, 2, NUM_LAYERS - 1]
 @pytest.fixture(scope="module")
 def op_eager_llm():
     """The lens op with ``enforce_eager``: the kernels of ``eager_llm``."""
-    env = {"VLLM_LENS_CAPTURE_LAYERS": ",".join(map(str, GRAPH_LAYERS))}
+    env = {"capture_layers": GRAPH_LAYERS}
     engine = make_llm(env, enforce_eager=True, enable_prefix_caching=False)
     yield engine
     del engine
@@ -34,7 +34,7 @@ def graph_llm(request):
             "max_num_batched_tokens": request.param,
             "enable_chunked_prefill": True,
         }
-    env = {"VLLM_LENS_CAPTURE_LAYERS": ",".join(map(str, GRAPH_LAYERS))}
+    env = {"capture_layers": GRAPH_LAYERS}
     engine = make_llm(env, **kwargs)
     yield engine
     del engine
@@ -130,5 +130,5 @@ def test_graph_projection_matches_the_graph_capture(graph_llm, max_tokens):
 @pytest.mark.parametrize("layers", [[1], True], ids=["other-layer", "all-layers"])
 def test_an_unserved_capture_is_rejected(graph_llm, layers):
     """A layer outside the list, or "all layers", raises before generation."""
-    with pytest.raises(ValueError, match="VLLM_LENS_CAPTURE_LAYERS"):
+    with pytest.raises(ValueError, match="capture_layers"):
         _capture(graph_llm, layers, None, 1)

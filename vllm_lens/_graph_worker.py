@@ -179,14 +179,14 @@ def install_graph_patches() -> None:
             return result
         if not hasattr(self, "_reset_state"):
             raise RuntimeError(
-                "The VLLM_LENS_*_LAYERS variables need the vllm-lens worker extension, "
+                "additional_config['vllm_lens'] needs the vllm-lens worker extension, "
                 "but worker_extension_cls names another class."
             )
         n_layers = _get_total_num_layers(self)
         outside = [layer for layer in named if not 0 <= layer < n_layers]
         if outside:
             raise ValueError(
-                f"The VLLM_LENS_*_LAYERS variables name layer(s) {outside}, but the "
+                f"additional_config['vllm_lens'] names layer(s) {outside}, but the "
                 f"model has layers 0..{n_layers - 1}."
             )
         # Each of these splits or pads a forward pass in a way the buffers do not follow.
@@ -200,8 +200,8 @@ def install_graph_patches() -> None:
         for name, used in refused.items():
             if used:
                 raise RuntimeError(
-                    f"The VLLM_LENS_*_LAYERS variables do not support {name}. "
-                    "Unset them to use the eager forward hooks."
+                    f"The CUDA-graph mode does not support {name}. "
+                    "Remove additional_config['vllm_lens'] to use the eager forward hooks."
                 )
         # No request-level forward hooks: they cannot serve requests here.
         self._reset_state()

@@ -1,4 +1,4 @@
-"""Tests for steering under CUDA graphs via ``VLLM_LENS_STEER_LAYERS``."""
+"""Tests for steering under CUDA graphs via ``additional_config["vllm_lens"]``."""
 
 import gc
 
@@ -35,10 +35,7 @@ def hidden(eager_llm) -> int:
 @pytest.fixture(scope="module")
 def graph_llm():
     """CUDA graphs on, 64-token prefill chunks, steering and capture on one layer."""
-    env = {
-        "VLLM_LENS_STEER_LAYERS": str(STEER_LAYER),
-        "VLLM_LENS_CAPTURE_LAYERS": str(STEER_LAYER),
-    }
+    env = {"steer_layers": [STEER_LAYER], "capture_layers": [STEER_LAYER]}
     # Prefix caching off: a later request must not read the KV of a steered one.
     engine = make_llm(
         env,
@@ -174,9 +171,9 @@ def test_a_bad_vector_does_not_stop_the_engine(graph_llm, hidden):
 
 
 def test_a_layer_outside_the_list_is_rejected(graph_llm, hidden):
-    """A vector on a layer outside ``VLLM_LENS_STEER_LAYERS`` raises before generation."""
+    """A vector on a layer outside ``steer_layers`` raises before generation."""
     vector = SteeringVector(
         activations=torch.zeros(1, hidden), layer_indices=[STEER_LAYER + 1]
     )
-    with pytest.raises(ValueError, match="VLLM_LENS_STEER_LAYERS"):
+    with pytest.raises(ValueError, match="steer_layers"):
         _run(graph_llm, [[vector]])

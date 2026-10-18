@@ -13,7 +13,6 @@ per-request activations for both online (async) and offline (sync) usage.
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict
 import json
 import logging
 import mmap
@@ -27,7 +26,7 @@ import cloudpickle
 import torch
 import zstandard as zstd
 
-from vllm_lens._cudagraph import CONFIG_KEY, LensGraphConfig
+from vllm_lens._cudagraph import LensGraphConfig
 from vllm_lens._helpers._serialize import (
     deserialize_directions,
     serialize_tensor,
@@ -347,13 +346,10 @@ def _patched_create_engine_config(self, *args, **kwargs):
     """Configure the worker extension and execution mode before engine creation."""
     if not self.worker_extension_cls:
         self.worker_extension_cls = _WORKER_EXT
-    graph_config = LensGraphConfig.from_env()
-    self.enforce_eager = self.enforce_eager or not graph_config.enabled
-    if graph_config.enabled:
-        self.additional_config = {
-            **(self.additional_config or {}),
-            CONFIG_KEY: asdict(graph_config),
-        }
+    # Layer lists in additional_config["vllm_lens"] keep compilation and CUDA graphs on.
+    self.enforce_eager = (
+        self.enforce_eager or not LensGraphConfig.from_vllm_config(self).enabled
+    )
 
     # Our capture/steering hooks read V1 model-runner internals (input_batch,
     # requests). vLLM's V2 runner — the default for dense models on vLLM 0.23+ —
