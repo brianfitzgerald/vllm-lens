@@ -27,7 +27,9 @@ def received(monkeypatch: pytest.MonkeyPatch) -> list:
     monkeypatch.setattr(
         plugin,
         "_original_process_inputs",
-        lambda self, request_id, prompt, params, *a, **k: seen.append(params),
+        lambda self, request_id, prompt, params, *a, **k: (
+            seen.append(params) or SimpleNamespace(cache_salt=None)
+        ),
     )
     return seen
 
@@ -86,6 +88,48 @@ def test_process_inputs_skips_the_prefix_cache(
     plugin._patched_process_inputs(_processor(persistent), "r", "p", params)
     assert received[0].skip_reading_prefix_cache is skip
     assert "skip_reading_prefix_cache" not in (received[0].extra_args or {})
+
+
+@pytest.mark.parametrize(
+    ("extra", "persistent", "salt"),
+    [
+        ({}, False, None),
+        ({"output_residual_stream": [0]}, False, None),
+        ({"apply_steering_vectors": "same"}, False, "lens-steer:"),
+        ({"apply_hooks": True}, False, "lens-request:r"),
+        ({}, True, "lens-request:r"),
+    ],
+    ids=["none", "capture", "steer", "hooks", "persistent"],
+)
+def test_process_inputs_salts_changed_kv(
+    monkeypatch: pytest.MonkeyPatch, extra: dict, persistent: bool, salt: str | None
+) -> None:
+    """Steered or hooked requests write KV blocks only other requests like them can read."""
+    requests: list = []
+
+    def original(self, request_id, prompt, params, *args, **kwargs):
+        requests.append(SimpleNamespace(cache_salt="user"))
+        return requests[-1]
+
+    monkeypatch.setattr(plugin, "_original_process_inputs", original)
+    if extra.get("apply_steering_vectors"):
+        extra = {
+            "apply_steering_vectors": [
+                SteeringVector(activations=torch.ones(1, 4), layer_indices=[0])
+            ]
+        }
+    if extra.get("apply_hooks"):
+        extra = {"apply_hooks": [Hook(fn=lambda ctx, h: None, layer_indices=[0])]}
+    for _ in range(2):
+        params = SimpleNamespace(
+            extra_args=dict(extra), skip_reading_prefix_cache=False
+        )
+        plugin._patched_process_inputs(_processor(persistent), "r", "p", params)
+    first, second = (request.cache_salt for request in requests)
+    if salt is None:
+        assert first == "user"
+    else:
+        assert first.startswith(f"user|{salt}") and first == second
 
 
 def test_process_inputs_rejects_a_layer_out_of_range(received: list) -> None:

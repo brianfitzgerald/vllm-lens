@@ -13,6 +13,7 @@ per-request activations for both online (async) and offline (sync) usage.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -52,6 +53,9 @@ else:
 class LensRequestError(VLLMValidationError, ValueError):
     """A request vllm-lens cannot serve. vLLM passes it to the caller and HTTP returns 400."""
 
+
+# msgspec cannot encode a message of 4 GiB or more, so one payload is held below that.
+_MAX_PAYLOAD_BYTES = 2**31
 
 _ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 _ZSTD_DECOMPRESSOR = zstd.ZstdDecompressor()
@@ -434,19 +438,35 @@ def _patched_process_inputs(
         )
     if hooks is not None:
         extra[HOOKS_PAYLOAD] = cloudpickle.dumps(hooks)
+    for key in (STEERING_PAYLOAD, HOOKS_PAYLOAD):
+        if len(extra.get(key, b"")) > _MAX_PAYLOAD_BYTES:
+            raise LensRequestError(
+                f"The {key} payload is {len(extra[key]) / 2**30:.1f} GiB; "
+                f"one request can send at most {_MAX_PAYLOAD_BYTES / 2**30:.0f} GiB."
+            )
     params = copy.copy(params)
     params.extra_args = extra
     # Prefix-cached tokens skip the forward pass, so the hooks would not see them.
     if (
         extra.pop("skip_reading_prefix_cache", None)
-        or vectors is not None
         or hooks is not None
         or persistent
         or extra.get("output_residual_stream") is not None
         or extra.get("output_qk") is not None
     ):
         params.skip_reading_prefix_cache = True
-    return _original_process_inputs(self, request_id, prompt, params, *args, **kwargs)
+    request = _original_process_inputs(
+        self, request_id, prompt, params, *args, **kwargs
+    )
+    # Steered or hooked KV blocks are shared only with requests that steer the same way.
+    if hooks is not None or persistent:
+        salt = f"lens-request:{request_id}"
+    elif vectors is not None:
+        salt = f"lens-steer:{hashlib.blake2b(extra[STEERING_PAYLOAD], digest_size=16).hexdigest()}"
+    else:
+        return request
+    request.cache_salt = f"{request.cache_salt}|{salt}" if request.cache_salt else salt
+    return request
 
 
 def _lens_flags(extra: dict[str, Any] | None, persistent: bool) -> dict[str, bool]:

@@ -3,6 +3,7 @@
 - Steering: Fixed `position_indices` during decode and chunked prefill. The absolute start of each forward pass was always 0, so a position in a later prefill chunk was never steered, and position 0 was steered again on every decode step. The start now comes from the request's computed-token count, which does not depend on the attention backend.
 - Plugin: Steering vectors and hooks go to the workers inside a copy of the request's `extra_args`, set in one patch of vLLM's `InputProcessor.process_inputs` that every entry point uses. The workers decode each distinct payload once and free it when the last request that holds it leaves the model runner. This removes the `set_steering_data` and `set_hook_data` RPCs and the offline `_steering_id` and `_hook_id` sentinels. A layer index out of range now fails before the request reaches the engine (HTTP 400). The caller's `SamplingParams` are not changed, so a reused one keeps its vectors and hooks.
 - Plugin: The package logs through the `vllm.lens` logger, a child of vLLM's `vllm` logger, so vLLM's handler, format and `VLLM_LOGGING_LEVEL` apply. Before, its INFO records were dropped.
+- Plugin: Steered requests salt the prefix cache with the digest of their vectors, and hooked requests with their request id. Before, a steered prefill wrote KV blocks that a later unsteered request with the same prefix read. Steered requests now read the prefix cache of requests with the same vectors. A vector or hook payload over 2 GiB fails with an error, below msgspec's 4 GiB message limit.
 
 ## v1.3.0 (2 October 2026)
 
