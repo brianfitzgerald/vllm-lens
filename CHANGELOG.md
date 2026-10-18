@@ -4,6 +4,7 @@
 - Plugin: The package logs through the `vllm.lens` logger, a child of vLLM's `vllm` logger, so vLLM's handler, format and `VLLM_LOGGING_LEVEL` apply. Before, its INFO records were dropped.
 - Plugin: Generation uses copies of the supplied `SamplingParams`. Before, the entry points popped the vectors and hooks from the caller's `extra_args`, so a reused `SamplingParams` steered only its first call.
 - Plugin: Steered requests salt the prefix cache with a digest of their vectors and hooked requests with a fresh id, so an unsteered request no longer reads KV blocks a steered prefill wrote, and requests with the same vectors share the cache.
+- Steering: Each request's 2-D vectors are summed once into a float32 row per layer. Behavior change: `norm_match` scales by the norm of the unsteered stream.
 
 ## v1.3.0 (2 October 2026)
 
