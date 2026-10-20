@@ -11,6 +11,7 @@
 - Capture: Added `output_residual_stream_pool="mean"` (`capture_pool` on the client), which returns the mean over the prompt positions as one row per layer.
 - Capture: Added `output_residual_stream_positions` (`capture_positions` on the client), `"last_prompt_token"` or a list of absolute positions. The response carries `residual_stream_positions`. With async speculative decoding, a list of positions fails at submission.
 - Capture: Added `output_residual_stream_project` (`capture_project` on the client), which names a direction set registered with `LLM.set_projection(name, directions)`, `POST /v1/projections` or `VLLMLensClient.set_projection`. The response holds the per-position projections and norms in float32 in place of the residual.
+- Plugin: Added a CUDA-graph mode for capture: `capture_layers` in `additional_config["vllm_lens"]` keeps compilation and CUDA graphs on and captures those layers through the custom op `vllm_lens::capture`. Steering, hooks, Q/K capture and layers outside the list are rejected.
 
 ## v1.3.0 (2 October 2026)
 

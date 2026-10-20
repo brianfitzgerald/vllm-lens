@@ -99,6 +99,38 @@ def fake_extension(
     )
 
 
+def lens_engine(lens: dict[str, list[int]] | None = None, **kwargs):
+    """A module fixture's offline engine, freed after; ``lens`` is its
+    ``additional_config["vllm_lens"]``."""
+    from vllm import LLM
+
+    kwargs.setdefault("gpu_memory_utilization", 0.2)
+    # Few graph sizes, so each engine start captures fewer graphs.
+    kwargs.setdefault(
+        "compilation_config", {"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64]}
+    )
+    if lens:
+        kwargs["additional_config"] = {"vllm_lens": lens}
+    engine = LLM(model=MODEL_NAME, dtype="auto", **kwargs)
+    yield engine
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def relative_errors(actual: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+    """``||actual - expected|| / ||expected||`` per leading index, in float32."""
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    diff = (actual.float() - expected.float()).flatten(1).norm(dim=1)
+    return diff / expected.float().flatten(1).norm(dim=1)
+
+
+@pytest.fixture(scope="module")
+def eager_llm():
+    """The reference of the CUDA-graph tests: forward hooks in eager mode."""
+    yield from lens_engine(enable_prefix_caching=False)
+
+
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_vllm():
     yield
