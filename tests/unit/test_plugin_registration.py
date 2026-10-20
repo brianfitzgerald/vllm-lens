@@ -42,6 +42,15 @@ def serving_surface(monkeypatch):
             )
         },
         "vllm.entrypoints.serve": {"register_vllm_serve_api_routers": original},
+        "vllm.v1.worker.gpu_worker": {
+            "Worker": type("Worker", (), {"load_model": original})
+        },
+        "vllm.envs": {"VLLM_USE_BREAKABLE_CUDAGRAPH": False},
+        "vllm.forward_context": {
+            "get_forward_context": original,
+            "is_forward_context_available": original,
+        },
+        "vllm.model_executor.models.utils": {"PPMissingLayer": type("PP", (), {})},
     }
     modules = {}
     for name, attributes in surfaces.items():
@@ -65,7 +74,12 @@ def serving_surface(monkeypatch):
     monkeypatch.delenv("VLLM_LENS_DISABLE", raising=False)
     monkeypatch.delenv("VLLM_LENS_STRICT_COMPATIBILITY", raising=False)
     monkeypatch.setattr(plugin, "version", lambda _: "test-version")
-    return modules
+    loaded = set(sys.modules)
+    yield modules
+    # The worker modules imported against this surface must not serve later tests.
+    for name in set(sys.modules) - loaded:
+        if name.startswith("vllm_lens."):
+            del sys.modules[name]
 
 
 @pytest.mark.parametrize("strict", [False, True])
