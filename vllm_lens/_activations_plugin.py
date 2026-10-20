@@ -291,10 +291,16 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
 
 
 def _check_capture_options(extra: dict[str, Any]) -> None:
-    """Parse the layer list that ``vllm_xargs`` passes as a JSON string."""
+    """Parse the layer list that ``vllm_xargs`` passes as a JSON string, and raise
+    ``ValueError`` for a bad pool value or a pool without ``output_residual_stream``."""
     layers = extra.get("output_residual_stream")
     if isinstance(layers, str):
         extra["output_residual_stream"] = json.loads(layers)
+    pool = extra.get("output_residual_stream_pool")
+    if pool not in (None, "mean"):
+        raise ValueError(f"output_residual_stream_pool must be 'mean', got {pool!r}")
+    if pool is not None and extra.get("output_residual_stream") is None:
+        raise ValueError("output_residual_stream_pool requires output_residual_stream")
 
 
 def _trim_activations(
