@@ -13,6 +13,7 @@
 - Capture: Added `output_residual_stream_project` (`capture_project` on the client), which names a direction set registered with `LLM.set_projection(name, directions)`, `POST /v1/projections` or `VLLMLensClient.set_projection`. The response holds the per-position projections and norms in float32 in place of the residual.
 - Plugin: Added a CUDA-graph mode for capture: `capture_layers` in `additional_config["vllm_lens"]` keeps compilation and CUDA graphs on and captures those layers through the custom op `vllm_lens::capture`. Hooks, Q/K capture and layers outside the lists are rejected.
 - Plugin: The CUDA-graph mode also steers: `steer_layers` in `additional_config["vllm_lens"]` applies fixed token buffers through the custom op `vllm_lens::steer`. The buffers are filled before each pass, without a limit on selected positions beyond the batch size.
+- Plugin: The eager hooks skip a layer that no batched request captures, steers or hooks; before, every layer scanned the batch twice per forward pass.
 
 ## v1.3.0 (2 October 2026)
 
