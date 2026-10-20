@@ -32,6 +32,7 @@ from vllm_lens._helpers._positions import (
     POSITIONS_KEY,
     POSITIONS_META_KEY,
 )
+from vllm_lens._helpers._serialize import deserialize_tensor
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
@@ -426,8 +427,8 @@ def _capture_rows(
     hidden_states: torch.Tensor,
     query_start_loc: torch.Tensor,
 ) -> None:
-    """Store the requested rows of one layer: every or the selected positions, or the sum of
-    the prompt rows for a mean."""
+    """Store the requested rows of one layer: every or the selected positions, the sum of the
+    prompt rows for a mean, or the projections onto a registered direction set."""
     runner = extension.model_runner
     num_reqs = runner.input_batch.num_reqs
     req_ids = runner.input_batch.req_ids
@@ -435,6 +436,8 @@ def _capture_rows(
     # Full and position-selected captures: each request's batch rows.
     picked: list[tuple[str, np.ndarray]] = []
     pooled: list[tuple[str, int, int, int]] = []
+    # Spans keyed by the id of their directions, so one matmul serves each set.
+    projected: dict[int, tuple[torch.Tensor, list[tuple[str, int, int]]]] = {}
     for i in range(num_reqs):
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
@@ -459,6 +462,7 @@ def _capture_rows(
         # Positions [first, ...) of the request are rows [start, ...) of this step.
         first = req_state.num_computed_tokens
         selector = extra.get(POSITIONS_KEY)
+        projection = extra.get("output_residual_stream_project")
         # The front end validates these values.
         if extra.get("output_residual_stream_pool") == "mean":
             high = min(first + end - start, req_state.num_prompt_tokens)
@@ -469,6 +473,22 @@ def _capture_rows(
                     hidden_states.dtype,
                     req_state.num_prompt_tokens,
                 )
+        elif projection is not None:
+            # The set as it was at the request's first capture, if it is still there.
+            directions = extension._projections.get(req_id)
+            if directions is None:
+                directions = extension._direction_tables.get(projection)
+                if directions is None:
+                    logger.warning(
+                        "No projection %r for request %s; its capture is skipped",
+                        projection,
+                        req_id,
+                    )
+                    continue
+                extension._projections[req_id] = directions
+            projected.setdefault(id(directions), (directions, []))[1].append(
+                (req_id, start, end)
+            )
         elif selector is not None:
             n_prompt = req_state.num_prompt_tokens
             wanted = [n_prompt - 1] if selector == LAST_PROMPT_TOKEN else selector
@@ -482,6 +502,18 @@ def _capture_rows(
         else:
             picked.append((req_id, np.arange(start, end, dtype=np.int64)))
 
+    for directions, spans in projected.values():
+        rows = torch.cat([hidden_states[start:end] for _, start, end in spans]).float()
+        # Each position is stored as its N projections and its norm, in float32.
+        host = _to_host(
+            torch.cat([rows @ directions.T, rows.norm(dim=-1, keepdim=True)], dim=1)
+        )
+        for (req_id, start, end), piece in zip(
+            spans, host.split([end - start for _, start, end in spans])
+        ):
+            extension._captured_states.setdefault(req_id, {}).setdefault(
+                layer_idx, []
+            ).append(piece)
     if pooled:
         # The batch row of every prompt token and its request, in one pinned copy.
         layout = torch.from_numpy(
@@ -980,6 +1012,10 @@ class HiddenStatesExtension:
     # captured layer records the same positions; _build_payload reads the first.
     # internal_req_id -> { layer_idx -> [position, ...] }
     _captured_positions: dict[str, dict[int, list[int]]] = {}
+    # Projected capture: each internal id's directions, as they were at its first capture.
+    _projections: dict[str, torch.Tensor] = {}
+    # Registered direction sets by name.
+    _direction_tables: dict[str, torch.Tensor] = {}
     _hooks_installed: bool = False
 
     # Prepared steering by request key and layer.
@@ -1038,6 +1074,8 @@ class HiddenStatesExtension:
         self._captured_states = {}
         self._pooled = {}
         self._captured_positions = {}
+        self._projections = {}
+        self._direction_tables = {}
         self._steering_data = {}
         self._hook_data = {}
         self._steer_pass = None
@@ -1149,11 +1187,35 @@ class HiddenStatesExtension:
         the entry.
         """
         prefix = f"{external_req_id}-"
-        for store in (self._captured_states, self._pooled, self._captured_positions):
+        for store in (
+            self._captured_states,
+            self._pooled,
+            self._captured_positions,
+            self._projections,
+        ):
             for req_id in list(store):
                 if req_id.startswith(prefix):
                     del store[req_id]
                     logger.debug("Cleared leaked activations for %s", req_id)
+
+    # ------------------------------------------------------------------
+    # Projection directions (called via collective_rpc)
+    # ------------------------------------------------------------------
+
+    def set_projection(self, name: str, payload: dict[str, Any]) -> None:
+        """Hold the ``(N, hidden)`` directions of a ``serialize_tensor`` payload under
+        ``name``; requests name it in ``output_residual_stream_project``."""
+        # Installing the hooks resets the worker state, so it must come first.
+        self.install_hooks()
+        device = next(self.model_runner.model.parameters()).device
+        self._direction_tables[name] = deserialize_tensor(payload).float().to(device)
+
+    def clear_projection(self, name: str | None) -> None:
+        """Drop the directions under ``name``; None drops every set."""
+        if name is None:
+            self._direction_tables = {}
+        else:
+            self._direction_tables.pop(name, None)
 
     def _build_payload(self, internal_req_id: str) -> dict[str, dict[str, Any]]:
         """Materialise the stacked-tensor payload for one internal request id.
@@ -1165,6 +1227,7 @@ class HiddenStatesExtension:
         layer_dict = self._captured_states.pop(internal_req_id)
         pooled = self._pooled.pop(internal_req_id, None)
         positions = self._captured_positions.pop(internal_req_id, None)
+        projected = self._projections.pop(internal_req_id, None) is not None
         sorted_indices = sorted(layer_dict.keys())
         if pooled is not None:
             # Each layer holds one float32 sum row; divide to get the mean.
@@ -1190,7 +1253,12 @@ class HiddenStatesExtension:
             if keep != list(range(stacked.shape[1])):
                 stacked = stacked[:, keep]
             activations[POSITIONS_META_KEY] = ordered
-        activations["residual_stream"] = stacked
+        if projected:
+            # Each row holds the N projections, then the norm.
+            activations["residual_stream_projection"] = stacked[..., :-1]
+            activations["residual_stream_norm"] = stacked[..., -1]
+        else:
+            activations["residual_stream"] = stacked
         return {"activations": activations}
 
     def get_captured_states(self, external_req_id: str) -> bytes | None:

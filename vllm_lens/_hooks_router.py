@@ -23,6 +23,8 @@ router = APIRouter(prefix="/v1/hooks", tags=["vllm-lens"])
 # independently of the hook-management router.
 activations_router = APIRouter(prefix="/v1/activations", tags=["vllm-lens"])
 
+# Named projection directions for output_residual_stream_project.
+projections_router = APIRouter(prefix="/v1/projections", tags=["vllm-lens"])
 
 _ACT_CHUNK_BYTES = 1 << 20  # 1 MiB
 
@@ -191,3 +193,34 @@ async def serve_ui(filename: str):
     if not os.path.isfile(path):
         raise HTTPException(404, f"File not found: {filename}")
     return FileResponse(path)
+
+
+@projections_router.post("")
+async def set_projection(raw_request: Request):
+    """Hold ``{"name", "directions"}`` on the workers; ``directions`` is a
+    ``serialize_tensor`` dict of shape ``(N, hidden)``."""
+    from vllm_lens._activations_plugin import _check_directions
+
+    body = await raw_request.json()
+    name = body.get("name") if isinstance(body, dict) else None
+    if not isinstance(name, str) or "directions" not in body:
+        raise HTTPException(400, "Body must hold a string 'name' and 'directions'")
+    engine = _engine_client(raw_request)
+    try:
+        payload = _check_directions(
+            body["directions"], engine.model_config.get_hidden_size()
+        )
+    except (ValueError, KeyError, TypeError) as error:
+        raise HTTPException(400, str(error)) from error
+    await engine.collective_rpc("set_projection", args=(name, payload))
+    engine._lens_projections = {*engine._lens_projections, name}
+    return JSONResponse({"status": "ok", "name": name})
+
+
+@projections_router.delete("/{name}")
+async def clear_projection(name: str, raw_request: Request):
+    """Drop the directions under ``name``."""
+    engine = _engine_client(raw_request)
+    await engine.collective_rpc("clear_projection", args=(name,))
+    engine._lens_projections = engine._lens_projections - {name}
+    return JSONResponse({"status": "ok"})
