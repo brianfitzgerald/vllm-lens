@@ -8,6 +8,7 @@
 - Steering: Vectors are prepared once per request and applied to token slices per layer.
 - Capture: A layer list sent as a JSON string in `output_residual_stream` is parsed once when the request is submitted, not again in every layer and step. Behavior change: an invalid JSON string now fails at submission; before, the worker captured every layer.
 - Capture: A step's captured rows go to the host in one gather and one non-blocking pinned copy per layer, in place of a blocking copy per request.
+- Capture: Added `output_residual_stream_pool="mean"` (`capture_pool` on the client), which returns the mean over the prompt positions as one row per layer.
 
 ## v1.3.0 (2 October 2026)
 
