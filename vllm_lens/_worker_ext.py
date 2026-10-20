@@ -27,6 +27,11 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_lens._helpers._hook_output import _replace_hook_output
+from vllm_lens._helpers._positions import (
+    LAST_PROMPT_TOKEN,
+    POSITIONS_KEY,
+    POSITIONS_META_KEY,
+)
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
@@ -421,13 +426,13 @@ def _capture_rows(
     hidden_states: torch.Tensor,
     query_start_loc: torch.Tensor,
 ) -> None:
-    """Store the requested rows of one layer: every position, or the sum of the prompt rows
-    for a mean."""
+    """Store the requested rows of one layer: every or the selected positions, or the sum of
+    the prompt rows for a mean."""
     runner = extension.model_runner
     num_reqs = runner.input_batch.num_reqs
     req_ids = runner.input_batch.req_ids
     bounds: list[int] | None = None
-    # Full captures: each request's batch rows.
+    # Full and position-selected captures: each request's batch rows.
     picked: list[tuple[str, np.ndarray]] = []
     pooled: list[tuple[str, int, int, int]] = []
     for i in range(num_reqs):
@@ -453,6 +458,7 @@ def _capture_rows(
         start, end = bounds[i], bounds[i + 1]
         # Positions [first, ...) of the request are rows [start, ...) of this step.
         first = req_state.num_computed_tokens
+        selector = extra.get(POSITIONS_KEY)
         # The front end validates these values.
         if extra.get("output_residual_stream_pool") == "mean":
             high = min(first + end - start, req_state.num_prompt_tokens)
@@ -463,6 +469,16 @@ def _capture_rows(
                     hidden_states.dtype,
                     req_state.num_prompt_tokens,
                 )
+        elif selector is not None:
+            n_prompt = req_state.num_prompt_tokens
+            wanted = [n_prompt - 1] if selector == LAST_PROMPT_TOKEN else selector
+            positions = [p for p in wanted if first <= p < first + end - start]
+            extension._captured_positions.setdefault(req_id, {}).setdefault(
+                layer_idx, []
+            ).extend(positions)
+            picked.append(
+                (req_id, np.asarray(positions, dtype=np.int64) + start - first)
+            )
         else:
             picked.append((req_id, np.arange(start, end, dtype=np.int64)))
 
@@ -960,6 +976,10 @@ class HiddenStatesExtension:
     # Pooled capture: _captured_states holds one float32 sum row per layer.
     # internal_req_id -> (capture dtype, divisor of the sum)
     _pooled: dict[str, tuple[torch.dtype, int]] = {}
+    # Position-selected capture: the absolute position of each captured row. Every
+    # captured layer records the same positions; _build_payload reads the first.
+    # internal_req_id -> { layer_idx -> [position, ...] }
+    _captured_positions: dict[str, dict[int, list[int]]] = {}
     _hooks_installed: bool = False
 
     # Prepared steering by request key and layer.
@@ -1017,6 +1037,7 @@ class HiddenStatesExtension:
         # set_persistent_hooks() before the first generate call.
         self._captured_states = {}
         self._pooled = {}
+        self._captured_positions = {}
         self._steering_data = {}
         self._hook_data = {}
         self._steer_pass = None
@@ -1128,15 +1149,13 @@ class HiddenStatesExtension:
         the entry.
         """
         prefix = f"{external_req_id}-"
-        for store in (self._captured_states, self._pooled):
+        for store in (self._captured_states, self._pooled, self._captured_positions):
             for req_id in list(store):
                 if req_id.startswith(prefix):
                     del store[req_id]
                     logger.debug("Cleared leaked activations for %s", req_id)
 
-    def _build_payload(
-        self, internal_req_id: str
-    ) -> dict[str, dict[str, "Float[torch.Tensor, 'n_layers total_pos hidden_dim']"]]:  # type: ignore[reportUndefinedVariable]
+    def _build_payload(self, internal_req_id: str) -> dict[str, dict[str, Any]]:
         """Materialise the stacked-tensor payload for one internal request id.
 
         Pops the entry from ``_captured_states`` so successive calls do not
@@ -1145,6 +1164,7 @@ class HiddenStatesExtension:
         """
         layer_dict = self._captured_states.pop(internal_req_id)
         pooled = self._pooled.pop(internal_req_id, None)
+        positions = self._captured_positions.pop(internal_req_id, None)
         sorted_indices = sorted(layer_dict.keys())
         if pooled is not None:
             # Each layer holds one float32 sum row; divide to get the mean.
@@ -1161,7 +1181,17 @@ class HiddenStatesExtension:
         )
         if stacked.is_cuda:
             stacked = stacked.cpu()
-        return {"activations": {"residual_stream": stacked}}
+        activations: dict[str, Any] = {}
+        if positions is not None:
+            # A position computed twice (after a preemption) keeps its latest row.
+            latest = {p: row for row, p in enumerate(positions[sorted_indices[0]])}
+            ordered = sorted(latest)
+            keep = [latest[p] for p in ordered]
+            if keep != list(range(stacked.shape[1])):
+                stacked = stacked[:, keep]
+            activations[POSITIONS_META_KEY] = ordered
+        activations["residual_stream"] = stacked
+        return {"activations": activations}
 
     def get_captured_states(self, external_req_id: str) -> bytes | None:
         """Retrieve captured activations for a specific request.
