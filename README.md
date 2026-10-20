@@ -129,7 +129,18 @@ out.activations["residual_stream"].shape      # (2, 1, hidden_dim)
 out.activations["residual_stream_positions"]  # [n_prompt - 1]
 ```
 
-Positions index the model input: prompt tokens are `0 .. n_prompt - 1`, and `n_prompt + k` is the state computed when generated token `k` is fed back, so the last generated token has no row. Rows come back in ascending position order without duplicates, and a position that is never computed is absent. `output_residual_stream_pool` and `output_residual_stream_positions` cannot be combined.
+Positions index the model input: prompt tokens are `0 .. n_prompt - 1`, and `n_prompt + k` is the state computed when generated token `k` is fed back, so the last generated token has no row. Rows come back in ascending position order without duplicates, and a position that is never computed is absent.
+
+To get the projection of every position onto a few directions in place of the residual, register the `(N, hidden_dim)` directions under a name, then pass the name in `output_residual_stream_project` (the client's `capture_project`). The response holds `residual_stream_projection` with shape `(n_layers, total_pos, N)` and `residual_stream_norm` with shape `(n_layers, total_pos)`, both float32, in place of `residual_stream`.
+
+```python
+client.set_projection("probes", directions)  # or llm.set_projection, or POST /v1/projections
+out = client.generate("Hello world", capture_layers=[15], capture_project="probes")
+print(out.activations["residual_stream_projection"].shape)  # (1, total_pos, N)
+client.clear_projection("probes")  # or llm.clear_projection, or DELETE /v1/projections/probes
+```
+
+The names are checked in the API server process, so with `--api-server-count` above 1 register a set through every server. `output_residual_stream_pool`, `output_residual_stream_positions` and `output_residual_stream_project` cannot be combined.
 
 Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 only (residual streams are identical across TP ranks after all-reduce).
 
