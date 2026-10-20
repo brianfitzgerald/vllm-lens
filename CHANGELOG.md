@@ -10,6 +10,7 @@
 - Capture: A step's captured rows go to the host in one gather and one non-blocking pinned copy per layer, in place of a blocking copy per request.
 - Capture: Added `output_residual_stream_pool="mean"` (`capture_pool` on the client), which returns the mean over the prompt positions as one row per layer.
 - Capture: Added `output_residual_stream_positions` (`capture_positions` on the client), `"last_prompt_token"` or a list of absolute positions. The response carries `residual_stream_positions`.
+- Capture: Added `output_residual_stream_project` (`capture_project` on the client), which names a direction set registered with `LLM.set_projection(name, directions)`, `POST /v1/projections` or `VLLMLensClient.set_projection`. The response holds the per-position projections and norms in float32 in place of the residual.
 
 ## v1.3.0 (2 October 2026)
 

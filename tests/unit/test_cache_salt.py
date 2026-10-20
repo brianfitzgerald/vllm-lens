@@ -73,6 +73,7 @@ async def test_async_intervention_params(monkeypatch, built, kind):
     monkeypatch.setattr(plugin, "_original_generate", original)
     engine = SimpleNamespace(
         collective_rpc=rpc,
+        _lens_projections=frozenset(),
         _hooks_installed=True,
         _has_persistent_hooks=kind == "persistent",
     )
@@ -113,6 +114,7 @@ def test_offline_intervention_params(kind, many):
     original_extra = dict(params.extra_args)
     engine = SimpleNamespace(
         collective_rpc=lambda *a, **k: [],
+        _lens_projections=frozenset(),
         _hooks_installed=True,
         _has_persistent_hooks=kind == "persistent",
     )
@@ -137,6 +139,7 @@ def test_offline_persistent_hooks_use_model_defaults():
         _has_persistent_hooks=True,
         _hooks_installed=True,
         get_default_sampling_params=lambda: defaults,
+        _lens_projections=frozenset(),
     )
     sent = plugin._prepare_offline_params(engine, None)["params"]
     assert sent is not defaults and sent.temperature == 0.7
