@@ -99,7 +99,7 @@ def fake_extension(
     )
 
 
-def lens_engine(lens: dict[str, list[int]] | None = None, **kwargs):
+def lens_engine(lens: dict[str, list[int] | bool] | None = None, **kwargs):
     """A module fixture's offline engine, freed after; ``lens`` is its
     ``additional_config["vllm_lens"]``."""
     from vllm import LLM

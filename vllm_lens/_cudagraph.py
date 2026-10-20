@@ -18,16 +18,19 @@ class LensGraphConfig:
     """The CUDA-graph settings of one engine: on when a layer list is set."""
 
     capture_layers: tuple[int, ...] = ()
+    steer_layers: tuple[int, ...] = ()
+    # False drops the norm buffer and its per-token norm: requests may not use norm_match.
+    steer_norm_match: bool = True
 
     @property
     def enabled(self) -> bool:
         """Whether the engine runs in the CUDA-graph mode."""
-        return bool(self.capture_layers)
+        return bool(self.capture_layers or self.steer_layers)
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> LensGraphConfig:
         """Read ``additional_config["vllm_lens"]`` of an ``EngineArgs`` or ``VllmConfig``:
-        ``{"capture_layers": [...]}``."""
+        ``{"capture_layers": [...], "steer_layers": [...], "steer_norm_match": bool}``."""
         stored = (vllm_config.additional_config or {}).get(CONFIG_KEY)
         known = [field.name for field in fields(cls)]
         unknown = sorted(set(stored) - set(known)) if isinstance(stored, dict) else []
@@ -36,9 +39,20 @@ class LensGraphConfig:
                 f'additional_config["{CONFIG_KEY}"] has unknown key(s) {unknown}; '
                 f"this vllm-lens version reads only {known}."
             )
+        settings = dict(stored) if isinstance(stored, dict) else stored or {}
+        norm_match = (
+            settings.pop("steer_norm_match", True)
+            if isinstance(settings, dict)
+            else True
+        )
+        if not isinstance(norm_match, bool):
+            raise ValueError(
+                f'additional_config["{CONFIG_KEY}"]["steer_norm_match"] must be a bool, '
+                f"got {norm_match!r}."
+            )
         if not isinstance(stored or {}, dict):
             raise ValueError("vllm_lens must map keys to lists of layer numbers")
-        layer_settings = dict(stored or {})
+        layer_settings = dict(settings)
         for key, layers in layer_settings.items():
             if not isinstance(layers, (list, tuple)) or any(
                 isinstance(layer, bool)
@@ -54,13 +68,14 @@ class LensGraphConfig:
             return cls(
                 **{
                     key: tuple(sorted({int(layer) for layer in value}))
-                    for key, value in (stored or {}).items()
-                }
+                    for key, value in settings.items()
+                },
+                steer_norm_match=norm_match,
             )
         except (AttributeError, TypeError, ValueError):
             raise ValueError(
-                f'additional_config["{CONFIG_KEY}"] must map capture_layers to a list '
-                f"of layer numbers, got {stored!r}."
+                f'additional_config["{CONFIG_KEY}"] must map capture_layers and '
+                f"steer_layers to lists of layer numbers, got {stored!r}."
             ) from None
 
     def reject(
@@ -71,7 +86,8 @@ class LensGraphConfig:
         vectors: list[SteeringVector] | None = None,
     ) -> None:
         """Raise ``ValueError`` for what only the forward hooks serve: hooks, Q/K capture,
-        steering, a capture layer outside the list, or a capture of every layer."""
+        a capture or steering layer outside the lists, a capture of every layer, or
+        ``norm_match`` on a server without the norm buffer."""
         if not self.enabled:
             return
         if hooks or qk:
@@ -80,10 +96,17 @@ class LensGraphConfig:
                 "hooks do not run: hooks and Q/K capture are not available. Remove the "
                 "layer lists to serve this request in eager mode."
             )
-        if vectors:
+        steering_layers = {layer for sv in vectors or [] for layer in sv.layer_indices}
+        unsteered = sorted(steering_layers - set(self.steer_layers))
+        if unsteered:
             raise ValueError(
-                "The CUDA-graph mode (additional_config['vllm_lens']) is on, so steering "
-                "is not available. Remove the layer lists to steer in eager mode."
+                f"apply_steering_vectors names layer(s) {unsteered}, but this server "
+                f"steers only its steer_layers: {list(self.steer_layers)}."
+            )
+        if not self.steer_norm_match and any(sv.norm_match for sv in vectors or []):
+            raise ValueError(
+                "This server sets steer_norm_match to false, so a steering vector "
+                "cannot use norm_match."
             )
         if residual_stream is None:
             return
