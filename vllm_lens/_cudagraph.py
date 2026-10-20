@@ -18,16 +18,17 @@ class LensGraphConfig:
     """The CUDA-graph settings of one engine: on when a layer list is set."""
 
     capture_layers: tuple[int, ...] = ()
+    steer_layers: tuple[int, ...] = ()
 
     @property
     def enabled(self) -> bool:
         """Whether the engine runs in the CUDA-graph mode."""
-        return bool(self.capture_layers)
+        return bool(self.capture_layers or self.steer_layers)
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> LensGraphConfig:
         """Read ``additional_config["vllm_lens"]`` of an ``EngineArgs`` or ``VllmConfig``:
-        ``{"capture_layers": [...]}``."""
+        ``{"capture_layers": [...], "steer_layers": [...]}``."""
         stored = (vllm_config.additional_config or {}).get(CONFIG_KEY)
         try:
             return cls(
@@ -38,8 +39,8 @@ class LensGraphConfig:
             )
         except (AttributeError, TypeError, ValueError):
             raise ValueError(
-                f'additional_config["{CONFIG_KEY}"] must map capture_layers to a list '
-                f"of layer numbers, got {stored!r}."
+                f'additional_config["{CONFIG_KEY}"] must map capture_layers and '
+                f"steer_layers to lists of layer numbers, got {stored!r}."
             ) from None
 
     def reject(
@@ -50,7 +51,7 @@ class LensGraphConfig:
         vectors: list[SteeringVector] | None = None,
     ) -> None:
         """Raise ``ValueError`` for what only the forward hooks serve: hooks, Q/K capture,
-        steering, a capture layer outside the list, or a capture of every layer."""
+        a capture or steering layer outside the lists, or a capture of every layer."""
         if not self.enabled:
             return
         if hooks or qk:
@@ -59,10 +60,12 @@ class LensGraphConfig:
                 "hooks do not run: hooks and Q/K capture are not available. Remove the "
                 "layer lists to serve this request in eager mode."
             )
-        if vectors:
+        steering_layers = {layer for sv in vectors or [] for layer in sv.layer_indices}
+        unsteered = sorted(steering_layers - set(self.steer_layers))
+        if unsteered:
             raise ValueError(
-                "The CUDA-graph mode (additional_config['vllm_lens']) is on, so steering "
-                "is not available. Remove the layer lists to steer in eager mode."
+                f"apply_steering_vectors names layer(s) {unsteered}, but this server "
+                f"steers only its steer_layers: {list(self.steer_layers)}."
             )
         if residual_stream is None:
             return
