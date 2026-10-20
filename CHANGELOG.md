@@ -7,6 +7,7 @@
 - Steering: Each request's 2-D vectors are summed once into a float32 row per layer. Behavior change: `norm_match` scales by the norm of the unsteered stream.
 - Capture: A step's captured rows go to the host in one gather and one non-blocking pinned copy per layer, in place of a blocking copy per request, and a layer list sent as a JSON string is parsed once when the request is submitted.
 - Capture: Added `output_residual_stream_pool="mean"` (`capture_pool` on the client), which returns the mean over the prompt positions as one row per layer.
+- Capture: Added `output_residual_stream_positions` (`capture_positions` on the client), `"last_prompt_token"` or a list of absolute positions. The response carries `residual_stream_positions`.
 
 ## v1.3.0 (2 October 2026)
 

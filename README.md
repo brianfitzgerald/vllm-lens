@@ -121,6 +121,16 @@ print(out.activations["residual_stream"].shape)
 
 To get the mean over the prompt positions as one row per layer, pass `output_residual_stream_pool="mean"` (the client's `capture_pool`); the result has shape `(n_layers, 1, hidden_dim)` and does not include generated positions.
 
+To keep only some positions, pass `output_residual_stream_positions` (the client's `capture_positions`): `"last_prompt_token"` or a list of absolute positions. The response then also holds `residual_stream_positions`, the position of each row:
+
+```python
+out = client.generate("Hello world", capture_layers=[15, 20], capture_positions="last_prompt_token")
+out.activations["residual_stream"].shape      # (2, 1, hidden_dim)
+out.activations["residual_stream_positions"]  # [n_prompt - 1]
+```
+
+Positions index the model input: prompt tokens are `0 .. n_prompt - 1`, and `n_prompt + k` is the state computed when generated token `k` is fed back, so the last generated token has no row. Rows come back in ascending position order without duplicates, and a position that is never computed is absent. `output_residual_stream_pool` and `output_residual_stream_positions` cannot be combined.
+
 Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 only (residual streams are identical across TP ranks after all-reduce).
 
 #### Binary transport for large captures
