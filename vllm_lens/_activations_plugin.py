@@ -27,6 +27,7 @@ import cloudpickle
 import torch
 import zstandard as zstd
 
+from vllm_lens._cudagraph import LensGraphConfig
 from vllm_lens._helpers._positions import (
     POSITIONS_KEY,
     POSITIONS_META_KEY,
@@ -406,7 +407,10 @@ def _patched_create_engine_config(self, *args, **kwargs):
     """
     if not self.worker_extension_cls:
         self.worker_extension_cls = _WORKER_EXT
-    self.enforce_eager = True
+    # Layer lists in additional_config["vllm_lens"] keep compilation and CUDA graphs on.
+    self.enforce_eager = (
+        self.enforce_eager or not LensGraphConfig.from_vllm_config(self).enabled
+    )
 
     # Our capture/steering hooks read V1 model-runner internals (input_batch,
     # requests). vLLM's V2 runner — the default for dense models on vLLM 0.23+ —
@@ -525,6 +529,12 @@ async def _patched_generate(
 
     # Extract hooks (callables can't survive msgspec).
     hooks_list = _decode_hooks(extra.pop("apply_hooks", None))
+    LensGraphConfig.from_vllm_config(self.vllm_config).reject(
+        hooks_list,
+        qk=wants_qk,
+        residual_stream=extra.get("output_residual_stream"),
+        vectors=steering_vectors,
+    )
 
     # Allow explicit prefix-cache bypass via extra_args.
     skip_kv_cache = extra.pop("skip_reading_prefix_cache", None)
@@ -659,9 +669,13 @@ def _prepare_offline_params(
     # Extract steering vectors per-request.  We must pop them from
     # extra_args before vLLM serialises SamplingParams, but keep them
     # for the RPC call.
+    graph_config = LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config)
     steering_payloads: dict[str, bytes] = {}  # steering_id -> pickled vectors
     for idx, extra in enumerate(extras):
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
+        graph_config.reject(
+            residual_stream=extra.get("output_residual_stream"), vectors=vectors
+        )
         if vectors is not None:
             steering_id = f"_steer_{idx}"
             payload = steering_payloads[steering_id] = pickle.dumps(vectors)
@@ -676,6 +690,7 @@ def _prepare_offline_params(
             hook_id = f"_hook_{idx}"
             hook_payloads[hook_id] = cloudpickle.dumps(hooks)
             extra["_hook_id"] = hook_id
+    graph_config.reject(hook_payloads, qk=wants_qk)
 
     # Pop skip_reading_prefix_cache from extra_args for each request.
     any_skip_kv_cache = False
@@ -1003,6 +1018,7 @@ def _llm_register_hooks(
     prefetch_params: list[str] | None = None,
 ) -> None:
     """Register persistent hooks that apply to every subsequent request."""
+    LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config).reject(hooks)
     if not getattr(self, "_hooks_installed", False):
         self.collective_rpc("install_hooks")
         self._hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
@@ -1194,3 +1210,10 @@ def register() -> None:
         _serve_mod.register_vllm_serve_api_routers = _patched_register_routers
     except Exception as error:
         _report_integration_failure("hook and activation HTTP routes", error)
+
+    try:
+        from vllm_lens._graph_worker import install_graph_patches
+
+        install_graph_patches()
+    except Exception as error:
+        _report_integration_failure("CUDA-graph mode", error)

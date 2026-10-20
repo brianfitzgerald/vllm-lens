@@ -1149,20 +1149,9 @@ class HiddenStatesExtension:
     # layer index (scale, sliding window, soft-cap, ... — see install_qk_hooks).
     _qk_layer_meta: dict[int, dict[str, Any]] = {}
 
-    def install_hooks(self) -> None:
-        """Register a forward hook on every decoder layer. Idempotent.
-
-        Hooks are installed on **all** TP ranks because steering must
-        modify hidden states everywhere.  Activation *capture* is gated
-        to rank 0 only via ``_should_capture``.
-
-        Requires ``enforce_eager=True`` in engine args — otherwise
-        ``@support_torch_compile`` would compile the forward graph and
-        hooks won't fire.
-        """
-        if self._hooks_installed:
-            return
-        self._hooks_installed = True
+    def _reset_state(self) -> None:
+        """Create the per-instance state, pick the capturing rank and plan each forward
+        pass's steering."""
         # Reset to instance-level dicts (class-level defaults are shared).
         # Do NOT reset _persistent_hooks — they may have been set via
         # set_persistent_hooks() before the first generate call.
@@ -1190,13 +1179,6 @@ class HiddenStatesExtension:
         tp_size = self.parallel_config.tensor_parallel_size
         self._should_capture = tp_size <= 1 or self.rank % tp_size == 0
 
-        # Hooks must be installed on ALL ranks so steering vectors are
-        # applied everywhere (not just rank 0).
-        layer_map = _discover_layer_modules(self)
-        for layer_idx, layer in sorted(layer_map.items()):
-            layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
-            layer.register_forward_hook(_make_hook(self, layer_idx))
-
         model_forward = runner._model_forward
 
         def _model_forward(*args: Any, **kwargs: Any) -> Any:
@@ -1214,6 +1196,20 @@ class HiddenStatesExtension:
                 self._steer_pass = None
 
         runner._model_forward = _model_forward
+
+    def install_hooks(self) -> None:
+        """Register the eager forward hooks on every decoder layer of every rank; idempotent."""
+        if self._hooks_installed:
+            return
+        self._hooks_installed = True
+        self._reset_state()
+
+        # Hooks must be installed on ALL ranks so steering vectors are
+        # applied everywhere (not just rank 0).
+        layer_map = _discover_layer_modules(self)
+        for layer_idx, layer in sorted(layer_map.items()):
+            layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
+            layer.register_forward_hook(_make_hook(self, layer_idx))
 
     # ------------------------------------------------------------------
     # Steering data management (called via collective_rpc)
@@ -1776,7 +1772,6 @@ class HiddenStatesExtension:
         ``_prefetched_params`` for use by ``HookContext.get_parameter``.
         """
         import torch.distributed as dist
-
         from vllm.distributed.parallel_state import get_pp_group, get_tp_group
         from vllm.model_executor.models.utils import PPMissingLayer
 

@@ -74,6 +74,25 @@ The plugin logs through the `vllm.lens` logger, a child of vLLM's `vllm` logger,
 VLLM_LOGGING_LEVEL=DEBUG vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
 
+## CUDA graphs
+
+Name the layers to capture in vLLM's `additional_config` under `vllm_lens` to keep compilation and CUDA graphs on:
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --additional-config '{"vllm_lens": {"capture_layers": [15, 20]}}'
+```
+
+Offline, pass `additional_config={"vllm_lens": {...}}` to `LLM(...)`.
+
+A forward hook on each named layer calls the custom op `vllm_lens::capture`, which stays inside the compiled graph and copies the stream into a buffer of that layer; the request format does not change. The layer list is part of vLLM's compile cache key, so each set gets its own compiled graph. Tested on Qwen2.5 and Gemma2.
+
+Limits:
+
+- A capture layer that is not in the list, `output_residual_stream=True` (all layers), steering vectors, hooks and Q/K capture fail with an error, as does the registration of a persistent hook.
+- The engine refuses to load with pipeline parallelism, micro-batching (DBO), sequence parallelism or breakable CUDA graphs.
+- The buffers are allocated when the model loads, before vLLM sizes the KV cache: one `(max_num_batched_tokens, hidden_size)` buffer per captured layer in the model dtype.
+
 ## Examples
 
 Runnable examples live in [`examples/`](examples/) — each is standalone; run any
