@@ -516,14 +516,15 @@ def _capture_rows(
     hidden_states: torch.Tensor,
     query_start_loc: torch.Tensor,
 ) -> None:
-    """Store the rows of one layer for every request that captures it, in one gather and
-    one pinned copy."""
+    """Store the requested rows of one layer: every position, or the sum of the prompt rows
+    for a mean."""
     runner = extension.model_runner
     num_reqs = runner.input_batch.num_reqs
     req_ids = runner.input_batch.req_ids
     bounds: list[int] | None = None
-    # Each request's batch rows.
+    # Full captures: each request's batch rows.
     picked: list[tuple[str, np.ndarray]] = []
+    pooled: list[tuple[str, int, int, int]] = []
     for i in range(num_reqs):
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
@@ -545,8 +546,53 @@ def _capture_rows(
         if bounds is None:
             bounds = query_start_loc[: num_reqs + 1].tolist()
         start, end = bounds[i], bounds[i + 1]
-        picked.append((req_id, np.arange(start, end, dtype=np.int64)))
+        # Positions [first, ...) of the request are rows [start, ...) of this step.
+        first = req_state.num_computed_tokens
+        # The front end validates these values.
+        if extra.get("output_residual_stream_pool") == "mean":
+            high = min(first + end - start, req_state.num_prompt_tokens)
+            if high > first:
+                pooled.append((req_id, start, start - first + high, first))
+                # The mean is the sum over the prompt divided at collection.
+                extension._pooled[req_id] = (
+                    hidden_states.dtype,
+                    req_state.num_prompt_tokens,
+                )
+        else:
+            picked.append((req_id, np.arange(start, end, dtype=np.int64)))
 
+    if pooled:
+        # The batch row of every prompt token and its request, in one pinned copy.
+        layout = torch.from_numpy(
+            np.stack(
+                [
+                    np.concatenate(
+                        [np.arange(low, high) for _, low, high, _ in pooled]
+                    ),
+                    np.repeat(
+                        np.arange(len(pooled)),
+                        [high - low for _, low, high, _ in pooled],
+                    ),
+                ]
+            )
+        )
+        if hidden_states.is_cuda:
+            layout = layout.pin_memory()
+        tokens, segments = layout.to(hidden_states.device, non_blocking=True)
+        # The sums stay on the device until collection, so the hook does not wait for the GPU.
+        sums = torch.zeros(
+            (len(pooled), hidden_states.shape[-1]),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        ).index_add_(0, segments, hidden_states.index_select(0, tokens).float())
+        for row, (req_id, _, _, first) in enumerate(pooled):
+            total = sums[row : row + 1]
+            states = extension._captured_states.setdefault(req_id, {})
+            # A prefill from position 0 starts a new sum; a preempted request starts at 0
+            # again because capture skips the prefix cache.
+            if first > 0 and layer_idx in states:
+                total = states[layer_idx][0] + total
+            states[layer_idx] = [total]
     if picked:
         index = torch.from_numpy(np.concatenate([rows for _, rows in picked]))
         if hidden_states.is_cuda:
@@ -1004,6 +1050,9 @@ class HiddenStatesExtension:
         str,
         dict[int, list[Float[torch.Tensor, "seq_len hidden_dim"]]],  # type: ignore[reportUndefinedVariable]
     ] = {}
+    # Pooled capture: _captured_states holds one float32 sum row per layer.
+    # internal_req_id -> (capture dtype, divisor of the sum)
+    _pooled: dict[str, tuple[torch.dtype, int]] = {}
     _hooks_installed: bool = False
 
     # Per-request steering configs:
@@ -1062,6 +1111,7 @@ class HiddenStatesExtension:
         # Do NOT reset _persistent_hooks — they may have been set via
         # set_persistent_hooks() before the first generate call.
         self._captured_states = {}
+        self._pooled = {}
         self._steering_data = {}
         self._hook_data = {}
         runner = self.model_runner
@@ -1166,10 +1216,11 @@ class HiddenStatesExtension:
         the entry.
         """
         prefix = f"{external_req_id}-"
-        for req_id in list(self._captured_states):
-            if req_id.startswith(prefix):
-                del self._captured_states[req_id]
-                logger.debug("Cleared leaked activations for %s", req_id)
+        for store in (self._captured_states, self._pooled):
+            for req_id in list(store):
+                if req_id.startswith(prefix):
+                    del store[req_id]
+                    logger.debug("Cleared leaked activations for %s", req_id)
 
     def _build_payload(
         self, internal_req_id: str
@@ -1181,7 +1232,15 @@ class HiddenStatesExtension:
         :meth:`get_captured_states_batch`.
         """
         layer_dict = self._captured_states.pop(internal_req_id)
+        pooled = self._pooled.pop(internal_req_id, None)
         sorted_indices = sorted(layer_dict.keys())
+        if pooled is not None:
+            # Each layer holds one float32 sum row; divide to get the mean.
+            dtype, divisor = pooled
+            sums = torch.stack([layer_dict[idx][0] for idx in sorted_indices])
+            return {
+                "activations": {"residual_stream": (sums / divisor).to(dtype).cpu()}
+            }
         per_layer: list[Float[torch.Tensor, "total_pos hidden_dim"]] = [  # type: ignore[reportUndefinedVariable]
             torch.cat(layer_dict[idx], dim=0) for idx in sorted_indices
         ]
