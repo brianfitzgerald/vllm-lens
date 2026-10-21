@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import pickle
+import uuid
 from importlib.metadata import PackageNotFoundError, version
 from collections.abc import AsyncIterator, Callable, Sequence
 from typing import TYPE_CHECKING, Any
@@ -52,6 +53,7 @@ _original_completion_response: Callable | None = None
 _original_chat_full_generator: Callable | None = None
 _original_chat_stream_generator: Callable | None = None
 _original_register_routers: Callable | None = None
+_original_process_inputs: Callable | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +379,25 @@ def _patched_create_engine_config(self, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 
+def _isolate_prefix_cache(request: Any) -> None:
+    """Add a unique salt to the request's cache namespace."""
+    salt = f"lens-request:{uuid.uuid4().hex}"
+    request.cache_salt = f"{request.cache_salt}|{salt}" if request.cache_salt else salt
+
+
+def _patched_process_inputs(
+    self: Any, request_id: str, prompt: Any, params: Any, *args, **kwargs
+) -> Any:
+    """Build the request, then isolate intervention cache entries."""
+    assert _original_process_inputs is not None
+    request = _original_process_inputs(
+        self, request_id, prompt, params, *args, **kwargs
+    )
+    if (getattr(params, "extra_args", None) or {}).get("_lens_isolate_cache"):
+        _isolate_prefix_cache(request)
+    return request
+
+
 async def _patched_generate(
     self: AsyncLLM,
     prompt: str,
@@ -431,16 +452,17 @@ async def _patched_generate(
     skip_kv_cache = extra.pop("skip_reading_prefix_cache", None)
 
     has_persistent = getattr(self, "_has_persistent_hooks", False)
-    needs_hooks = (
-        wants_activations
-        or steering_vectors is not None
-        or hooks_list is not None
-        or has_persistent
-    )
+    hooked = hooks_list is not None or has_persistent
+    needs_hooks = wants_activations or steering_vectors is not None or hooked
     if needs_hooks or wants_qk or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
         # computation entirely, so force a fresh prefill for this request.
         effective_params.skip_reading_prefix_cache = True
+    if steering_vectors is not None or hooked:
+        effective_params.extra_args = extra
+        extra["_lens_isolate_cache"] = True
+        if built:
+            _isolate_prefix_cache(prompt)
     if needs_hooks and not getattr(self, "_hooks_installed", False):
         await self.collective_rpc("install_hooks")
         setattr(self, "_hooks_installed", True)
@@ -451,8 +473,7 @@ async def _patched_generate(
     # Send steering data to workers before the forward pass begins.
     if steering_vectors is not None:
         await self.collective_rpc(
-            "set_steering_data",
-            args=(request_id, pickle.dumps(steering_vectors)),
+            "set_steering_data", args=(request_id, pickle.dumps(steering_vectors))
         )
 
     # Send hook data to workers before the forward pass begins.
@@ -533,6 +554,8 @@ def _prepare_offline_params(
     Returns the state for :func:`_finalize_offline_outputs`; ``params`` are copies of the
     caller's SamplingParams.
     """
+    if sampling_params is None and getattr(self, "_has_persistent_hooks", False):
+        sampling_params = self.get_default_sampling_params()
     if isinstance(sampling_params, Sequence):
         params_list = [copy.copy(sp) for sp in sampling_params]
         sampling_params = params_list
@@ -583,6 +606,9 @@ def _prepare_offline_params(
     if needs_hooks or wants_qk or any_skip_kv_cache:
         for sp in params_list:
             sp.skip_reading_prefix_cache = True
+    for extra in extras:
+        if has_persistent or "_steering_id" in extra or "_hook_id" in extra:
+            extra["_lens_isolate_cache"] = True
 
     if needs_hooks and not getattr(self, "_hooks_installed", False):
         self.collective_rpc("install_hooks")
@@ -983,13 +1009,19 @@ def register() -> None:
     global _original_completion_response, _original_chat_full_generator
     global _original_chat_stream_generator
     global _original_register_routers
+    global _original_process_inputs
 
     from vllm import LLM
     from vllm.engine.arg_utils import EngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
+    from vllm.v1.engine.input_processor import InputProcessor
 
     _original_create_engine_config = EngineArgs.create_engine_config
     EngineArgs.create_engine_config = _patched_create_engine_config
+
+    # Before any engine is built: InputProcessor binds process_inputs_async at __init__.
+    _original_process_inputs = InputProcessor.process_inputs
+    InputProcessor.process_inputs = _patched_process_inputs  # type: ignore[reportAttributeAccessIssue]
 
     _original_generate = AsyncLLM.generate
     AsyncLLM.generate = _patched_generate  # type: ignore[reportAttributeAccessIssue]
