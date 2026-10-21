@@ -1,12 +1,13 @@
 """Tests for activation steering via ``apply_steering_vectors``."""
 
 import gc
+import uuid
 
 import pytest
 import torch
 from vllm import AsyncEngineArgs, AsyncLLMEngine, RequestOutput, SamplingParams
 
-from vllm_lens import SteeringVector
+from vllm_lens import Hook, SteeringVector
 
 from .conftest import LAYER_IDX, MODEL_NAME, PROMPT
 
@@ -223,6 +224,48 @@ class TestSteering:
             extra_args={"apply_steering_vectors": vectors},
         )
         assert steered.outputs[0].text == baseline_text
+
+    @pytest.mark.parametrize("kind", ["steering", "hooks"])
+    async def test_intervention_prefix_is_not_reused(self, vllm_model, kind):
+        """Interventions isolate writes; ordinary requests still reuse the cache."""
+        prompt = uuid.uuid4().hex + " The quick brown fox jumps over the lazy dog." * 20
+        hidden_dim = vllm_model.model_config.get_hidden_size()
+        extra = (
+            {
+                "apply_steering_vectors": _make_steering_vector(
+                    hidden_dim, [LAYER_IDX], scale=10.0
+                )
+            }
+            if kind == "steering"
+            else {
+                "apply_hooks": [
+                    Hook(
+                        fn=lambda ctx, h: torch.zeros_like(h), layer_indices=[LAYER_IDX]
+                    )
+                ]
+            }
+        )
+        for index in range(2):
+            result = await _generate(
+                vllm_model, prompt, f"isolated-{index}", max_tokens=1, extra_args=extra
+            )
+            assert result.num_cached_tokens == 0
+        first = await _generate(vllm_model, prompt, "ordinary-first", max_tokens=20)
+        assert first.num_cached_tokens == 0
+        repeat = await _generate(vllm_model, prompt, "ordinary-repeat", max_tokens=20)
+        assert repeat.num_cached_tokens > 0
+        fresh = await _generate(
+            vllm_model,
+            prompt,
+            "ordinary-fresh",
+            max_tokens=20,
+            extra_args={"skip_reading_prefix_cache": True},
+        )
+        assert (
+            first.outputs[0].token_ids
+            == repeat.outputs[0].token_ids
+            == fresh.outputs[0].token_ids
+        )
 
     async def test_steering_with_capture(self, vllm_model):
         """Steering + capture: captured activations should reflect the

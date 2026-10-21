@@ -23,6 +23,9 @@ def serving_surface(monkeypatch):
         "vllm.v1.engine.async_llm": {
             "AsyncLLM": type("AsyncLLM", (), {"generate": original})
         },
+        "vllm.v1.engine.input_processor": {
+            "InputProcessor": type("InputProcessor", (), {"process_inputs": original})
+        },
         "vllm.entrypoints.openai.completion.serving": {
             "OpenAIServingCompletion": type(
                 "Completion", (), {"request_output_to_completion_response": original}
