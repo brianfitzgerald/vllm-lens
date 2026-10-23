@@ -24,6 +24,8 @@ REFERENCE_DTYPE = "float32"
 LAYER_IDX = 2
 NUM_LAYERS = 24
 PROMPT = "The future of AI is"
+CAPTURE_LAYERS = [LAYER_IDX, LAYER_IDX + 3]
+LONG_PROMPT = "The quick brown fox jumps over the lazy dog. " * 20
 PROMPTS = [
     "The future of AI is",
     "Once upon a time in a land far away",
@@ -50,6 +52,24 @@ def hf_model():
     torch.cuda.empty_cache()
 
 
+@pytest.fixture(scope="module", params=[None, 64], ids=["single-pass", "chunked-64"])
+def capture_llm(request):
+    """Offline engine, with and without a 64-token prefill chunk."""
+    from vllm import LLM
+
+    kwargs = {}
+    if request.param is not None:
+        kwargs = {
+            "max_num_batched_tokens": request.param,
+            "enable_chunked_prefill": True,
+        }
+    engine = LLM(model=MODEL_NAME, dtype="auto", gpu_memory_utilization=0.3, **kwargs)
+    yield engine
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def fake_extension(extras: dict[str, dict[str, Any] | None]) -> SimpleNamespace:
     """A worker stand-in whose runner holds one request per entry of ``extras``, each with
     10 prompt tokens and none computed."""
@@ -65,7 +85,7 @@ def fake_extension(extras: dict[str, dict[str, Any] | None]) -> SimpleNamespace:
         input_batch=SimpleNamespace(num_reqs=len(extras), req_ids=list(extras)),
         requests=requests,
     )
-    return SimpleNamespace(model_runner=runner, _captured_states={})
+    return SimpleNamespace(model_runner=runner, _captured_states={}, _pooled={})
 
 
 @pytest.fixture(autouse=True, scope="module")
