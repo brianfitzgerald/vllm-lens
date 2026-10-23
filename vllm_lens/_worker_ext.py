@@ -286,6 +286,33 @@ class _SteerSlice(NamedTuple):
     data: _SteeringLayer
 
 
+class _HookPass(NamedTuple):
+    """What the hooks have to do in one forward pass: the layers some batched request
+    captures (None for every layer), and whether a request or persistent hook runs."""
+
+    capture: frozenset[int] | None
+    hooks: bool
+
+
+def _hook_pass(extension: HiddenStatesExtension) -> _HookPass:
+    """Scan the batch once, so the hooks of a layer with nothing to do return at once."""
+    runner = extension.model_runner
+    capture: set[int] | None = set()
+    hooks = bool(extension._persistent_hooks)
+    for req_id in runner.input_batch.req_ids[: runner.input_batch.num_reqs]:
+        extra = getattr(runner.requests[req_id].sampling_params, "extra_args", None)
+        if not hooks and _find_hook_configs_no_persistent(extension, req_id, extra):
+            hooks = True
+        layers = (extra or {}).get("output_residual_stream")
+        if layers is None or capture is None:
+            continue
+        if isinstance(layers, list):
+            capture.update(layers)
+        else:
+            capture = None
+    return _HookPass(None if capture is None else frozenset(capture), hooks)
+
+
 def _steer_pass(
     extension: HiddenStatesExtension,
 ) -> dict[int, list[_SteerSlice]] | None:
@@ -570,6 +597,16 @@ def _hook_inner(
 ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
     """Core hook logic, separated so _make_hook can wrap it in try/except."""
     runner = extension.model_runner
+    plan = extension._steer_pass
+    steered = plan is not None and layer_idx in plan
+    # Without a pass plan (a forward pass outside the planner), every layer does everything.
+    todo = extension._hook_pass
+    capture = extension._should_capture and (
+        todo is None or todo.capture is None or layer_idx in todo.capture
+    )
+    hooks = todo is None or todo.hooks
+    if not (steered or capture or hooks):
+        return None
     query_start_loc = _batch_layout(runner, warn=True)
     if query_start_loc is None:
         return None
@@ -578,8 +615,7 @@ def _hook_inner(
 
     # Apply the request slices planned for this layer.
     modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None = None
-    plan = extension._steer_pass
-    if plan is not None and layer_idx in plan:
+    if plan is not None and steered:
         target: torch.Tensor
         if isinstance(output, tuple):
             target, residual = output[0].clone(), output[1]
@@ -602,7 +638,7 @@ def _hook_inner(
     per_req_hooks: list[list[Hook]] = []
     needs_hooks = False
     persistent_hooks = extension._persistent_hooks
-    for i in range(num_reqs):
+    for i in range(num_reqs) if hooks else ():
         req_id = req_ids[i]
         req_state = runner.requests.get(req_id)
         extra = (
@@ -678,7 +714,7 @@ def _hook_inner(
             )
 
     # --- Phase 3: capture activations (rank 0 only) -----------------
-    if getattr(extension, "_should_capture", True):
+    if capture:
         capture_src = modified_output if modified_output is not None else output
         hidden_states: Float[torch.Tensor, "total_tokens hidden_dim"]  # type: ignore[reportUndefinedVariable]
         if isinstance(capture_src, tuple):
@@ -705,6 +741,8 @@ def _pre_hook_inner(
     post-hook operations and are not affected.
     """
     runner = extension.model_runner
+    if extension._hook_pass is not None and not extension._hook_pass.hooks:
+        return None
     query_start_loc = _batch_layout(runner, warn=False)
     if query_start_loc is None:
         return None
@@ -1027,6 +1065,7 @@ class HiddenStatesExtension:
 
     # The steering slices of the current forward pass.
     _steer_pass: dict[int, list[_SteerSlice]] | None = None
+    _hook_pass: _HookPass | None = None
 
     # Persistent hooks (apply to every request, not auto-cleaned):
     _persistent_hooks: list[Hook] = []
@@ -1082,18 +1121,21 @@ class HiddenStatesExtension:
         model_forward = runner._model_forward
 
         def _model_forward(*args: Any, **kwargs: Any) -> Any:
-            """Plan this forward pass's steering, then run it."""
+            """Plan this forward pass's steering and hook work, then run it."""
             try:
                 self._steer_pass = _steer_pass(self)
+                self._hook_pass = _hook_pass(self)
             except Exception:
                 # As for a bad hook: one request must not stop the engine.
                 logger.warning("Steering failed for this step", exc_info=True)
                 self._steer_pass = None
+                self._hook_pass = None
             try:
                 return model_forward(*args, **kwargs)
             finally:
                 # A forward pass outside this wrapper (a dummy run) steers nothing.
                 self._steer_pass = None
+                self._hook_pass = None
 
         runner._model_forward = _model_forward
 
