@@ -17,7 +17,7 @@ import logging
 import os
 import pickle
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import cloudpickle
 import torch
@@ -227,29 +227,6 @@ def _get_total_num_layers(worker: Any) -> int:
     return int(worker.model_config.get_total_num_hidden_layers())
 
 
-def _find_steering_configs(
-    extension: HiddenStatesExtension,
-    internal_req_id: str,
-    extra_args: dict[str, Any] | None,
-) -> list[SteeringVector]:
-    """Find all steering configs that apply to an internal request ID.
-
-    Matches by ``"{external_id}-"`` prefix (async path: vLLM appends
-    ``"-{random_suffix}"`` to external IDs) and by ``_steering_id``
-    sentinel in ``extra_args`` (offline path).
-    """
-    results: list[SteeringVector] = []
-    for external_id, configs in extension._steering_data.items():
-        if internal_req_id.startswith(f"{external_id}-"):
-            results.extend(configs)
-    # Offline path stores a lightweight string key in extra_args
-    if extra_args:
-        steering_id = extra_args.get("_steering_id")
-        if steering_id and steering_id in extension._steering_data:
-            results.extend(extension._steering_data[steering_id])
-    return results
-
-
 def _find_hook_configs(
     extension: HiddenStatesExtension,
     internal_req_id: str,
@@ -284,84 +261,147 @@ def _find_hook_configs_no_persistent(
     return results
 
 
-def norm_match(
-    residual: torch.Tensor,
-    steering: torch.Tensor,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """Scale a steering vector to match the L2 norm of the residual stream.
+class _SteeringLayer(NamedTuple):
+    """Prepared additions and normalized directions for one request and layer. Each
+    positional entry holds absolute positions, their values and whether they are matched."""
 
-    Norm matching approach from the Activation Oracles paper
-    (arXiv:2512.15674):
-
-        h'_i = h_i + ‖h_i‖ · v_i / ‖v_i‖
-
-    This rescales the steering vector so its magnitude matches the
-    residual before addition, ensuring activations of varying provenance
-    are automatically scaled to a consistent magnitude.
-    """
-    r_norm = residual.float().norm(dim=-1, keepdim=True)
-    v_norm = steering.float().norm(dim=-1, keepdim=True)
-    return (steering * (r_norm / (v_norm + eps))).to(residual.dtype)
+    add: torch.Tensor
+    norm: torch.Tensor | None
+    positional: list[tuple[list[int], torch.Tensor, bool]]
 
 
-def _apply_steering(
-    configs: list[SteeringVector],
-    layer_idx: int,
-    target: torch.Tensor,
-    start: int,
-    end: int,
-    abs_start: int,
-    norm_ref: torch.Tensor,
-) -> None:
-    """Apply all matching steering vectors to a token slice *in-place*.
+class _SteerSlice(NamedTuple):
+    """One request's token slice and prepared steering."""
 
-    ``target`` is the (already-cloned) output tensor.  ``start``/``end``
-    are batch-relative indices, ``abs_start`` is the absolute sequence
-    position of the first token in ``target[start:end]``.
+    start: int
+    end: int
+    abs_start: int
+    data: _SteeringLayer
 
-    ``norm_ref`` is the tensor whose per-token L2 norm ``norm_match`` should
-    match.  For fused-residual models (e.g. Qwen3) the layer returns
-    ``(hidden_states, residual)`` and ``target`` is only ``hidden_states``
-    (the MLP-delta half); the *true* residual stream is
-    ``hidden_states + residual``, so ``norm_ref`` must be that full stream,
-    not the MLP-delta half, or the steering vector is scaled to a far smaller
-    norm than HF uses.  For non-fused / plain-tensor layers the caller passes
-    ``norm_ref = target``.  Required (no default) so a forgotten reference
-    fails at the call instead of silently scaling to the wrong
-    MLP-delta-half norm.
-    """
-    n_tokens = end - start
-    for cfg in configs:
-        if layer_idx not in cfg.layer_index_map:
+
+def _steer_pass(
+    extension: HiddenStatesExtension,
+) -> dict[int, list[_SteerSlice]] | None:
+    """Group the token slices of the steered requests by layer, once per forward pass."""
+    if not extension._steering_data:
+        return None
+    runner = extension.model_runner
+    query_start_loc = _batch_layout(runner, warn=False)
+    if query_start_loc is None:
+        return None
+    num_reqs = runner.input_batch.num_reqs
+    bounds = query_start_loc[: num_reqs + 1].tolist()
+    layers: dict[int, list[_SteerSlice]] = {}
+    for i, req_id in enumerate(runner.input_batch.req_ids[:num_reqs]):
+        start, end = bounds[i], bounds[i + 1]
+        if start == end:
             continue
-        act_idx = cfg.layer_index_map[layer_idx]
-        vec = cfg.activations[act_idx].to(target.dtype)  # (hidden,) or (n_pos, hidden)
-
-        if vec.dim() == 1:
-            # 2D: broadcast to all positions
-            v = vec.unsqueeze(0)
-            if cfg.norm_match:
-                v = norm_match(norm_ref[start:end], v)
-            target[start:end] = target[start:end] + v * cfg.scale
-        else:
-            # 3D: position-specific
-            pos_indices = (
-                cfg.position_indices
-                if cfg.position_indices is not None
-                else list(range(vec.shape[0]))
+        request = runner.requests[req_id]
+        extra = getattr(request.sampling_params, "extra_args", None)
+        key = (extra or {}).get("_steering_id") or req_id.rpartition("-")[0]
+        for layer, data in extension._steering_data.get(key, {}).items():
+            layers.setdefault(layer, []).append(
+                _SteerSlice(start, end, request.num_computed_tokens, data)
             )
-            abs_end = abs_start + n_tokens
-            for pi, abs_pos in enumerate(pos_indices):
-                if pi >= vec.shape[0]:
-                    break
-                if abs_pos < abs_start or abs_pos >= abs_end:
-                    continue
-                rel = abs_pos - abs_start + start
-                v = vec[pi]
-                if cfg.norm_match:
-                    v = norm_match(norm_ref[rel], v)
-                target[rel] = target[rel] + v * cfg.scale
+    return layers or None
+
+
+def _steering_buffers(
+    spans: list[_SteerSlice],
+    length: int,
+    add_out: torch.Tensor | None = None,
+    norm_out: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Combine request slices and zero padding in one write per buffer, then add the
+    positional values."""
+    zero = torch.zeros_like(spans[0].data.add)
+    additions: list[torch.Tensor] = []
+    directions: list[torch.Tensor] = []
+    # Positional (token indices, values) for the add buffer (False) and the norm buffer (True).
+    points: dict[bool, list[tuple[list[int], torch.Tensor]]] = {False: [], True: []}
+    needs_norm = False
+    cursor = 0
+    for span in spans:
+        if span.start > cursor:
+            additions.append(zero.expand(span.start - cursor, -1))
+            directions.append(zero.expand(span.start - cursor, -1))
+        count = span.end - span.start
+        add = span.data.add
+        norm = span.data.norm if span.data.norm is not None else zero
+        # A decode slice has one token, so the (1, hidden) rows need no expand.
+        additions.append(add if count == 1 else add.expand(count, -1))
+        directions.append(norm if count == 1 else norm.expand(count, -1))
+        needs_norm |= span.data.norm is not None
+        for positions, values, matched in span.data.positional:
+            hits = [
+                (span.start + pos - span.abs_start, i)
+                for i, pos in enumerate(positions)
+                if span.abs_start <= pos < span.abs_start + count
+            ]
+            if hits:
+                target, source = zip(*hits)
+                points[matched].append((list(target), values[list(source)]))
+                needs_norm |= matched
+        cursor = span.end
+    if cursor < length:
+        additions.append(zero.expand(length - cursor, -1))
+        directions.append(zero.expand(length - cursor, -1))
+    add = torch.cat(additions, out=add_out)
+    norm = (
+        torch.cat(directions, out=norm_out)
+        if needs_norm or norm_out is not None
+        else None
+    )
+    for target, values in points[False]:
+        add.index_add_(0, torch.tensor(target, device=add.device), values)
+    if norm is not None:
+        for target, values in points[True]:
+            norm.index_add_(0, torch.tensor(target, device=norm.device), values)
+    return add, norm
+
+
+def _steer(
+    hidden: torch.Tensor,
+    residual: torch.Tensor | None,
+    add: torch.Tensor,
+    norm: torch.Tensor | None,
+) -> None:
+    """Apply additions and directions scaled by the unsteered stream norm."""
+    delta = add
+    if norm is not None:
+        stream = hidden if residual is None else hidden + residual
+        stream_norm = torch.linalg.vector_norm(
+            stream, dim=-1, keepdim=True, dtype=torch.float32
+        )
+        delta = delta + norm * stream_norm
+    hidden += delta.to(hidden.dtype)
+
+
+def _batch_layout(
+    runner: Any, *, warn: bool
+) -> Int[torch.Tensor, "num_reqs_plus1"] | None:  # type: ignore[reportUndefinedVariable]
+    """``query_start_loc`` of this forward pass, or None when there is nothing to act on.
+    With ``warn``, attention metadata without ``query_start_loc`` is logged."""
+    if not is_forward_context_available() or runner.input_batch.num_reqs == 0:
+        return None
+    attn_metadata = get_forward_context().attn_metadata
+    if isinstance(attn_metadata, list):
+        attn_metadata = attn_metadata[0] if attn_metadata else None
+    if attn_metadata is None:
+        return None
+    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have several metadata
+    # entries, and some (like GDNAttentionMetadata) lack query_start_loc.
+    for meta in attn_metadata.values():
+        query_start_loc = getattr(meta, "query_start_loc", None)
+        if query_start_loc is not None:
+            return query_start_loc
+    if warn:
+        logger.warning(
+            "No attention metadata with query_start_loc found "
+            "(keys: %s). Skipping hook for this step.",
+            list(attn_metadata.keys()),
+        )
+    return None
 
 
 def _hook_inner(
@@ -370,79 +410,26 @@ def _hook_inner(
     output: torch.Tensor | tuple[torch.Tensor, ...],
 ) -> torch.Tensor | tuple[torch.Tensor, ...] | None:
     """Core hook logic, separated so _make_hook can wrap it in try/except."""
-    if not is_forward_context_available():
-        return None
-
     runner = extension.model_runner
-    num_reqs = runner.input_batch.num_reqs
-    if num_reqs == 0:
+    query_start_loc = _batch_layout(runner, warn=True)
+    if query_start_loc is None:
         return None
-
+    num_reqs = runner.input_batch.num_reqs
     req_ids = runner.input_batch.req_ids
 
-    ctx = get_forward_context()
-    attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return None
-    if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return None
-    # Hybrid models (e.g. Qwen3-Next with GatedDeltaNet) have multiple
-    # attention metadata entries — some (like GDNAttentionMetadata) lack
-    # query_start_loc.  Find one that has it.
-    query_start_loc: Int[torch.Tensor, "num_reqs_plus1"] | None = None  # type: ignore[reportUndefinedVariable]
-    for _meta in attn_metadata.values():
-        if hasattr(_meta, "query_start_loc"):
-            query_start_loc = getattr(_meta, "query_start_loc")
-            break
-    if query_start_loc is None:
-        logger.warning(
-            "No attention metadata with query_start_loc found "
-            "(keys: %s). Skipping hook for this step.",
-            list(attn_metadata.keys()),
-        )
-        return None
-
-    # --- Phase 1: detect steering requests --------------------------
-    per_req_steering: list[list[SteeringVector]] = []
-    needs_steering = False
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        req_state = runner.requests.get(req_id)
-        extra = (
-            req_state.sampling_params.extra_args
-            if req_state and req_state.sampling_params
-            else None
-        )
-        configs = _find_steering_configs(extension, req_id, extra)
-        per_req_steering.append(configs)
-        if configs:
-            needs_steering = True
-
-    # --- Phase 2: apply steering ------------------------------------
+    # Apply the request slices planned for this layer.
     modified_output: torch.Tensor | tuple[torch.Tensor, ...] | None = None
-    if needs_steering:
+    plan = extension._steer_pass
+    if plan is not None and layer_idx in plan:
+        target: torch.Tensor
         if isinstance(output, tuple):
-            modified_output = (output[0].clone(), output[1])
-            target = modified_output[0]
-            # Fused-residual layers: true residual stream is output[0]+output[1].
-            # norm_match must reference the full stream, not the MLP-delta half.
-            norm_ref = output[0] + output[1] if output[1] is not None else output[0]
+            target, residual = output[0].clone(), output[1]
+            modified_output = (target, *output[1:])
         else:
-            modified_output = output.clone()
-            target = modified_output
-            norm_ref = target
-
-        for i in range(num_reqs):
-            if not per_req_steering[i]:
-                continue
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
-            abs_start = runner.requests[req_ids[i]].num_computed_tokens
-            _apply_steering(
-                per_req_steering[i], layer_idx, target, start, end, abs_start, norm_ref
-            )
+            target, residual = output.clone(), None
+            modified_output = target
+        add, norm = _steering_buffers(plan[layer_idx], target.shape[0])
+        _steer(target, residual, add, norm)
 
     # --- Phase 2.5: run generic (post) hooks -------------------------
     # Per-request and persistent hooks are stored in separate context
@@ -593,30 +580,12 @@ def _pre_hook_inner(
     Only runs generic hooks — steering and activation capture are
     post-hook operations and are not affected.
     """
-    if not is_forward_context_available():
-        return None
-
     runner = extension.model_runner
-    num_reqs = runner.input_batch.num_reqs
-    if num_reqs == 0:
-        return None
-
-    req_ids = runner.input_batch.req_ids
-    ctx = get_forward_context()
-    attn_metadata = ctx.attn_metadata
-    if attn_metadata is None:
-        return None
-    if isinstance(attn_metadata, list):
-        attn_metadata = attn_metadata[0]
-        if attn_metadata is None:
-            return None
-    query_start_loc: torch.Tensor | None = None
-    for _meta in attn_metadata.values():
-        if hasattr(_meta, "query_start_loc"):
-            query_start_loc = getattr(_meta, "query_start_loc")
-            break
+    query_start_loc = _batch_layout(runner, warn=False)
     if query_start_loc is None:
         return None
+    num_reqs = runner.input_batch.num_reqs
+    req_ids = runner.input_batch.req_ids
 
     # Pre-hooks share the same context stores as post-hooks, keyed by the
     # hook's position in its category list.  A hook at a given position is
@@ -914,13 +883,15 @@ class HiddenStatesExtension:
     ] = {}
     _hooks_installed: bool = False
 
-    # Per-request steering configs:
-    # key (external_req_id or _steering_id) → list of SteeringVector
-    _steering_data: dict[str, list[SteeringVector]] = {}
+    # Prepared steering by request key and layer.
+    _steering_data: dict[str, dict[int, _SteeringLayer]] = {}
 
     # Per-request hook definitions:
     # key (external_req_id or _hook_id) → list of Hook
     _hook_data: dict[str, list[Hook]] = {}
+
+    # The steering slices of the current forward pass.
+    _steer_pass: dict[int, list[_SteerSlice]] | None = None
 
     # Persistent hooks (apply to every request, not auto-cleaned):
     _persistent_hooks: list[Hook] = []
@@ -968,6 +939,7 @@ class HiddenStatesExtension:
         self._captured_states = {}
         self._steering_data = {}
         self._hook_data = {}
+        self._steer_pass = None
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
             self._persistent_hooks = []
         self._hook_contexts = {}
@@ -985,26 +957,39 @@ class HiddenStatesExtension:
             layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
             layer.register_forward_hook(_make_hook(self, layer_idx))
 
+        runner = self.model_runner
+        model_forward = runner._model_forward
+
+        def _model_forward(*args: Any, **kwargs: Any) -> Any:
+            """Plan this forward pass's steering, then run it."""
+            try:
+                self._steer_pass = _steer_pass(self)
+            except Exception:
+                # As for a bad hook: one request must not stop the engine.
+                logger.warning("Steering failed for this step", exc_info=True)
+                self._steer_pass = None
+            try:
+                return model_forward(*args, **kwargs)
+            finally:
+                # A forward pass outside this wrapper (a dummy run) steers nothing.
+                self._steer_pass = None
+
+        runner._model_forward = _model_forward
+
     # ------------------------------------------------------------------
     # Steering data management (called via collective_rpc)
     # ------------------------------------------------------------------
 
     def set_steering_data(self, key: str, pickled_data: bytes) -> None:
-        """Receive and store steering vectors for a request.
-
-        Called via ``collective_rpc`` before generation begins.  Unpickles
-        the list of ``SteeringVector`` instances, validates layer indices
-        against the model, moves activation tensors to GPU in the model's
-        dtype, and stores them keyed by *key* (an external request ID or a
-        synthetic ``_steering_id``).
-        """
+        """Validate and prepare steering vectors for one request."""
         sv_list: list[SteeringVector] = pickle.loads(pickled_data)
 
         device = next(self.model_runner.model.parameters()).device
         dtype = next(self.model_runner.model.parameters()).dtype
 
         num_layers = _get_total_num_layers(self)
-        vectors: list[SteeringVector] = []
+        hidden = self.model_runner.model_config.get_hidden_size()
+        prepared: dict[int, _SteeringLayer] = {}
 
         for sv in sv_list:
             for idx in sv.layer_indices:
@@ -1012,16 +997,42 @@ class HiddenStatesExtension:
                     raise ValueError(
                         f"layer_index {idx} out of range [0, {num_layers})"
                     )
-
-            vectors.append(
-                sv.model_copy(
-                    update={
-                        "activations": sv.activations.to(device=device, dtype=dtype)
-                    }
+            if sv.activations.shape[-1] != hidden:
+                raise ValueError(
+                    f"vector width {sv.activations.shape[-1]}, model width {hidden}"
                 )
-            )
 
-        self._steering_data[key] = vectors
+            values = sv.activations.to(device=device, dtype=dtype).float()
+            if sv.norm_match:
+                values = values / (values.norm(dim=-1, keepdim=True) + 1e-6)
+            values = values * sv.scale
+            for layer, index in sv.layer_index_map.items():
+                if layer not in prepared:
+                    prepared[layer] = _SteeringLayer(
+                        torch.zeros((1, hidden), dtype=torch.float32, device=device),
+                        None,
+                        [],
+                    )
+                data = prepared[layer]
+                if values.dim() == 3:
+                    count = values.shape[1]
+                    positions = sv.position_indices
+                    if positions is None:
+                        positions = list(range(count))
+                    data.positional.append(
+                        (list(positions[:count]), values[index], sv.norm_match)
+                    )
+                elif sv.norm_match:
+                    norm = (
+                        data.norm
+                        if data.norm is not None
+                        else torch.zeros_like(data.add)
+                    )
+                    norm.add_(values[index])
+                    prepared[layer] = data._replace(norm=norm)
+                else:
+                    data.add.add_(values[index])
+        self._steering_data[key] = prepared
 
     def clear_steering_data(self, key: str) -> None:
         """Remove steering data for a completed request."""
