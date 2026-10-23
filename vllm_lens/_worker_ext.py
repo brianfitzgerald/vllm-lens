@@ -432,7 +432,7 @@ def _hook_inner(
         else:
             modified_output = output.clone()
             target = modified_output
-            norm_ref = target
+            norm_ref = output
 
         for i in range(num_reqs):
             if not per_req_steering[i]:
