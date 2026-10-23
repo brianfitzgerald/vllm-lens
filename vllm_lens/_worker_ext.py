@@ -542,12 +542,6 @@ def _hook_inner(
             output_residual_stream = extra.get("output_residual_stream")
             if output_residual_stream is None:
                 continue
-            # vllm_xargs passes values as strings; parse JSON lists.
-            if isinstance(output_residual_stream, str):
-                try:
-                    output_residual_stream = json.loads(output_residual_stream)
-                except (json.JSONDecodeError, ValueError):
-                    pass  # treat as truthy (capture all layers)
             if (
                 isinstance(output_residual_stream, list)
                 and layer_idx not in output_residual_stream
