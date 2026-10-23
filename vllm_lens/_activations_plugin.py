@@ -311,6 +311,13 @@ def _reject_async_spec_positions(
         )
 
 
+def _check_capture_options(extra: dict[str, Any]) -> None:
+    """Parse the layer list that ``vllm_xargs`` passes as a JSON string."""
+    layers = extra.get("output_residual_stream")
+    if isinstance(layers, str):
+        extra["output_residual_stream"] = json.loads(layers)
+
+
 def _trim_activations(
     activations: dict[str, Any],
     expected_len: int,
@@ -450,6 +457,7 @@ async def _patched_generate(
         effective_params.extra_args = dict(effective_params.extra_args or {})
 
     extra = effective_params.extra_args or {}
+    _check_capture_options(extra)
     wants_activations = extra.get("output_residual_stream") is not None
     # Response-transport negotiation (issue #31): "binary" parks activation
     # bytes in the process-local store and returns a handle instead of base64.
@@ -589,6 +597,7 @@ def _prepare_offline_params(
     extras = [dict(sp.extra_args or {}) for sp in params_list]
     for sp, extra in zip(params_list, extras):
         sp.extra_args = extra
+        _check_capture_options(extra)
 
     wants_activations = any(
         extra.get("output_residual_stream") is not None for extra in extras
