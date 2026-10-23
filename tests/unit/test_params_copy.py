@@ -31,6 +31,7 @@ def test_offline_generate_keeps_the_callers_params(
     )
     llm = SimpleNamespace(
         _hooks_installed=True,
+        _lens_projections=frozenset(),
         llm_engine=SimpleNamespace(vllm_config=SimpleNamespace(additional_config=None)),
         collective_rpc=lambda method, args=(): [],
     )
@@ -67,6 +68,7 @@ async def test_async_generate_keeps_the_callers_params(
     engine = SimpleNamespace(
         vllm_config=SimpleNamespace(additional_config=None),
         _hooks_installed=True,
+        _lens_projections=frozenset(),
         collective_rpc=collective_rpc,
     )
     params = _params()

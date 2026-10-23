@@ -70,7 +70,10 @@ def capture_llm(request):
     torch.cuda.empty_cache()
 
 
-def fake_extension(extras: dict[str, dict[str, Any] | None]) -> SimpleNamespace:
+def fake_extension(
+    extras: dict[str, dict[str, Any] | None],
+    directions: dict[str, torch.Tensor] | None = None,
+) -> SimpleNamespace:
     """A worker stand-in whose runner holds one request per entry of ``extras``, each with
     10 prompt tokens and none computed."""
     requests = {
@@ -90,6 +93,8 @@ def fake_extension(extras: dict[str, dict[str, Any] | None]) -> SimpleNamespace:
         _captured_states={},
         _pooled={},
         _captured_positions={},
+        _projections={},
+        _direction_tables=directions or {},
     )
 
 

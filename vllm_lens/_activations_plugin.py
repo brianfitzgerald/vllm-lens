@@ -32,9 +32,11 @@ from vllm_lens._helpers._positions import (
     parse_capture_positions,
 )
 from vllm_lens._helpers._serialize import (
+    deserialize_tensor,
     serialize_activations,
     serialize_activations_binary,
     serialize_hook_results,
+    serialize_tensor,
 )
 from vllm_lens._helpers.types import Hook, SteeringVector
 
@@ -298,16 +300,33 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
     return [h if isinstance(h, Hook) else Hook.model_validate(h) for h in value]
 
 
-def _check_capture_options(extra: dict[str, Any]) -> None:
+def _check_directions(value: dict[str, Any], hidden: int) -> dict[str, Any]:
+    """The ``serialize_tensor`` dict of projection directions; ``ValueError`` unless they
+    are finite ``(N, hidden)``."""
+    directions = deserialize_tensor(value)
+    if (
+        directions.ndim != 2
+        or directions.shape[1] != hidden
+        or not torch.isfinite(directions).all()
+    ):
+        raise ValueError(
+            f"projection directions must be finite (N, {hidden}), "
+            f"got {tuple(directions.shape)}"
+        )
+    return value
+
+
+def _check_capture_options(extra: dict[str, Any], projections: set[str]) -> None:
     """Parse the layer list and selector that ``vllm_xargs`` passes as strings, and raise
     ``ValueError`` for a bad pool value or selector, an option without
-    ``output_residual_stream``, or a combination of options."""
+    ``output_residual_stream``, a combination of options, or an unknown projection."""
     layers = extra.get("output_residual_stream")
     if isinstance(layers, str):
         extra["output_residual_stream"] = json.loads(layers)
     pool = extra.get("output_residual_stream_pool")
     if pool not in (None, "mean"):
         raise ValueError(f"output_residual_stream_pool must be 'mean', got {pool!r}")
+    project = extra.get("output_residual_stream_project")
     selector = parse_capture_positions(extra.pop(POSITIONS_KEY, None))
     if selector is not None:
         extra[POSITIONS_KEY] = selector
@@ -315,6 +334,7 @@ def _check_capture_options(extra: dict[str, Any]) -> None:
         key
         for key, value in (
             ("output_residual_stream_pool", pool),
+            ("output_residual_stream_project", project),
             (POSITIONS_KEY, extra.get(POSITIONS_KEY)),
         )
         if value is not None
@@ -323,6 +343,11 @@ def _check_capture_options(extra: dict[str, Any]) -> None:
         raise ValueError(f"{' and '.join(chosen)} cannot be combined")
     if chosen and extra.get("output_residual_stream") is None:
         raise ValueError(f"{chosen[0]} requires output_residual_stream")
+    if project is not None and project not in projections:
+        raise ValueError(
+            f"output_residual_stream_project names {project!r}, which is not "
+            "registered: register it with LLM.set_projection or POST /v1/projections"
+        )
 
 
 def _trim_activations(
@@ -351,6 +376,8 @@ def _trim_activations(
             activations[POSITIONS_META_KEY] = [positions[row] for row in keep]
     for key in (
         *(() if positions is not None else ("residual_stream",)),
+        "residual_stream_projection",
+        "residual_stream_norm",
         "attn_q",
         "attn_k",
     ):
@@ -474,7 +501,7 @@ async def _patched_generate(
         effective_params.extra_args = dict(effective_params.extra_args or {})
 
     extra = effective_params.extra_args or {}
-    _check_capture_options(extra)
+    _check_capture_options(extra, self._lens_projections)  # type: ignore[reportAttributeAccessIssue]
     wants_activations = extra.get("output_residual_stream") is not None
     # Response-transport negotiation (issue #31): "binary" parks activation
     # bytes in the process-local store and returns a handle instead of base64.
@@ -613,8 +640,10 @@ def _prepare_offline_params(
     extras = [dict(sp.extra_args or {}) for sp in params_list]
     for sp, extra in zip(params_list, extras):
         sp.extra_args = extra
-        _check_capture_options(extra)
 
+    projections = self._lens_projections  # type: ignore[reportAttributeAccessIssue]
+    for extra in extras:
+        _check_capture_options(extra, projections)
     wants_activations = any(
         extra.get("output_residual_stream") is not None for extra in extras
     )
@@ -940,11 +969,12 @@ def _patched_register_routers(app):
     """Inject vllm-lens hook router after vLLM registers its own routes."""
     assert _original_register_routers is not None
     _original_register_routers(app)
-    from vllm_lens._hooks_router import activations_router
+    from vllm_lens._hooks_router import activations_router, projections_router
     from vllm_lens._hooks_router import router as hooks_router
 
     app.include_router(hooks_router)
     app.include_router(activations_router)
+    app.include_router(projections_router)
 
 
 # ---------------------------------------------------------------------------
@@ -965,6 +995,21 @@ def _llm_register_hooks(
     if prefetch_params:
         self.collective_rpc("prefetch_parameters", args=(prefetch_params,))
     self._has_persistent_hooks = True  # type: ignore[reportAttributeAccessIssue]
+
+
+def _llm_set_projection(self: LLM, name: str, directions: torch.Tensor) -> None:
+    """Hold ``(N, hidden)`` directions on the workers under ``name``, for requests that name
+    it in ``output_residual_stream_project``."""
+    hidden = self.llm_engine.model_config.get_hidden_size()
+    payload = _check_directions(serialize_tensor(directions.float()), hidden)
+    self.collective_rpc("set_projection", args=(name, payload))
+    self._lens_projections = {*self._lens_projections, name}  # type: ignore[reportAttributeAccessIssue]
+
+
+def _llm_clear_projection(self: LLM, name: str | None = None) -> None:
+    """Drop the directions under ``name``; None drops every set."""
+    self.collective_rpc("clear_projection", args=(name,))
+    self._lens_projections = set() if name is None else self._lens_projections - {name}  # type: ignore[reportAttributeAccessIssue]
 
 
 def _llm_collect_hook_results(self: LLM) -> dict:
@@ -1087,6 +1132,11 @@ def register() -> None:
     LLM.clear_hooks = _llm_clear_hooks  # type: ignore[reportAttributeAccessIssue]
     LLM.prefetch_params = _llm_prefetch_params  # type: ignore[reportAttributeAccessIssue]
     LLM.clear_prefetched = _llm_clear_prefetched  # type: ignore[reportAttributeAccessIssue]
+    LLM.set_projection = _llm_set_projection  # type: ignore[reportAttributeAccessIssue]
+    LLM.clear_projection = _llm_clear_projection  # type: ignore[reportAttributeAccessIssue]
+    # The names of the registered direction sets, checked before a request is submitted.
+    LLM._lens_projections = frozenset()  # type: ignore[reportAttributeAccessIssue]
+    AsyncLLM._lens_projections = frozenset()  # type: ignore[reportAttributeAccessIssue]
 
     # Patch OpenAI-compatible response builders so activations survive
     # HTTP serialization.  Wrapped in try/except because these modules

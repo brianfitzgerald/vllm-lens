@@ -16,20 +16,21 @@ import vllm_lens._activations_plugin as plugin
 def test_layer_list_is_parsed(value, expected) -> None:
     """Test that a JSON-string layer list becomes the decoded value."""
     extra = {"output_residual_stream": value}
-    plugin._check_capture_options(extra)
+    plugin._check_capture_options(extra, set())
     assert extra["output_residual_stream"] == expected
 
 
 def test_invalid_json_raises() -> None:
     """Test that an invalid layer list fails at submission."""
     with pytest.raises(json.JSONDecodeError):
-        plugin._check_capture_options({"output_residual_stream": "[1,"})
+        plugin._check_capture_options({"output_residual_stream": "[1,"}, set())
 
 
 def test_offline_params_carry_the_parsed_list() -> None:
     """Test that the params sent to vLLM hold the list and the caller's keep the string."""
     llm = SimpleNamespace(
         _hooks_installed=True,
+        _lens_projections=frozenset(),
         llm_engine=SimpleNamespace(vllm_config=SimpleNamespace(additional_config=None)),
         collective_rpc=lambda method, args=(): [],
     )
