@@ -26,6 +26,12 @@ import cloudpickle
 import torch
 import zstandard as zstd
 
+from vllm_lens._helpers._positions import (
+    LAST_PROMPT_TOKEN,
+    POSITIONS_KEY,
+    POSITIONS_META_KEY,
+    parse_capture_positions,
+)
 from vllm_lens._helpers._serialize import (
     serialize_activations,
     serialize_activations_binary,
@@ -124,10 +130,20 @@ def _merge_captured_states(
     ]
     if not parts:
         return None
+    return _merge_rank_activations([p["activations"] for p in parts])
+
+
+def _merge_rank_activations(parts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Concatenate the tensors of each pipeline rank along the layer dim; the positions list
+    is the same on every rank."""
     if len(parts) == 1:
-        return parts[0]["activations"]
-    merged = torch.cat([p["activations"]["residual_stream"] for p in parts], dim=0)
-    return {"residual_stream": merged}
+        return parts[0]
+    return {
+        key: torch.cat([p[key] for p in parts])
+        if isinstance(value, torch.Tensor)
+        else value
+        for key, value in parts[0].items()
+    }
 
 
 def _merge_captured_states_batch(
@@ -160,14 +176,7 @@ def _merge_captured_states_batch(
         per_rank = [d[req_id] for d in rank_dicts if req_id in d]
         if not per_rank:
             continue
-        if len(per_rank) == 1:
-            out[req_id] = per_rank[0]["activations"]
-        else:
-            merged = torch.cat(
-                [p["activations"]["residual_stream"] for p in per_rank],
-                dim=0,
-            )
-            out[req_id] = {"residual_stream": merged}
+        out[req_id] = _merge_rank_activations([p["activations"] for p in per_rank])
     return out
 
 
@@ -291,10 +300,12 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
 
 
 def _reject_async_spec_positions(
-    vllm_config: Any, vectors: list[SteeringVector] | None
+    vllm_config: Any,
+    vectors: list[SteeringVector] | None,
+    positions: str | list[int] | None = None,
 ) -> None:
-    """Raise ``ValueError`` for a position-specific vector under async speculative decoding,
-    where the computed-token count of a request is optimistic during the forward pass."""
+    """Raise ``ValueError`` for a position-specific vector or a list of capture positions under
+    async speculative decoding, where the computed-token count of a request is optimistic."""
     scheduler = getattr(vllm_config, "scheduler_config", None)
     if getattr(vllm_config, "speculative_config", None) is None or not getattr(
         scheduler, "async_scheduling", False
@@ -309,19 +320,39 @@ def _reject_async_spec_positions(
             "decoding: the positions of generated tokens are not known before the forward "
             "pass. Disable async scheduling or speculative decoding to steer by position."
         )
+    if isinstance(positions, list):
+        raise ValueError(
+            f"A list in {POSITIONS_KEY} is not available with async speculative decoding: "
+            "the positions of generated tokens are not known before the forward pass. "
+            f"Use {LAST_PROMPT_TOKEN!r}, or disable async scheduling or speculative decoding."
+        )
 
 
 def _check_capture_options(extra: dict[str, Any]) -> None:
-    """Parse the layer list that ``vllm_xargs`` passes as a JSON string, and raise
-    ``ValueError`` for a bad pool value or a pool without ``output_residual_stream``."""
+    """Parse the layer list and selector that ``vllm_xargs`` passes as strings, and raise
+    ``ValueError`` for a bad pool value or selector, an option without
+    ``output_residual_stream``, or a combination of options."""
     layers = extra.get("output_residual_stream")
     if isinstance(layers, str):
         extra["output_residual_stream"] = json.loads(layers)
     pool = extra.get("output_residual_stream_pool")
     if pool not in (None, "mean"):
         raise ValueError(f"output_residual_stream_pool must be 'mean', got {pool!r}")
-    if pool is not None and extra.get("output_residual_stream") is None:
-        raise ValueError("output_residual_stream_pool requires output_residual_stream")
+    selector = parse_capture_positions(extra.pop(POSITIONS_KEY, None))
+    if selector is not None:
+        extra[POSITIONS_KEY] = selector
+    chosen = [
+        key
+        for key, value in (
+            ("output_residual_stream_pool", pool),
+            (POSITIONS_KEY, extra.get(POSITIONS_KEY)),
+        )
+        if value is not None
+    ]
+    if len(chosen) > 1:
+        raise ValueError(f"{' and '.join(chosen)} cannot be combined")
+    if chosen and extra.get("output_residual_stream") is None:
+        raise ValueError(f"{chosen[0]} requires output_residual_stream")
 
 
 def _trim_activations(
@@ -339,10 +370,20 @@ def _trim_activations(
     during that extra pass.  This trims the surplus positions so the
     residual stream shape is always deterministic.
     """
-    rs = activations.get("residual_stream")
-    if rs is not None and rs.shape[1] > expected_len:
-        activations["residual_stream"] = rs[:, :expected_len, :]
-    for key in ("attn_q", "attn_k"):
+    positions = activations.get(POSITIONS_META_KEY)
+    if positions is not None:
+        # Selected rows are sparse: a row of the extra pass is at or past expected_len.
+        keep = [
+            row for row, position in enumerate(positions) if position < expected_len
+        ]
+        if len(keep) < len(positions):
+            activations["residual_stream"] = activations["residual_stream"][:, keep]
+            activations[POSITIONS_META_KEY] = [positions[row] for row in keep]
+    for key in (
+        *(() if positions is not None else ("residual_stream",)),
+        "attn_q",
+        "attn_k",
+    ):
         t = activations.get(key)
         if t is not None and t.shape[1] > expected_len:
             activations[key] = t[:, :expected_len]
@@ -479,7 +520,9 @@ async def _patched_generate(
     steering_vectors = _decode_steering_vectors(
         extra.pop("apply_steering_vectors", None)
     )
-    _reject_async_spec_positions(self.vllm_config, steering_vectors)
+    _reject_async_spec_positions(
+        self.vllm_config, steering_vectors, extra.get(POSITIONS_KEY)
+    )
 
     # Extract hooks (callables can't survive msgspec).
     hooks_list = _decode_hooks(extra.pop("apply_hooks", None))
@@ -616,7 +659,9 @@ def _prepare_offline_params(
     steering_payloads: dict[str, bytes] = {}  # steering_id -> pickled vectors
     for idx, extra in enumerate(extras):
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
-        _reject_async_spec_positions(self.llm_engine.vllm_config, vectors)
+        _reject_async_spec_positions(
+            self.llm_engine.vllm_config, vectors, extra.get(POSITIONS_KEY)
+        )
         if vectors is not None:
             steering_id = f"_steer_{idx}"
             steering_payloads[steering_id] = pickle.dumps(vectors)
