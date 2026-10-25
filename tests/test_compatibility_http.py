@@ -4,6 +4,8 @@ Run with VLLM_TEST_MODEL=Qwen/Qwen2.5-0.5B-Instruct. Unlike the original
 Llama-specific server tests, these infer hidden size from captured states.
 """
 
+import uuid
+
 import pytest
 import torch
 
@@ -92,3 +94,48 @@ def test_persistent_hook_cleanup(client):
     client.clear_hooks()
     client.generate(PROMPT, max_tokens=1)
     assert not client.collect_hook_results()
+
+
+@pytest.mark.parametrize("endpoint", ["generate", "chat"])
+@pytest.mark.parametrize("kind", ["steering", "hooks", "persistent"])
+def test_intervention_cache_isolation(client, endpoint, kind):
+    """HTTP interventions isolate writes without requesting activation capture."""
+    prompt = uuid.uuid4().hex + " The quick brown fox jumps over the lazy dog." * 20
+    inputs = prompt if endpoint == "generate" else [{"role": "user", "content": prompt}]
+    run = getattr(client, endpoint)
+    options = {
+        "cache_salt": uuid.uuid4().hex,
+        "return_token_ids": True,
+        "max_tokens": 20,
+        "temperature": 0.0,
+    }
+    hook = Hook(fn=lambda ctx, h: torch.zeros_like(h), layer_indices=[LAYER])
+    intervention = {}
+    if kind == "steering":
+        probe = run(inputs, capture_layers=[LAYER], max_tokens=1)
+        hidden_dim = probe.activations["residual_stream"].shape[-1]
+        intervention["steering_vectors"] = [
+            SteeringVector(
+                activations=torch.ones(1, hidden_dim), layer_indices=[LAYER], scale=10.0
+            )
+        ]
+    elif kind == "hooks":
+        intervention["hooks"] = [hook]
+    else:
+        client.register_hooks([hook])
+    try:
+        for _ in range(2):
+            result = run(inputs, **options, **intervention)
+            assert result.raw["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+    finally:
+        if kind == "persistent":
+            client.clear_hooks()
+    first = run(inputs, **options)
+    assert first.raw["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+    repeat = run(inputs, **options)
+    assert repeat.raw["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
+    fresh = run(inputs, **{**options, "cache_salt": uuid.uuid4().hex})
+    # A cache hit is not bitwise equal to a prefill, so only the two prefills must match.
+    tokens = first.raw["choices"][0]["token_ids"]
+    assert tokens is not None
+    assert tokens == fresh.raw["choices"][0]["token_ids"]

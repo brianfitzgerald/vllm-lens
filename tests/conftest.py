@@ -50,6 +50,7 @@ def vllm_server(tmp_path_factory):
         vllm_bin,
         "serve",
         MODEL,
+        "--enable-prompt-tokens-details",
         "--dtype",
         "auto",
         "--gpu-memory-utilization",
