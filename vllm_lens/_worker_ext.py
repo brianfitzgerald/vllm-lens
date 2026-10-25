@@ -17,9 +17,10 @@ import logging
 import os
 import pickle
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import cloudpickle
+import numpy as np
 import torch
 import zstandard as zstd
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -404,6 +405,70 @@ def _batch_layout(
     return None
 
 
+def _to_host(rows: torch.Tensor) -> torch.Tensor:
+    """Queue a copy of ``rows`` into pinned host memory and return it without waiting:
+    the engine's sampled-token copy syncs the stream each step, before the request finishes."""
+    if not rows.is_cuda:
+        return rows
+    host = torch.empty(rows.shape, dtype=rows.dtype, pin_memory=True)
+    host.copy_(rows, non_blocking=True)
+    return host
+
+
+def _capture_rows(
+    extension: HiddenStatesExtension,
+    layer_idx: int,
+    hidden_states: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """Store the rows of one layer for every request that captures it, in one gather and
+    one pinned copy."""
+    runner = extension.model_runner
+    num_reqs = runner.input_batch.num_reqs
+    req_ids = runner.input_batch.req_ids
+    bounds: list[int] | None = None
+    # Each request's batch rows.
+    picked: list[tuple[str, np.ndarray]] = []
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        req_state = runner.requests.get(req_id)
+        if req_state is None or req_state.sampling_params is None:
+            continue
+        extra = req_state.sampling_params.extra_args
+        if not extra:
+            continue
+
+        output_residual_stream = extra.get("output_residual_stream")
+        if output_residual_stream is None:
+            continue
+        if (
+            isinstance(output_residual_stream, list)
+            and layer_idx not in output_residual_stream
+        ):
+            continue
+
+        if bounds is None:
+            bounds = cast(list[int], query_start_loc[: num_reqs + 1].tolist())
+        start, end = bounds[i], bounds[i + 1]
+        picked.append((req_id, np.arange(start, end, dtype=np.int64)))
+
+    if picked:
+        index = torch.from_numpy(np.concatenate([rows for _, rows in picked]))
+        if hidden_states.is_cuda:
+            index = index.pin_memory()
+        host = _to_host(
+            hidden_states.index_select(
+                0, index.to(hidden_states.device, non_blocking=True)
+            )
+        )
+        for (req_id, _), piece in zip(
+            picked, host.split([len(rows) for _, rows in picked])
+        ):
+            extension._captured_states.setdefault(req_id, {}).setdefault(
+                layer_idx, []
+            ).append(piece)
+
+
 def _hook_inner(
     extension: HiddenStatesExtension,
     layer_idx: int,
@@ -530,36 +595,7 @@ def _hook_inner(
         else:
             hidden_states = capture_src
 
-        for i in range(num_reqs):
-            req_id = req_ids[i]
-            req_state = runner.requests.get(req_id)
-            if req_state is None or req_state.sampling_params is None:
-                continue
-            extra = req_state.sampling_params.extra_args
-            if not extra:
-                continue
-
-            output_residual_stream = extra.get("output_residual_stream")
-            if output_residual_stream is None:
-                continue
-            if (
-                isinstance(output_residual_stream, list)
-                and layer_idx not in output_residual_stream
-            ):
-                continue
-
-            start = query_start_loc[i].item()
-            end = query_start_loc[i + 1].item()
-            activation: Float[torch.Tensor, "seq_len hidden_dim"] = hidden_states[  # type: ignore[reportUndefinedVariable]
-                start:end
-            ].cpu()
-
-            if req_id not in extension._captured_states:
-                extension._captured_states[req_id] = {}
-            layer_states = extension._captured_states[req_id]
-            if layer_idx not in layer_states:
-                layer_states[layer_idx] = []
-            layer_states[layer_idx].append(activation)
+        _capture_rows(extension, layer_idx, hidden_states, query_start_loc)
 
     return modified_output
 
