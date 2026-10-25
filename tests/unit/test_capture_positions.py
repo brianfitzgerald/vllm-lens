@@ -52,5 +52,5 @@ def test_parse_rejects_invalid_selectors(value) -> None:
 )
 def test_capture_options_are_normalized(extra: dict, expected: dict) -> None:
     """The layer list and the selector replace their string forms; None is removed."""
-    _check_capture_options(extra)
+    _check_capture_options(extra, set())
     assert extra == expected
