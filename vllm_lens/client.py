@@ -43,7 +43,7 @@ from vllm_lens._helpers._serialize import (
     deserialize_hook_results,
     serialize_tensor,
 )
-from vllm_lens._helpers.types import Hook, SteeringVector
+from vllm_lens._helpers.types import Hook, SteeringRow, SteeringVector
 
 if TYPE_CHECKING:
     import torch
@@ -110,6 +110,7 @@ class VLLMLensClient:
         capture_pool: Literal["mean"] | None = None,
         capture_project: str | None = None,
         capture_positions: str | list[int] | None = None,
+        steering_rows: list[SteeringRow] | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
@@ -133,6 +134,10 @@ class VLLMLensClient:
         if steering_vectors is not None:
             xargs["apply_steering_vectors"] = json.dumps(
                 [sv.model_dump() for sv in steering_vectors]
+            )
+        if steering_rows is not None:
+            xargs["apply_steering_rows"] = json.dumps(
+                [row.model_dump() for row in steering_rows]
             )
         return xargs
 
@@ -190,6 +195,7 @@ class VLLMLensClient:
         capture_pool: Literal["mean"] | None = None,
         capture_project: str | None = None,
         capture_positions: str | list[int] | None = None,
+        steering_rows: list[SteeringRow] | None = None,
         logprobs: int | None = None,
         echo: bool = False,
         **kwargs: Any,
@@ -211,7 +217,8 @@ class VLLMLensClient:
         ``capture_positions`` keeps ``"last_prompt_token"`` or a list of absolute
         positions and adds ``residual_stream_positions``; ``capture_project`` names
         a set from :meth:`set_projection` and returns the projection of every
-        position onto its rows and the norm of every position.
+        position onto its rows and the norm of every position. ``steering_rows`` adds
+        rows of a table from :meth:`set_steering_table`.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -234,6 +241,7 @@ class VLLMLensClient:
             capture_pool=capture_pool,
             capture_project=capture_project,
             capture_positions=capture_positions,
+            steering_rows=steering_rows,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -257,6 +265,7 @@ class VLLMLensClient:
         capture_pool: Literal["mean"] | None = None,
         capture_project: str | None = None,
         capture_positions: str | list[int] | None = None,
+        steering_rows: list[SteeringRow] | None = None,
         **kwargs: Any,
     ) -> GenerateOutput:
         """Generate a chat completion from a list of messages.
@@ -287,6 +296,7 @@ class VLLMLensClient:
             capture_pool=capture_pool,
             capture_project=capture_project,
             capture_positions=capture_positions,
+            steering_rows=steering_rows,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -318,6 +328,29 @@ class VLLMLensClient:
         )
         if resp.status_code != 200:
             raise RuntimeError(f"Failed to clear projection {name!r}: {resp.text}")
+
+    # ------------------------------------------------------------------
+    # Steering tables
+    # ------------------------------------------------------------------
+
+    def set_steering_table(self, name: str, vectors: torch.Tensor) -> None:
+        """Hold ``(N, hidden)`` steering vectors on the server under ``name``, for
+        ``SteeringRow(table=name, ...)``."""
+        resp = self._session.post(
+            f"{self.base_url}/v1/steering_tables",
+            json={"name": name, "vectors": serialize_tensor(vectors.float())},
+            timeout=self._timeout,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Failed to set steering table {name!r}: {resp.text}")
+
+    def clear_steering_table(self, name: str) -> None:
+        """Drop the steering table under ``name``."""
+        resp = self._session.delete(
+            f"{self.base_url}/v1/steering_tables/{name}", timeout=self._timeout
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Failed to clear steering table {name!r}: {resp.text}")
 
     # ------------------------------------------------------------------
     # Persistent hooks

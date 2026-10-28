@@ -7,7 +7,7 @@ from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from vllm_lens._helpers.types import SteeringVector
+    from vllm_lens._helpers.types import SteeringRow, SteeringVector
 
 # The key of these settings in ``VllmConfig.additional_config``, part of the compile cache key.
 CONFIG_KEY = "vllm_lens"
@@ -84,6 +84,7 @@ class LensGraphConfig:
         qk: bool = False,
         residual_stream: Any = None,
         vectors: list[SteeringVector] | None = None,
+        rows: list[SteeringRow] | None = None,
     ) -> None:
         """Raise ``ValueError`` for what only the forward hooks serve: hooks, Q/K capture,
         a capture or steering layer outside the lists, a capture of every layer, or
@@ -96,13 +97,19 @@ class LensGraphConfig:
                 "hooks do not run: hooks and Q/K capture are not available. Remove the "
                 "layer lists to serve this request in eager mode."
             )
-        steering_layers = {layer for sv in vectors or [] for layer in sv.layer_indices}
-        unsteered = sorted(steering_layers - set(self.steer_layers))
-        if unsteered:
-            raise ValueError(
-                f"apply_steering_vectors names layer(s) {unsteered}, but this server "
-                f"steers only its steer_layers: {list(self.steer_layers)}."
-            )
+        for key, entries in (
+            ("apply_steering_vectors", vectors),
+            ("apply_steering_rows", rows),
+        ):
+            steering_layers = {
+                layer for entry in entries or [] for layer in entry.layer_indices
+            }
+            unsteered = sorted(steering_layers - set(self.steer_layers))
+            if unsteered:
+                raise ValueError(
+                    f"{key} names layer(s) {unsteered}, but this server "
+                    f"steers only its steer_layers: {list(self.steer_layers)}."
+                )
         if not self.steer_norm_match and any(sv.norm_match for sv in vectors or []):
             raise ValueError(
                 "This server sets steer_norm_match to false, so a steering vector "

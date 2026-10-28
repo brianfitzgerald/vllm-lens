@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Steering: Register tables once and reference rows per request; parallel sampling supports steering but rejects capture and per-request hooks.
+
 - Steering: Add-only graph steering uses `steer_norm_match=False` and rejects norm-matched vectors.
 
 - Steering: All vectors in one layer use the unsteered stream norm for `norm_match`.

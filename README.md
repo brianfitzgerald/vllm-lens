@@ -531,3 +531,21 @@ VLLM_LENS_QK_PARITY=1 pytest vllm_lens/tests/test_qk_parity_models.py -v
 Developed by Alan Cooney, with credit going to Sid Black for the original vLLM worker extension idea.
 
 Set `steer_norm_match=False` in `additional_config["vllm_lens"]` for add-only graph steering. This removes the norm buffer and norm computation; vectors with `norm_match=True` are rejected.
+
+### Registered steering tables
+
+Register a table once and send row references with each request:
+
+```python
+from vllm_lens import SteeringRow
+
+client.set_steering_table("features", vectors)  # shape (rows, hidden_size)
+client.generate("Hello", steering_rows=[SteeringRow(table="features", row=0, layer_indices=[15])])
+client.clear_steering_table("features")
+```
+
+Offline, use `llm.set_steering_table` and `apply_steering_rows` in `SamplingParams.extra_args`. HTTP registration uses `POST /v1/steering_tables` with `name` and serialized `vectors`; deletion uses `DELETE /v1/steering_tables/{name}`. Register tables through each API server process when using multiple API servers.
+
+Rows add `scale * table[row]` at every position. Rows and steering vectors cannot be combined. A request keeps its prepared rows when its table is cleared or replaced; preparation occurs at first use. Completed, cancelled, and failed requests release their prepared rows.
+
+Steering supports `n > 1`. Residual-stream capture, Q/K capture, and per-request hooks reject `n > 1`; use separate requests for capture.

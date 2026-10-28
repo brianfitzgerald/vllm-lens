@@ -304,8 +304,13 @@ def _hook_pass(extension: HiddenStatesExtension) -> _HookPass:
 def _steer_pass(
     extension: HiddenStatesExtension,
 ) -> dict[int, list[_SteerSlice]] | None:
-    """Group the token slices of the steered requests by layer, once per forward pass."""
-    if not extension._steering_data:
+    """Group the token slices of the steered requests by layer, once per forward pass.
+    Prepared rows remain valid until request cleanup, even if their table is cleared."""
+    if (
+        not extension._steering_data
+        and not extension._steering_tables
+        and not extension._row_steering
+    ):
         return None
     runner = extension.model_runner
     query_start_loc = _batch_layout(runner, warn=False)
@@ -319,9 +324,27 @@ def _steer_pass(
         if start == end:
             continue
         request = runner.requests[req_id]
-        extra = getattr(request.sampling_params, "extra_args", None)
-        key = (extra or {}).get("_steering_id", "")
-        for layer, data in extension._steering_data.get(key, {}).items():
+        extra = getattr(request.sampling_params, "extra_args", None) or {}
+        key = extra.get("_steering_id", "")
+        rows = extra.get("apply_steering_rows")
+        if rows:
+            prepared = extension._row_steering.get(key)
+            if prepared is None:
+                prepared = {}
+                for entry in rows:
+                    table = extension._steering_tables[entry["table"]]
+                    values = table[entry["row"] : entry["row"] + 1] * float(
+                        entry["scale"]
+                    )
+                    for layer in entry["layer_indices"]:
+                        if layer in prepared:
+                            prepared[layer].add.add_(values)
+                        else:
+                            prepared[layer] = _SteeringLayer(values.clone(), None, [])
+                extension._row_steering[key] = prepared
+        else:
+            prepared = extension._steering_data.get(key, {})
+        for layer, data in prepared.items():
             layers.setdefault(layer, []).append(
                 _SteerSlice(start, end, request.num_computed_tokens, data)
             )
@@ -1059,6 +1082,10 @@ class HiddenStatesExtension:
 
     # Prepared steering by request key and layer.
     _steering_data: dict[str, dict[int, _SteeringLayer]] = {}
+    # Registered steering tables by name, float32 on the device.
+    _steering_tables: dict[str, torch.Tensor] = {}
+    # Prepared steering rows by internal request id and layer.
+    _row_steering: dict[str, dict[int, _SteeringLayer]] = {}
 
     # Per-request hook definitions:
     # key (external_req_id or _hook_id) → list of Hook
@@ -1107,6 +1134,8 @@ class HiddenStatesExtension:
         self._projections = {}
         self._direction_tables = {}
         self._steering_data = {}
+        self._steering_tables = {}
+        self._row_steering = {}
         self._hook_data = {}
         self._steer_pass = None
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
@@ -1218,6 +1247,22 @@ class HiddenStatesExtension:
     def clear_steering_data(self, key: str) -> None:
         """Remove steering data for a completed request."""
         self._steering_data.pop(key, None)
+        self._row_steering.pop(key, None)
+
+    def set_steering_table(self, name: str, payload: dict[str, Any]) -> None:
+        """Hold the ``(N, hidden)`` rows of a ``serialize_tensor`` payload under ``name``;
+        requests name a row in ``apply_steering_rows``."""
+        # Installing the hooks resets the worker state, so it must come first.
+        self.install_hooks()
+        device = next(self.model_runner.model.parameters()).device
+        self._steering_tables[name] = deserialize_tensor(payload).float().to(device)
+
+    def clear_steering_table(self, name: str | None) -> None:
+        """Drop the table under ``name``; None drops every table."""
+        if name is None:
+            self._steering_tables = {}
+        else:
+            self._steering_tables.pop(name, None)
 
     def clear_captured_states(self, external_req_id: str) -> None:
         """Remove captured activations without returning them.
