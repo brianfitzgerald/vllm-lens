@@ -1254,8 +1254,13 @@ class HiddenStatesExtension:
         requests name a row in ``apply_steering_rows``."""
         # Installing the hooks resets the worker state, so it must come first.
         self.install_hooks()
-        device = next(self.model_runner.model.parameters()).device
-        self._steering_tables[name] = deserialize_tensor(payload).float().to(device)
+        parameter = next(self.model_runner.model.parameters())
+        # Rounded to the model dtype, as set_steering_data rounds a vector.
+        self._steering_tables[name] = (
+            deserialize_tensor(payload)
+            .to(device=parameter.device, dtype=parameter.dtype)
+            .float()
+        )
 
     def clear_steering_table(self, name: str | None) -> None:
         """Drop the table under ``name``; None drops every table."""
