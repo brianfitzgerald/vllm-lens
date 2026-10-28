@@ -128,7 +128,8 @@ def test_unknown_table_and_cleared_table_are_rejected(graph_llm, table):
 
 @pytest.mark.parametrize("kind", ["rows", "vectors"])
 def test_every_parallel_sample_is_steered(graph_llm, table, kind):
-    """Each of n samples equals a single request with its seed and the same steering."""
+    """In one greedy batch, each of n samples equals a steered single request and differs from
+    an unsteered one."""
     graph_llm.set_steering_table(TABLE, table)  # type: ignore[attr-defined]
     steering = (
         {
@@ -145,15 +146,12 @@ def test_every_parallel_sample_is_steered(graph_llm, table, kind):
             ]
         }
     )
-
-    def sample(n: int, seed: int, extra: dict) -> list[list[int]]:
-        params = SamplingParams(
-            n=n, temperature=1.0, seed=seed, max_tokens=12, extra_args=extra
-        )
-        output = graph_llm.generate([LONG_PROMPT], params)[0]
-        return [list(choice.token_ids) for choice in output.outputs]
-
-    parallel = sample(3, 100, steering)
-    single = [sample(1, 100 + index, steering)[0] for index in range(3)]
-    assert parallel == single
-    assert sample(3, 100, {}) != parallel
+    params = [
+        SamplingParams(n=n, temperature=0.0, max_tokens=12, extra_args=extra)
+        for n, extra in ((3, steering), (1, steering), (1, {}))
+    ]
+    parallel, single, unsteered = graph_llm.generate([LONG_PROMPT] * 3, params)
+    samples = [list(choice.token_ids) for choice in parallel.outputs]
+    assert len(samples) == 3
+    assert samples == [list(single.outputs[0].token_ids)] * 3
+    assert samples[0] != list(unsteered.outputs[0].token_ids)

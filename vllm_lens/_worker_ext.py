@@ -875,15 +875,20 @@ def _make_pre_hook(extension: HiddenStatesExtension, layer_idx: int) -> Callable
     def hook(
         _module: torch.nn.Module,
         args: tuple[torch.Tensor, ...],
-    ) -> tuple[torch.Tensor, ...] | None:
+        kwargs: dict[str, Any],
+    ) -> tuple[tuple[torch.Tensor, ...], dict[str, Any]] | None:
         """Forward pre-hook: run user pre-hooks on the layer input."""
         try:
-            # hidden_states is args[1] (args[0] is positions).
-            hidden = args[1]
+            # hidden_states is args[1] (args[0] is positions), or a keyword argument
+            # (Qwen3.5).
+            positional = len(args) > 1
+            hidden = args[1] if positional else kwargs["hidden_states"]
             result = _pre_hook_inner(extension, layer_idx, hidden)
-            if result is not None:
-                return args[:1] + (result,) + args[2:]
-            return None
+            if result is None:
+                return None
+            if positional:
+                return args[:1] + (result,) + args[2:], kwargs
+            return args, {**kwargs, "hidden_states": result}
         except Exception:
             logger.warning(
                 "vllm-lens pre-hook error on layer %d, skipping",
@@ -1188,7 +1193,9 @@ class HiddenStatesExtension:
         # applied everywhere (not just rank 0).
         layer_map = _discover_layer_modules(self)
         for layer_idx, layer in sorted(layer_map.items()):
-            layer.register_forward_pre_hook(_make_pre_hook(self, layer_idx))
+            layer.register_forward_pre_hook(
+                _make_pre_hook(self, layer_idx), with_kwargs=True
+            )
             layer.register_forward_hook(_make_hook(self, layer_idx))
 
     # ------------------------------------------------------------------
@@ -1258,8 +1265,13 @@ class HiddenStatesExtension:
         requests name a row in ``apply_steering_rows``."""
         # Installing the hooks resets the worker state, so it must come first.
         self.install_hooks()
-        device = next(self.model_runner.model.parameters()).device
-        self._steering_tables[name] = deserialize_tensor(payload).float().to(device)
+        parameter = next(self.model_runner.model.parameters())
+        # Rounded to the model dtype, as set_steering_data rounds a vector.
+        self._steering_tables[name] = (
+            deserialize_tensor(payload)
+            .to(device=parameter.device, dtype=parameter.dtype)
+            .float()
+        )
 
     def clear_steering_table(self, name: str | None) -> None:
         """Drop the table under ``name``; None drops every table."""
