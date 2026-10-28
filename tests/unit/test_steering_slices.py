@@ -19,6 +19,8 @@ def extension(worker, dtype=torch.float32):
         ),
         model_config=SimpleNamespace(get_total_num_hidden_layers=lambda: 4),
         _steering_data={},
+        _steering_tables={},
+        _row_steering={},
     )
 
 

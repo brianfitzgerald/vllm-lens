@@ -42,10 +42,23 @@ def _steer_op(
     _steer(hidden_states, residual, add[:n], norm[:n])
 
 
+@torch.library.custom_op("vllm_lens::steer_add", mutates_args=("hidden_states",))
+def _steer_add_op(hidden_states: torch.Tensor, add: torch.Tensor) -> None:
+    """Add the token buffer to the stream in place, with no norm term."""
+    n = hidden_states.shape[0]
+    hidden_states += add[:n].to(hidden_states.dtype)
+
+
 def _steer_hook(module: Any, args: Any, output: Any) -> None:
     """Call the steer op on the layer output; Dynamo traces this body into the graph."""
     hidden, residual = output if isinstance(output, tuple) else (output, None)
     torch.ops.vllm_lens.steer(hidden, residual, module._lens_add, module._lens_norm)
+
+
+def _steer_add_hook(module: Any, args: Any, output: Any) -> None:
+    """Call the add-only steer op on the layer output."""
+    hidden = output[0] if isinstance(output, tuple) else output
+    torch.ops.vllm_lens.steer_add(hidden, module._lens_add)
 
 
 def _capture_hook(module: Any, args: Any, output: Any) -> None:
@@ -94,7 +107,7 @@ def install_graph_patches() -> None:
         runner = self.model_runner
         max_tokens = runner.scheduler_config.max_num_batched_tokens
         hidden = runner.model_config.get_hidden_size()
-        steering: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        steering: dict[int, tuple[torch.Tensor, torch.Tensor | None]] = {}
         buffers: dict[int, torch.Tensor] = {}
         model_forward = runner._model_forward
         warned = False
@@ -108,11 +121,17 @@ def install_graph_patches() -> None:
                 spans = plan.get(layer_idx, []) if plan is not None else []
                 length = spans[-1].end if spans else 0
                 if length:
-                    _steering_buffers(spans, length, add[:length], norm[:length])
+                    _steering_buffers(
+                        spans,
+                        length,
+                        add[:length],
+                        None if norm is None else norm[:length],
+                    )
                 previous = filled.get(layer_idx, 0)
                 if previous > length:
                     add[length:previous].zero_()
-                    norm[length:previous].zero_()
+                    if norm is not None:
+                        norm[length:previous].zero_()
                 filled[layer_idx] = length
             out = model_forward(*args, **kwargs)
             query_start_loc = _batch_layout(runner, warn=False)
@@ -138,13 +157,16 @@ def install_graph_patches() -> None:
             add = torch.zeros(
                 (max_tokens, hidden), dtype=torch.float32, device=self.device
             )
-            norm = torch.zeros_like(add)
+            norm = torch.zeros_like(add) if config.steer_norm_match else None
             steering[layer_idx] = (add, norm)
             layer = layer_map[layer_idx]
             layer.register_buffer("_lens_add", add, persistent=False)
-            layer.register_buffer("_lens_norm", norm, persistent=False)
+            if norm is not None:
+                layer.register_buffer("_lens_norm", norm, persistent=False)
             # Registered first, so a layer steers before it captures.
-            layer.register_forward_hook(_steer_hook)
+            layer.register_forward_hook(
+                _steer_hook if norm is not None else _steer_add_hook
+            )
         # Only the rank that captures needs a capture buffer.
         for layer_idx in config.capture_layers if self._should_capture else ():
             buffers[layer_idx] = torch.zeros(
@@ -157,8 +179,9 @@ def install_graph_patches() -> None:
             )
             layer_map[layer_idx].register_forward_hook(_capture_hook)
         logger.info(
-            "CUDA-graph mode: steer layers %s, capture layers %s",
+            "CUDA-graph mode: steer layers %s (norm_match %s), capture layers %s",
             list(config.steer_layers),
+            config.steer_norm_match,
             list(buffers),
         )
         return result

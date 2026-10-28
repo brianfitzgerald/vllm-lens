@@ -7,7 +7,7 @@ from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from vllm_lens._helpers.types import SteeringVector
+    from vllm_lens._helpers.types import SteeringRow, SteeringVector
 
 # The key of these settings in ``VllmConfig.additional_config``, part of the compile cache key.
 CONFIG_KEY = "vllm_lens"
@@ -19,6 +19,8 @@ class LensGraphConfig:
 
     capture_layers: tuple[int, ...] = ()
     steer_layers: tuple[int, ...] = ()
+    # False drops the norm buffer and its per-token norm: requests may not use norm_match.
+    steer_norm_match: bool = True
 
     @property
     def enabled(self) -> bool:
@@ -28,7 +30,7 @@ class LensGraphConfig:
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> LensGraphConfig:
         """Read ``additional_config["vllm_lens"]`` of an ``EngineArgs`` or ``VllmConfig``:
-        ``{"capture_layers": [...], "steer_layers": [...]}``."""
+        ``{"capture_layers": [...], "steer_layers": [...], "steer_norm_match": bool}``."""
         stored = (vllm_config.additional_config or {}).get(CONFIG_KEY)
         known = [field.name for field in fields(cls)]
         unknown = sorted(set(stored) - set(known)) if isinstance(stored, dict) else []
@@ -37,12 +39,24 @@ class LensGraphConfig:
                 f'additional_config["{CONFIG_KEY}"] has unknown key(s) {unknown}; '
                 f"this vllm-lens version reads only {known}."
             )
+        settings = dict(stored) if isinstance(stored, dict) else stored or {}
+        norm_match = (
+            settings.pop("steer_norm_match", True)
+            if isinstance(settings, dict)
+            else True
+        )
+        if not isinstance(norm_match, bool):
+            raise ValueError(
+                f'additional_config["{CONFIG_KEY}"]["steer_norm_match"] must be a bool, '
+                f"got {norm_match!r}."
+            )
         try:
             return cls(
                 **{
                     key: tuple(sorted({int(layer) for layer in value}))
-                    for key, value in (stored or {}).items()
-                }
+                    for key, value in settings.items()
+                },
+                steer_norm_match=norm_match,
             )
         except (AttributeError, TypeError, ValueError):
             raise ValueError(
@@ -56,9 +70,11 @@ class LensGraphConfig:
         qk: bool = False,
         residual_stream: Any = None,
         vectors: list[SteeringVector] | None = None,
+        rows: list[SteeringRow] | None = None,
     ) -> None:
         """Raise ``ValueError`` for what only the forward hooks serve: hooks, Q/K capture,
-        a capture or steering layer outside the lists, or a capture of every layer."""
+        a capture or steering layer outside the lists, a capture of every layer, or
+        ``norm_match`` on a server without the norm buffer."""
         if not self.enabled:
             return
         if hooks or qk:
@@ -67,12 +83,23 @@ class LensGraphConfig:
                 "hooks do not run: hooks and Q/K capture are not available. Remove the "
                 "layer lists to serve this request in eager mode."
             )
-        steering_layers = {layer for sv in vectors or [] for layer in sv.layer_indices}
-        unsteered = sorted(steering_layers - set(self.steer_layers))
-        if unsteered:
+        for key, entries in (
+            ("apply_steering_vectors", vectors),
+            ("apply_steering_rows", rows),
+        ):
+            steering_layers = {
+                layer for entry in entries or [] for layer in entry.layer_indices
+            }
+            unsteered = sorted(steering_layers - set(self.steer_layers))
+            if unsteered:
+                raise ValueError(
+                    f"{key} names layer(s) {unsteered}, but this server "
+                    f"steers only its steer_layers: {list(self.steer_layers)}."
+                )
+        if not self.steer_norm_match and any(sv.norm_match for sv in vectors or []):
             raise ValueError(
-                f"apply_steering_vectors names layer(s) {unsteered}, but this server "
-                f"steers only its steer_layers: {list(self.steer_layers)}."
+                "This server sets steer_norm_match to false, so a steering vector "
+                "cannot use norm_match."
             )
         if residual_stream is None:
             return
