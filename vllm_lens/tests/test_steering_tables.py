@@ -147,7 +147,8 @@ def test_every_parallel_sample_is_steered(graph_llm, table, kind):
         }
     )
     params = [
-        SamplingParams(n=n, temperature=0.0, max_tokens=12, extra_args=extra)
+        # vLLM refuses n > 1 at temperature 0; top_k=1 picks the same tokens.
+        SamplingParams(n=n, temperature=1.0, top_k=1, max_tokens=12, extra_args=extra)
         for n, extra in ((3, steering), (1, steering), (1, {}))
     ]
     parallel, single, unsteered = graph_llm.generate([LONG_PROMPT] * 3, params)
