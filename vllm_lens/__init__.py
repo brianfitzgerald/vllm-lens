@@ -8,7 +8,7 @@ from vllm_lens._helpers._serialize import (
     serialize_hook_results,
     serialize_tensor,
 )
-from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
+from vllm_lens._helpers.types import Hook, HookContext, SteeringRow, SteeringVector
 from vllm_lens.attention import attention_patterns, compute_attention_weights
 
 try:
@@ -27,6 +27,7 @@ __all__ = [
     "serialize_activations",
     "serialize_hook_results",
     "serialize_tensor",
+    "SteeringRow",
     "SteeringVector",
     "__version__",
 ]

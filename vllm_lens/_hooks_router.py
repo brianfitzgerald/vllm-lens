@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm_lens._cudagraph import LensGraphConfig
-from vllm_lens._helpers._serialize import serialize_hook_results
+from vllm_lens._helpers._serialize import deserialize_tensor, serialize_hook_results
 from vllm_lens._helpers.types import Hook
 
 router = APIRouter(prefix="/v1/hooks", tags=["vllm-lens"])
@@ -26,6 +26,9 @@ activations_router = APIRouter(prefix="/v1/activations", tags=["vllm-lens"])
 
 # Named projection directions for output_residual_stream_project.
 projections_router = APIRouter(prefix="/v1/projections", tags=["vllm-lens"])
+
+# Named steering tables for apply_steering_rows.
+steering_tables_router = APIRouter(prefix="/v1/steering_tables", tags=["vllm-lens"])
 
 _ACT_CHUNK_BYTES = 1 << 20  # 1 MiB
 
@@ -228,4 +231,38 @@ async def clear_projection(name: str, raw_request: Request):
     engine = _engine_client(raw_request)
     await engine.collective_rpc("clear_projection", args=(name,))
     engine._lens_projections = engine._lens_projections - {name}
+    return JSONResponse({"status": "ok"})
+
+
+@steering_tables_router.post("")
+async def set_steering_table(raw_request: Request):
+    """Hold ``{"name", "vectors"}`` on the workers; ``vectors`` is a ``serialize_tensor``
+    dict of shape ``(N, hidden)``."""
+    from vllm_lens._activations_plugin import _check_directions
+
+    body = await raw_request.json()
+    name = body.get("name") if isinstance(body, dict) else None
+    if not isinstance(name, str) or "vectors" not in body:
+        raise HTTPException(400, "Body must hold a string 'name' and 'vectors'")
+    engine = _engine_client(raw_request)
+    try:
+        payload = _check_directions(
+            body["vectors"], engine.model_config.get_hidden_size()
+        )
+    except (ValueError, KeyError, TypeError) as error:
+        raise HTTPException(400, str(error)) from error
+    rows = deserialize_tensor(payload).shape[0]
+    await engine.collective_rpc("set_steering_table", args=(name, payload))
+    engine._lens_steering_tables = {**engine._lens_steering_tables, name: rows}
+    return JSONResponse({"status": "ok", "name": name, "rows": rows})
+
+
+@steering_tables_router.delete("/{name}")
+async def clear_steering_table(name: str, raw_request: Request):
+    """Drop the steering table under ``name``."""
+    engine = _engine_client(raw_request)
+    await engine.collective_rpc("clear_steering_table", args=(name,))
+    engine._lens_steering_tables = {
+        key: rows for key, rows in engine._lens_steering_tables.items() if key != name
+    }
     return JSONResponse({"status": "ok"})

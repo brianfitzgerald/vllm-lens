@@ -8,7 +8,13 @@ import json
 
 import requests
 import torch
-from vllm_lens import Hook, deserialize_hook_results, deserialize_tensor, SteeringVector
+from vllm_lens import (
+    Hook,
+    deserialize_hook_results,
+    deserialize_tensor,
+    SteeringRow,
+    SteeringVector,
+)
 from vllm_lens import serialize_tensor
 
 from .conftest import MODEL
@@ -484,3 +490,89 @@ def test_layer_filtering_respects_list(vllm_server):
     assert rs.shape[0] == 1, (
         f"Expected 1 layer (layer 15 only), got {rs.shape[0]} layers"
     )
+
+
+# ---------------------------------------------------------------------------
+# Steering tables and parallel samples
+# ---------------------------------------------------------------------------
+
+
+def _complete(vllm_server, xargs: dict, **body):
+    """One completion of a fixed prompt with the given ``vllm_xargs``."""
+    return requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "My favourite animal is",
+            "max_tokens": 16,
+            **body,
+            "vllm_xargs": xargs,
+        },
+    ).json()
+
+
+def test_steering_rows_match_steering_vectors(vllm_server):
+    """A row of a registered table steers as the same vector sent in the request."""
+    vectors = torch.randn(2, 4096, generator=torch.Generator().manual_seed(0))
+    registered = requests.post(
+        f"{vllm_server}/v1/steering_tables",
+        json={"name": "server-rows", "vectors": serialize_tensor(vectors)},
+    )
+    assert registered.status_code == 200, registered.text
+    assert registered.json()["rows"] == 2
+    try:
+        row = SteeringRow(table="server-rows", row=1, layer_indices=[15], scale=6.0)
+        vector = SteeringVector(activations=vectors[1:2], layer_indices=[15], scale=6.0)
+        by_row = _complete(
+            vllm_server,
+            {"apply_steering_rows": json.dumps([row.model_dump()])},
+            temperature=0.0,
+        )
+        by_vector = _complete(
+            vllm_server,
+            {"apply_steering_vectors": json.dumps([vector.model_dump()])},
+            temperature=0.0,
+        )
+        baseline = _complete(vllm_server, {}, temperature=0.0)
+        assert by_row["choices"][0]["text"] == by_vector["choices"][0]["text"]
+        assert by_row["choices"][0]["text"] != baseline["choices"][0]["text"]
+    finally:
+        requests.delete(f"{vllm_server}/v1/steering_tables/server-rows")
+    missing = _complete(
+        vllm_server, {"apply_steering_rows": json.dumps([row.model_dump()])}
+    )
+    assert "not registered" in json.dumps(missing), missing
+
+
+def test_every_parallel_sample_is_steered(vllm_server):
+    """Each of n choices equals a single request with its seed and the same steering."""
+    vector = SteeringVector(
+        activations=torch.randn(1, 4096, generator=torch.Generator().manual_seed(1)),
+        layer_indices=[15],
+        scale=8.0,
+    )
+    xargs = {"apply_steering_vectors": json.dumps([vector.model_dump()])}
+    parallel = _complete(vllm_server, xargs, n=3, seed=100, temperature=1.0)
+    texts = [
+        choice["text"]
+        for choice in sorted(parallel["choices"], key=lambda c: c["index"])
+    ]
+    single = [
+        _complete(vllm_server, xargs, seed=100 + index, temperature=1.0)["choices"][0][
+            "text"
+        ]
+        for index in range(3)
+    ]
+    assert texts == single
+    unsteered = _complete(vllm_server, {}, n=3, seed=100, temperature=1.0)
+    assert [
+        c["text"] for c in sorted(unsteered["choices"], key=lambda c: c["index"])
+    ] != texts
+
+
+def test_capture_with_parallel_samples_is_rejected(vllm_server):
+    """Capture with n > 1 fails with a clear error."""
+    response = _complete(
+        vllm_server, {"output_residual_stream": "[15]"}, n=2, temperature=1.0
+    )
+    assert "n > 1" in json.dumps(response), response
