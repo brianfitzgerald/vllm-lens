@@ -1191,13 +1191,12 @@ def _llm_clear_steering_table(self: LLM, name: str | None = None) -> None:
     """Drop the steering table under ``name``; None drops every table."""
     self.collective_rpc("clear_steering_table", args=(name,))
     tables = self._lens_steering_tables  # type: ignore[reportAttributeAccessIssue]
-    self._lens_steering_tables = (
+    tables = (
         {}
         if name is None
-        else {  # type: ignore[reportAttributeAccessIssue]
-            key: rows for key, rows in tables.items() if key != name
-        }
+        else {key: rows for key, rows in tables.items() if key != name}
     )
+    self._lens_steering_tables = tables  # type: ignore[reportAttributeAccessIssue]
 
 
 def _llm_collect_hook_results(self: LLM) -> dict:
