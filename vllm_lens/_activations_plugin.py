@@ -12,6 +12,7 @@ per-request activations for both online (async) and offline (sync) usage.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -275,6 +276,22 @@ def _decode_steering_vectors(value: Any) -> list[SteeringVector] | None:
     ]
 
 
+def _reject_parallel_capture(
+    params: SamplingParams, extra: dict[str, Any], hooks: object
+) -> None:
+    """Raise ``ValueError`` for capture or hooks with ``n > 1``: results are keyed by the
+    request id, and each child request has its own."""
+    if (getattr(params, "n", None) or 1) > 1 and (
+        extra.get("output_residual_stream") is not None
+        or extra.get("output_qk") is not None
+        or hooks
+    ):
+        raise ValueError(
+            "Activation capture, Q/K capture and hooks are not available with n > 1; "
+            "send separate requests to capture."
+        )
+
+
 def _decode_hooks(value: Any) -> list[Hook] | None:
     """Normalise an ``apply_hooks`` extra_args value.
 
@@ -416,19 +433,16 @@ async def _patched_generate(
     When generation finishes, retrieves the captured activations from
     the worker and attaches them as ``output.activations``.
     """
-    # In vLLM v1, the chat completion endpoint creates an
-    # EngineCoreRequest with a *cloned* SamplingParams before calling
-    # generate(). add_request() uses the clone from the
-    # EngineCoreRequest, ignoring the separately-passed sampling_params.
-    # We must read/modify the clone so our changes take effect.
-    effective_params = sampling_params
-    try:
-        from vllm.v1.engine import EngineCoreRequest
+    from vllm.v1.engine import EngineCoreRequest
 
-        if isinstance(prompt, EngineCoreRequest) and prompt.sampling_params is not None:  # type: ignore[reportAttributeAccessIssue]
-            effective_params = prompt.sampling_params  # type: ignore[reportAttributeAccessIssue]
-    except ImportError:
-        pass
+    # A deprecated EngineCoreRequest carries its own cloned SamplingParams; other
+    # prompts use a copy of the caller's.
+    built = isinstance(prompt, EngineCoreRequest) and prompt.sampling_params is not None  # type: ignore[reportAttributeAccessIssue]
+    if built:
+        effective_params: SamplingParams = prompt.sampling_params  # type: ignore[reportAttributeAccessIssue]
+    else:
+        sampling_params = effective_params = copy.copy(sampling_params)
+        effective_params.extra_args = dict(effective_params.extra_args or {})
 
     extra = effective_params.extra_args or {}
     wants_activations = extra.get("output_residual_stream") is not None
@@ -450,6 +464,7 @@ async def _patched_generate(
 
     # Extract hooks (callables can't survive msgspec).
     hooks_list = _decode_hooks(extra.pop("apply_hooks", None))
+    _reject_parallel_capture(effective_params, extra, hooks_list)
 
     # Allow explicit prefix-cache bypass via extra_args.
     skip_kv_cache = extra.pop("skip_reading_prefix_cache", None)
@@ -554,54 +569,52 @@ def _prepare_offline_params(
     sentinels stored in ``extra_args`` (lightweight strings that survive
     msgspec serialization), then shipped to workers via RPC.
 
-    Returns the state dict consumed by :func:`_finalize_offline_outputs`.
+    Returns the state for :func:`_finalize_offline_outputs`; ``params`` are copies of the
+    caller's SamplingParams.
     """
     if isinstance(sampling_params, Sequence):
-        params_list = list(sampling_params)
+        params_list = [copy.copy(sp) for sp in sampling_params]
+        sampling_params = params_list
     elif sampling_params is not None:
-        params_list = [sampling_params]
+        params_list = [copy.copy(sampling_params)]
+        sampling_params = params_list[0]
     else:
         params_list = []
+    extras = [dict(sp.extra_args or {}) for sp in params_list]
+    for sp, extra in zip(params_list, extras):
+        sp.extra_args = extra
 
     wants_activations = any(
-        (sp.extra_args or {}).get("output_residual_stream") is not None
-        for sp in params_list
+        extra.get("output_residual_stream") is not None for extra in extras
     )
-    wants_qk = any(
-        (sp.extra_args or {}).get("output_qk") is not None for sp in params_list
-    )
+    wants_qk = any(extra.get("output_qk") is not None for extra in extras)
 
     # Extract steering vectors per-request.  We must pop them from
     # extra_args before vLLM serialises SamplingParams, but keep them
     # for the RPC call.
     steering_payloads: dict[str, bytes] = {}  # steering_id -> pickled vectors
-    for idx, sp in enumerate(params_list):
-        extra = sp.extra_args or {}
+    for idx, extra in enumerate(extras):
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
         _reject_async_spec_positions(self.llm_engine.vllm_config, vectors)
         if vectors is not None:
             steering_id = f"_steer_{idx}"
             steering_payloads[steering_id] = pickle.dumps(vectors)
-            if sp.extra_args is None:
-                sp.extra_args = {}
-            sp.extra_args["_steering_id"] = steering_id
+            extra["_steering_id"] = steering_id
 
     # Extract hooks per-request (same pattern as steering).
     hook_payloads: dict[str, bytes] = {}  # hook_id -> cloudpickled hooks
-    for idx, sp in enumerate(params_list):
-        extra = sp.extra_args or {}
+    for idx, (sp, extra) in enumerate(zip(params_list, extras)):
         hooks = _decode_hooks(extra.pop("apply_hooks", None))
+        _reject_parallel_capture(sp, extra, hooks)
         if hooks is not None:
             hook_id = f"_hook_{idx}"
             hook_payloads[hook_id] = cloudpickle.dumps(hooks)
-            if sp.extra_args is None:
-                sp.extra_args = {}
-            sp.extra_args["_hook_id"] = hook_id
+            extra["_hook_id"] = hook_id
 
     # Pop skip_reading_prefix_cache from extra_args for each request.
     any_skip_kv_cache = False
-    for sp in params_list:
-        if (sp.extra_args or {}).pop("skip_reading_prefix_cache", None):
+    for extra in extras:
+        if extra.pop("skip_reading_prefix_cache", None):
             any_skip_kv_cache = True
 
     has_steering = len(steering_payloads) > 0
@@ -629,6 +642,7 @@ def _prepare_offline_params(
         self.collective_rpc("set_hook_data", args=(hid, payload))
 
     return {
+        "params": sampling_params,
         "wants_activations": wants_activations,
         "wants_qk": wants_qk,
         "steering_payloads": steering_payloads,
@@ -649,7 +663,6 @@ def _finalize_offline_outputs(
     """
     wants_activations = state["wants_activations"]
     wants_qk = state.get("wants_qk", False)
-    steering_payloads = state["steering_payloads"]
     hook_payloads = state["hook_payloads"]
     has_hooks = len(hook_payloads) > 0
 
@@ -689,10 +702,6 @@ def _finalize_offline_outputs(
             if merged is not None:
                 output.hook_results = merged
 
-    # Clean up steering data.
-    for sid in steering_payloads:
-        self.collective_rpc("clear_steering_data", args=(sid,))
-
     # Clean up hook data and contexts.
     for hid in hook_payloads:
         self.collective_rpc("clear_hook_data", args=(hid,))
@@ -717,8 +726,14 @@ def _patched_llm_generate(
     """
     state = _prepare_offline_params(self, sampling_params)
     assert _original_llm_generate is not None
-    outputs = _original_llm_generate(self, prompts, sampling_params, *args, **kwargs)
-    return _finalize_offline_outputs(self, outputs, state)
+    try:
+        outputs = _original_llm_generate(
+            self, prompts, state["params"], *args, **kwargs
+        )
+        return _finalize_offline_outputs(self, outputs, state)
+    finally:
+        for key in state["steering_payloads"]:
+            self.collective_rpc("clear_steering_data", args=(key,))
 
 
 def _patched_llm_chat(
@@ -739,8 +754,12 @@ def _patched_llm_chat(
     """
     state = _prepare_offline_params(self, sampling_params)
     assert _original_llm_chat is not None
-    outputs = _original_llm_chat(self, messages, sampling_params, *args, **kwargs)
-    return _finalize_offline_outputs(self, outputs, state)
+    try:
+        outputs = _original_llm_chat(self, messages, state["params"], *args, **kwargs)
+        return _finalize_offline_outputs(self, outputs, state)
+    finally:
+        for key in state["steering_payloads"]:
+            self.collective_rpc("clear_steering_data", args=(key,))
 
 
 # ---------------------------------------------------------------------------
