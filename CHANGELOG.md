@@ -9,6 +9,7 @@
 - Capture: A layer list sent as a JSON string in `output_residual_stream` is parsed once when the request is submitted, not again in every layer and step. Behavior change: an invalid JSON string now fails at submission; before, the worker captured every layer.
 - Capture: A step's captured rows go to the host in one gather and one non-blocking pinned copy per layer, in place of a blocking copy per request.
 - Capture: Added `output_residual_stream_pool="mean"` (`capture_pool` on the client), which returns the mean over the prompt positions as one row per layer.
+- Capture: Added `output_residual_stream_positions` (`capture_positions` on the client), `"last_prompt_token"` or a list of absolute positions. The response carries `residual_stream_positions`. With async speculative decoding, a list of positions fails at submission.
 
 ## v1.3.0 (2 October 2026)
 
