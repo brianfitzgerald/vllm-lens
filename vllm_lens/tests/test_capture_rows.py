@@ -33,8 +33,9 @@ def _step(extension, rows: torch.Tensor, first: int) -> None:
             {},
             lambda s, steps: torch.cat([s[first : first + n] for first, n in steps]),
         ),
+        ({"output_residual_stream_pool": "mean"}, lambda s, _: s[:10].mean(0, True)),
     ],
-    ids=["full"],
+    ids=["full", "mean"],
 )
 def test_each_position_is_captured_once(schedule, extra, expected):
     """The capture is exact for any step schedule, with a re-prefill too; a full capture
