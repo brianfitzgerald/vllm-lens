@@ -197,6 +197,8 @@ client.generate("I think the best dessert is", steering_vectors=[sv])
 
 `position_indices` are absolute positions in the sequence (prompt and generated tokens). With async speculative decoding, a position-specific vector fails at submission, because the positions of generated tokens are not known before the forward pass.
 
+Steered and hooked requests skip prefix-cache reads and use a unique cache salt per request. Other requests cannot reuse their KV blocks.
+
 Residual-stream capture, Q/K capture, and per-request hooks require `n=1`. Send separate requests for capture. Steering state is cleared if offline generation fails.
 
 ### Generic hooks

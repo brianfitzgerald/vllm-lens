@@ -12,6 +12,7 @@ format documented for the HTTP API (``vllm_xargs``).  Before the fix:
 
 import gc
 import json
+import uuid
 
 import pytest
 import torch
@@ -237,3 +238,47 @@ class TestOfflineSteeringEntryPoints:
         n_gen = len(output.outputs[0].token_ids)
         assert rs.shape[0] == 1  # one captured layer
         assert rs.shape[1] == n_prompt + n_gen - 1
+
+
+@pytest.mark.parametrize("endpoint", ["generate", "chat"])
+@pytest.mark.parametrize("kind", ["steering", "hooks", "persistent"])
+def test_intervention_cache_isolation(llm_model, endpoint, kind):
+    """Interventions isolate cache writes for both offline entry points."""
+    llm_model.reset_prefix_cache()
+    prompt = uuid.uuid4().hex + " The quick brown fox jumps over the lazy dog." * 20
+    inputs = (
+        [prompt] if endpoint == "generate" else [[{"role": "user", "content": prompt}]]
+    )
+    run = getattr(llm_model, endpoint)
+    hook = Hook(fn=lambda ctx, h: torch.zeros_like(h), layer_indices=[LAYER_IDX])
+    extra = {}
+    if kind == "steering":
+        extra["apply_steering_vectors"] = [
+            SteeringVector(
+                activations=torch.ones(1, llm_model.model_config.get_hidden_size()),
+                layer_indices=[LAYER_IDX],
+                scale=10.0,
+            )
+        ]
+    elif kind == "hooks":
+        extra["apply_hooks"] = [hook]
+    else:
+        llm_model.register_hooks([hook])
+    try:
+        params = SamplingParams(temperature=0.0, max_tokens=1, extra_args=extra)
+        for _ in range(2):
+            assert run(inputs, params)[0].num_cached_tokens == 0
+    finally:
+        if kind == "persistent":
+            llm_model.clear_hooks()
+    params = SamplingParams(temperature=0.0, max_tokens=20)
+    first = run(inputs, params)[0]
+    assert first.num_cached_tokens == 0
+    repeat = run(inputs, params)[0]
+    assert repeat.num_cached_tokens > 0
+    fresh = run(
+        inputs,
+        SamplingParams(temperature=0.0, max_tokens=20, skip_reading_prefix_cache=True),
+    )[0]
+    # A cache hit is not bitwise equal to a prefill, so only the two prefills must match.
+    assert first.outputs[0].token_ids == fresh.outputs[0].token_ids
