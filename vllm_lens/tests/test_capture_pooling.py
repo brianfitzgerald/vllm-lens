@@ -1,10 +1,12 @@
-"""Tests for mean-pooled capture."""
+"""Tests for mean-pooled and position-selected capture."""
 
 import gc
 
 import pytest
 import torch
 from vllm import LLM, AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+
+from vllm_lens._helpers._positions import POSITIONS_KEY, POSITIONS_META_KEY
 
 from .conftest import CAPTURE_LAYERS, LONG_PROMPT, MODEL_NAME, PROMPT
 
@@ -13,6 +15,14 @@ MODES = {
     "mean": (
         {"output_residual_stream_pool": "mean"},
         lambda rows, n_prompt: rows[:, :n_prompt].mean(1, keepdim=True),
+    ),
+    "last-prompt-token": (
+        {POSITIONS_KEY: "last_prompt_token"},
+        lambda rows, n_prompt: rows[:, n_prompt - 1 : n_prompt],
+    ),
+    "positions": (
+        {POSITIONS_KEY: [0, 3, 1000]},
+        lambda rows, n_prompt: rows[:, [0, 3]],
     ),
 }
 
@@ -30,7 +40,7 @@ def _capture(engine: LLM, prompts: list[str], max_tokens: int, extra: dict):
 @pytest.mark.parametrize("max_tokens", [1, 5])
 @pytest.mark.parametrize("mode", MODES)
 def test_capture_matches_the_full_capture(capture_llm, mode, max_tokens):
-    """The pooled rows equal the same rows of the full capture."""
+    """The pooled or selected rows equal the same rows of the full capture."""
     extra, expected_rows = MODES[mode]
     prompts = [PROMPT, LONG_PROMPT]
     full_outputs = _capture(capture_llm, prompts, max_tokens, {})
@@ -43,6 +53,11 @@ def test_capture_matches_the_full_capture(capture_llm, mode, max_tokens):
         expected = expected_rows(full.float(), n_prompt)
         assert got.shape == expected.shape and got.dtype == full.dtype
         torch.testing.assert_close(got.float(), expected, atol=1e-2, rtol=1e-2)
+        if POSITIONS_KEY in extra:
+            positions = out.activations[POSITIONS_META_KEY]  # type: ignore[reportAttributeAccessIssue]
+            assert positions == (
+                [n_prompt - 1] if mode == "last-prompt-token" else [0, 3]
+            )
 
 
 @pytest.fixture(scope="module")
@@ -92,12 +107,15 @@ async def test_capture_on_the_async_engine(async_engine, mode):
     [
         {"output_residual_stream_pool": "last"},
         {"output_residual_stream": None, "output_residual_stream_pool": "mean"},
+        {"output_residual_stream_pool": "mean", POSITIONS_KEY: [0]},
+        {POSITIONS_KEY: [-1]},
     ],
-    ids=["last", "no-capture"],
+    ids=["last", "no-capture", "pool-and-positions", "negative"],
 )
 async def test_bad_capture_options_raise_on_the_async_engine(
     async_engine, extra, request
 ):
-    """The async path rejects a bad pool value or a pool without capture."""
+    """The async path rejects a bad pool value or selector, an option without capture, or
+    a combination."""
     with pytest.raises(ValueError, match="output_residual_stream"):
         await _generate_async(async_engine, request.node.callspec.id, extra)

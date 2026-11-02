@@ -85,7 +85,12 @@ def fake_extension(extras: dict[str, dict[str, Any] | None]) -> SimpleNamespace:
         input_batch=SimpleNamespace(num_reqs=len(extras), req_ids=list(extras)),
         requests=requests,
     )
-    return SimpleNamespace(model_runner=runner, _captured_states={}, _pooled={})
+    return SimpleNamespace(
+        model_runner=runner,
+        _captured_states={},
+        _pooled={},
+        _captured_positions={},
+    )
 
 
 @pytest.fixture(autouse=True, scope="module")
