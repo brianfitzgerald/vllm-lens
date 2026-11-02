@@ -483,6 +483,10 @@ async def _patched_generate(
     )
     _reject_async_spec_positions(self.vllm_config, steering_vectors)
 
+    extra.pop("_steering_id", None)
+    if steering_vectors is not None:
+        extra["_steering_id"] = request_id
+
     # Extract hooks (callables can't survive msgspec).
     hooks_list = _decode_hooks(extra.pop("apply_hooks", None))
     _reject_parallel_capture(effective_params, extra, hooks_list)
