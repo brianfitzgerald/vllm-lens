@@ -27,7 +27,7 @@ def test_offline_rows_clear_on_error(monkeypatch, method):
         n=2,
         skip_reading_prefix_cache=False,
         extra_args={
-            "apply_steering_rows": [{"table": "t", "row": 0, "layer_indices": [1]}]
+            "apply_steering_vectors": [{"table": "t", "row": 0, "layer_indices": [1]}]
         },
     )
 
@@ -74,7 +74,7 @@ async def test_async_rows_clear_on_close(monkeypatch):
         n=2,
         skip_reading_prefix_cache=False,
         extra_args={
-            "apply_steering_rows": [{"table": "t", "row": 0, "layer_indices": [1]}]
+            "apply_steering_vectors": [{"table": "t", "row": 0, "layer_indices": [1]}]
         },
     )
     stream = plugin._patched_generate(engine, "prompt", params, "r")

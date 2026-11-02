@@ -12,7 +12,6 @@ from vllm_lens import (
     Hook,
     deserialize_hook_results,
     deserialize_tensor,
-    SteeringRow,
     SteeringVector,
 )
 from vllm_lens import serialize_tensor
@@ -485,11 +484,11 @@ def test_steering_rows_match_steering_vectors(vllm_server):
     assert registered.status_code == 200, registered.text
     assert registered.json()["rows"] == 2
     try:
-        row = SteeringRow(table="server-rows", row=1, layer_indices=[15], scale=6.0)
+        row = SteeringVector(table="server-rows", row=1, layer_indices=[15], scale=6.0)
         vector = SteeringVector(activations=vectors[1:2], layer_indices=[15], scale=6.0)
         by_row = _complete(
             vllm_server,
-            {"apply_steering_rows": json.dumps([row.model_dump()])},
+            {"apply_steering_vectors": json.dumps([row.model_dump()])},
             temperature=0.0,
         )
         by_vector = _complete(
@@ -503,7 +502,7 @@ def test_steering_rows_match_steering_vectors(vllm_server):
     finally:
         requests.delete(f"{vllm_server}/v1/steering_tables/server-rows")
     missing = _complete(
-        vllm_server, {"apply_steering_rows": json.dumps([row.model_dump()])}
+        vllm_server, {"apply_steering_vectors": json.dumps([row.model_dump()])}
     )
     assert "not registered" in json.dumps(missing), missing
 

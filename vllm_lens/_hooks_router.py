@@ -25,7 +25,7 @@ router = APIRouter(prefix="/v1/hooks", tags=["vllm-lens"])
 activations_router = APIRouter(prefix="/v1/activations", tags=["vllm-lens"])
 
 
-# Named steering tables for apply_steering_rows.
+# Named steering tables for apply_steering_vectors.
 steering_tables_router = APIRouter(prefix="/v1/steering_tables", tags=["vllm-lens"])
 
 _ACT_CHUNK_BYTES = 1 << 20  # 1 MiB
@@ -213,13 +213,12 @@ async def set_steering_table(raw_request: Request):
         raise HTTPException(400, "Body must hold a string 'name' and 'vectors'")
     engine = _engine_client(raw_request)
     try:
-        payload = _check_steering_vectors(
-            body["vectors"], engine.model_config.get_hidden_size()
-        )
+        vectors = deserialize_tensor(body["vectors"])
+        _check_steering_vectors(vectors, engine.model_config.get_hidden_size())
     except (ValueError, KeyError, TypeError) as error:
         raise HTTPException(400, str(error)) from error
-    rows = deserialize_tensor(payload).shape[0]
-    await engine.collective_rpc("set_steering_table", args=(name, payload))
+    rows = vectors.shape[0]
+    await engine.collective_rpc("set_steering_table", args=(name, body["vectors"]))
     engine._lens_steering_tables = {**engine._lens_steering_tables, name: rows}
     return JSONResponse({"status": "ok", "name": name, "rows": rows})
 

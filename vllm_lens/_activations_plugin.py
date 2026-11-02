@@ -34,13 +34,12 @@ from vllm_lens._helpers._positions import (
     parse_capture_positions,
 )
 from vllm_lens._helpers._serialize import (
-    deserialize_tensor,
     serialize_tensor,
     serialize_activations,
     serialize_activations_binary,
     serialize_hook_results,
 )
-from vllm_lens._helpers.types import Hook, SteeringRow, SteeringVector
+from vllm_lens._helpers.types import Hook, SteeringVector
 
 logger = logging.getLogger("vllm.lens")
 
@@ -272,7 +271,9 @@ def _merge_captured_qk_batch(
     return out
 
 
-def _decode_steering_vectors(value: Any) -> list[SteeringVector] | None:
+def _decode_steering_vectors(
+    value: Any, tables: dict[str, int] | None = None
+) -> list[SteeringVector] | None:
     """Normalise an ``apply_steering_vectors`` extra_args value.
 
     Accepts live ``SteeringVector`` instances, plain dicts (already
@@ -284,59 +285,17 @@ def _decode_steering_vectors(value: Any) -> list[SteeringVector] | None:
         return None
     if isinstance(value, str):
         value = json.loads(value)
-    return [
+    vectors = [
         v if isinstance(v, SteeringVector) else SteeringVector.model_validate(v)
         for v in value
     ]
-
-
-def _decode_steering_rows(value: Any) -> list[SteeringRow] | None:
-    """Normalise an ``apply_steering_rows`` extra_args value: ``SteeringRow`` instances,
-    dicts, or their JSON string."""
-    if value is None:
-        return None
-    if isinstance(value, str):
-        value = json.loads(value)
-    return [
-        v if isinstance(v, SteeringRow) else SteeringRow.model_validate(v)
-        for v in value
-    ]
-
-
-def _check_steering_rows(
-    rows: list[SteeringRow],
-    tables: dict[str, int],
-    vectors: list[SteeringVector] | None,
-    vllm_config: Any,
-) -> list[dict[str, Any]]:
-    """Raise ``ValueError`` for an unregistered table, a row or layer out of range, or rows
-    beside steering vectors; return the rows as dicts for the workers."""
-    if vectors is not None:
-        raise ValueError(
-            "apply_steering_rows cannot be combined with apply_steering_vectors"
-        )
-    num_layers = getattr(
-        vllm_config.model_config.hf_text_config, "num_hidden_layers", None
-    )
-    for row in rows:
-        if row.table not in tables:
-            raise ValueError(
-                f"apply_steering_rows names table {row.table!r}, which is not registered: "
-                "register it with LLM.set_steering_table or POST /v1/steering_tables"
-            )
-        if row.row >= tables[row.table]:
-            raise ValueError(
-                f"apply_steering_rows names row {row.row} of {row.table!r}, "
-                f"which has {tables[row.table]} rows"
-            )
-        outside = [
-            layer
-            for layer in row.layer_indices
-            if layer < 0 or (num_layers is not None and layer >= num_layers)
-        ]
-        if outside:
-            raise ValueError(f"layer_index {outside} out of range [0, {num_layers})")
-    return [row.model_dump() for row in rows]
+    for vector in vectors:
+        if vector.table is not None:
+            if tables is None or vector.table not in tables:
+                raise ValueError(f"Steering table {vector.table!r} is not registered")
+            if vector.row is None or vector.row >= tables[vector.table]:
+                raise ValueError("Steering row is out of range")
+    return vectors
 
 
 def _reject_parallel_capture(
@@ -351,7 +310,7 @@ def _reject_parallel_capture(
     ):
         raise ValueError(
             "Activation capture, Q/K capture and hooks are not available with n > 1; "
-            "steering is. Send n separate requests to capture."
+            "send separate requests to capture."
         )
 
 
@@ -380,7 +339,8 @@ def _reject_async_spec_positions(
     ):
         return
     if any(
-        vector.position_indices is not None or vector.activations.dim() == 3
+        vector.position_indices is not None
+        or (vector.activations is not None and vector.activations.dim() == 3)
         for vector in vectors or ()
     ):
         raise ValueError(
@@ -396,9 +356,8 @@ def _reject_async_spec_positions(
         )
 
 
-def _check_steering_vectors(value: dict[str, Any], hidden: int) -> dict[str, Any]:
+def _check_steering_vectors(directions: torch.Tensor, hidden: int) -> None:
     """Validate finite steering vectors with shape ``(N, hidden)``."""
-    directions = deserialize_tensor(value)
     if (
         directions.ndim != 2
         or directions.shape[1] != hidden
@@ -407,7 +366,6 @@ def _check_steering_vectors(value: dict[str, Any], hidden: int) -> dict[str, Any
         raise ValueError(
             f"directions must be finite (N, {hidden}), got {tuple(directions.shape)}"
         )
-    return value
 
 
 def _check_capture_options(extra: dict[str, Any]) -> None:
@@ -604,24 +562,16 @@ async def _patched_generate(
     # When arriving via the OpenAI API (vllm_xargs), complex values
     # are JSON-encoded strings; decode and validate as SteeringVector.
     steering_vectors = _decode_steering_vectors(
-        extra.pop("apply_steering_vectors", None)
+        extra.pop("apply_steering_vectors", None),
+        getattr(self, "_lens_steering_tables", {}),
     )
     _reject_async_spec_positions(
         self.vllm_config, steering_vectors, extra.get(POSITIONS_KEY)
     )
+
     extra.pop("_steering_id", None)
     if steering_vectors is not None:
         extra["_steering_id"] = request_id
-    # Rows stay in extra_args as plain dicts; the workers read them from there.
-    steering_rows = _decode_steering_rows(extra.pop("apply_steering_rows", None))
-    if steering_rows:
-        extra["_steering_id"] = request_id
-        extra["apply_steering_rows"] = _check_steering_rows(
-            steering_rows,
-            self._lens_steering_tables,  # type: ignore[reportAttributeAccessIssue]
-            steering_vectors,
-            self.vllm_config,
-        )
 
     # Extract hooks (callables can't survive msgspec).
     hooks_list = _decode_hooks(extra.pop("apply_hooks", None))
@@ -631,7 +581,6 @@ async def _patched_generate(
         qk=wants_qk,
         residual_stream=extra.get("output_residual_stream"),
         vectors=steering_vectors,
-        rows=steering_rows,
     )
 
     # Allow explicit prefix-cache bypass via extra_args.
@@ -639,13 +588,12 @@ async def _patched_generate(
 
     has_persistent = getattr(self, "_has_persistent_hooks", False)
     hooked = hooks_list is not None or has_persistent
-    steered = steering_vectors is not None or bool(steering_rows)
-    needs_hooks = wants_activations or steered or hooked
+    needs_hooks = wants_activations or steering_vectors is not None or hooked
     if needs_hooks or wants_qk or skip_kv_cache:
         # Hooks rely on forward passes firing; prefix-cached tokens skip
         # computation entirely, so force a fresh prefill for this request.
         effective_params.skip_reading_prefix_cache = True
-    if steered or hooked:
+    if steering_vectors is not None or hooked:
         effective_params.extra_args = extra
         extra["_lens_isolate_cache"] = True
         if built:
@@ -657,30 +605,21 @@ async def _patched_generate(
         await self.collective_rpc("install_qk_hooks")
         setattr(self, "_qk_hooks_installed", True)
 
-    # Send steering data to workers before the forward pass begins.
-    if steering_vectors is not None:
-        await self.collective_rpc(
-            "set_steering_data", args=(request_id, pickle.dumps(steering_vectors))
-        )
-
-    if steering_rows:
-        try:
-            await self.collective_rpc(
-                "set_steering_rows", args=(request_id, extra.pop("apply_steering_rows"))
-            )
-        except BaseException:
-            await self.collective_rpc("clear_steering_data", args=(request_id,))
-            raise
-
-    # Send hook data to workers before the forward pass begins.
-    if hooks_list is not None:
-        await self.collective_rpc(
-            "set_hook_data",
-            args=(request_id, cloudpickle.dumps(hooks_list)),
-        )
-
     assert _original_generate is not None
     try:
+        # Send steering data to workers before the forward pass begins.
+        if steering_vectors is not None:
+            await self.collective_rpc(
+                "set_steering_data", args=(request_id, pickle.dumps(steering_vectors))
+            )
+
+        # Send hook data to workers before the forward pass begins.
+        if hooks_list is not None:
+            await self.collective_rpc(
+                "set_hook_data",
+                args=(request_id, cloudpickle.dumps(hooks_list)),
+            )
+
         async for output in _original_generate(
             self, prompt, sampling_params, request_id, **kwargs
         ):
@@ -717,7 +656,7 @@ async def _patched_generate(
                         output.hook_results = merged
             yield output
     finally:
-        if steering_vectors is not None or steering_rows:
+        if steering_vectors is not None:
             await self.collective_rpc("clear_steering_data", args=(request_id,))
         if wants_activations:
             await self.collective_rpc("clear_captured_states", args=(request_id,))
@@ -773,37 +712,26 @@ def _prepare_offline_params(
     # Extract steering vectors per-request.  We must pop them from
     # extra_args before vLLM serialises SamplingParams, but keep them
     # for the RPC call.
-    vllm_config = self.llm_engine.vllm_config
-    graph_config = LensGraphConfig.from_vllm_config(vllm_config)
+    graph_config = LensGraphConfig.from_vllm_config(self.llm_engine.vllm_config)
     steering_payloads: dict[str, bytes] = {}  # steering_id -> pickled vectors
-    has_rows = False
-    steering_keys: list[str] = []
     for idx, extra in enumerate(extras):
-        vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
-        _reject_async_spec_positions(vllm_config, vectors, extra.get(POSITIONS_KEY))
-        rows = _decode_steering_rows(extra.pop("apply_steering_rows", None))
-        if rows:
-            extra["apply_steering_rows"] = _check_steering_rows(
-                rows,
-                self._lens_steering_tables,  # type: ignore[reportAttributeAccessIssue]
-                vectors,
-                vllm_config,
-            )
-            has_rows = True
+        vectors = _decode_steering_vectors(
+            extra.pop("apply_steering_vectors", None),
+            getattr(self, "_lens_steering_tables", {}),
+        )
+        _reject_async_spec_positions(
+            self.llm_engine.vllm_config, vectors, extra.get(POSITIONS_KEY)
+        )
         graph_config.reject(
             extra.get("apply_hooks"),
             qk=extra.get("output_qk") is not None,
             residual_stream=extra.get("output_residual_stream"),
             vectors=vectors,
-            rows=rows,
         )
-        extra.pop("_steering_id", None)
-        if vectors is not None or rows:
+        if vectors is not None:
             steering_id = f"_steer_{idx}"
-            steering_keys.append(steering_id)
+            steering_payloads[steering_id] = pickle.dumps(vectors)
             extra["_steering_id"] = steering_id
-            if vectors is not None:
-                steering_payloads[steering_id] = pickle.dumps(vectors)
 
     # Extract hooks per-request (same pattern as steering).
     hook_payloads: dict[str, bytes] = {}  # hook_id -> cloudpickled hooks
@@ -821,7 +749,7 @@ def _prepare_offline_params(
         if extra.pop("skip_reading_prefix_cache", None):
             any_skip_kv_cache = True
 
-    has_steering = len(steering_payloads) > 0 or has_rows
+    has_steering = len(steering_payloads) > 0
     has_hooks = len(hook_payloads) > 0
     has_persistent = getattr(self, "_has_persistent_hooks", False)
     needs_hooks = wants_activations or has_steering or has_hooks or has_persistent
@@ -829,12 +757,7 @@ def _prepare_offline_params(
         for sp in params_list:
             sp.skip_reading_prefix_cache = True
     for extra in extras:
-        if (
-            has_persistent
-            or "_steering_id" in extra
-            or "apply_steering_rows" in extra
-            or "_hook_id" in extra
-        ):
+        if has_persistent or "_steering_id" in extra or "_hook_id" in extra:
             extra["_lens_isolate_cache"] = True
 
     if needs_hooks and not getattr(self, "_hooks_installed", False):
@@ -846,31 +769,23 @@ def _prepare_offline_params(
         self._qk_hooks_installed = True  # type: ignore[reportAttributeAccessIssue]
 
     try:
-        for extra in extras:
-            rows = extra.pop("apply_steering_rows", None)
-            if rows:
-                self.collective_rpc(
-                    "set_steering_rows", args=(extra["_steering_id"], rows)
-                )
+        # Send steering data to workers before generation.
+        for sid, payload in steering_payloads.items():
+            self.collective_rpc("set_steering_data", args=(sid, payload))
+
+        # Send hook data to workers before generation.
+        for hid, payload in hook_payloads.items():
+            self.collective_rpc("set_hook_data", args=(hid, payload))
     except BaseException:
-        for key in steering_keys:
+        for key in steering_payloads:
             self.collective_rpc("clear_steering_data", args=(key,))
         raise
-
-    # Send steering data to workers before generation.
-    for sid, payload in steering_payloads.items():
-        self.collective_rpc("set_steering_data", args=(sid, payload))
-
-    # Send hook data to workers before generation.
-    for hid, payload in hook_payloads.items():
-        self.collective_rpc("set_hook_data", args=(hid, payload))
 
     return {
         "params": sampling_params,
         "wants_activations": wants_activations,
         "wants_qk": wants_qk,
         "steering_payloads": steering_payloads,
-        "steering_keys": steering_keys,
         "hook_payloads": hook_payloads,
     }
 
@@ -957,7 +872,7 @@ def _patched_llm_generate(
         )
         return _finalize_offline_outputs(self, outputs, state)
     finally:
-        for key in state["steering_keys"]:
+        for key in state["steering_payloads"]:
             self.collective_rpc("clear_steering_data", args=(key,))
 
 
@@ -983,7 +898,7 @@ def _patched_llm_chat(
         outputs = _original_llm_chat(self, messages, state["params"], *args, **kwargs)
         return _finalize_offline_outputs(self, outputs, state)
     finally:
-        for key in state["steering_keys"]:
+        for key in state["steering_payloads"]:
             self.collective_rpc("clear_steering_data", args=(key,))
 
 
@@ -1138,10 +1053,7 @@ def _patched_register_routers(app):
     """Inject vllm-lens hook router after vLLM registers its own routes."""
     assert _original_register_routers is not None
     _original_register_routers(app)
-    from vllm_lens._hooks_router import (
-        activations_router,
-        steering_tables_router,
-    )
+    from vllm_lens._hooks_router import activations_router, steering_tables_router
     from vllm_lens._hooks_router import router as hooks_router
 
     app.include_router(hooks_router)
@@ -1172,9 +1084,10 @@ def _llm_register_hooks(
 
 def _llm_set_steering_table(self: LLM, name: str, vectors: torch.Tensor) -> None:
     """Hold ``(N, hidden)`` steering vectors on the workers under ``name``, for requests
-    that name a row in ``apply_steering_rows``."""
+    that name a row in ``apply_steering_vectors``."""
     hidden = self.llm_engine.model_config.get_hidden_size()
-    payload = _check_steering_vectors(serialize_tensor(vectors.float()), hidden)
+    _check_steering_vectors(vectors, hidden)
+    payload = serialize_tensor(vectors.float())
     self.collective_rpc("set_steering_table", args=(name, payload))
     self._lens_steering_tables = {**self._lens_steering_tables, name: vectors.shape[0]}  # type: ignore[reportAttributeAccessIssue]
 
