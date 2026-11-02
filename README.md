@@ -239,6 +239,28 @@ Steered and hooked requests skip prefix-cache reads and use a unique cache salt 
 
 Residual-stream capture, Q/K capture, and per-request hooks require `n=1`. Send separate requests for capture. Steering state is cleared if offline generation fails.
 
+### Registered steering tables
+
+Register a table once and send row references with each request:
+
+```python
+from vllm_lens import SteeringRow
+
+client.set_steering_table("features", vectors)  # shape (rows, hidden_size)
+client.generate(
+    "Hello", steering_rows=[SteeringRow(table="features", row=0, layer_indices=[15])]
+)
+client.clear_steering_table("features")
+```
+
+Rows are prepared before generation. Clearing or replacing a table does not change prepared requests. A missing table or row fails before generation.
+
+Offline, use `llm.set_steering_table` and `apply_steering_rows` in `SamplingParams.extra_args`. HTTP registration uses `POST /v1/steering_tables` with `name` and serialized `vectors`; deletion uses `DELETE /v1/steering_tables/{name}`. Register tables through each API server process when using multiple API servers.
+
+Steering supports `n > 1`.
+
+Rows add `scale * table[row]` at every position. Rows and steering vectors cannot be combined. A request keeps its prepared rows when its table is cleared or replaced; preparation occurs before generation. Completed, cancelled, and failed requests release their prepared rows.
+
 ### Generic hooks
 
 Hooks let you run arbitrary Python functions on hidden states at specific layers during inference. They can capture data (via `ctx.saved`) and/or modify hidden states (by returning a tensor).
