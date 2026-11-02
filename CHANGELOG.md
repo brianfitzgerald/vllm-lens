@@ -11,6 +11,7 @@
 - Capture: Added `output_residual_stream_pool="mean"` (`capture_pool` on the client), which returns the mean over the prompt positions as one row per layer.
 - Capture: Added `output_residual_stream_positions` (`capture_positions` on the client), `"last_prompt_token"` or a list of absolute positions. The response carries `residual_stream_positions`. With async speculative decoding, a list of positions fails at submission.
 - Plugin: Added a CUDA-graph mode: `capture_layers` and `steer_layers` in `additional_config["vllm_lens"]` keep compilation and CUDA graphs on, and capture and steer those layers through the custom ops `vllm_lens::capture` and `vllm_lens::steer`. `steer_norm_match=False` removes the norm buffer and rejects norm-matched vectors. Hooks, Q/K capture and layers outside the lists are rejected.
+- Plugin: The eager hooks skip a layer that no batched request captures, steers or hooks; before, every layer scanned the batch twice per forward pass.
 
 
 ## v1.3.0 (2 October 2026)
