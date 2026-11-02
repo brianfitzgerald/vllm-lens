@@ -83,3 +83,38 @@ async def test_async_generate_keeps_the_callers_params(
         assert "apply_steering_vectors" not in prompt.sampling_params.extra_args  # type: ignore[attr-defined]
     else:
         assert sent is not params and "apply_steering_vectors" not in sent.extra_args
+
+
+@pytest.mark.parametrize("vectors", [False, True])
+async def test_async_generate_keys_vectors_by_request_id(monkeypatch, vectors):
+    """Vectors are keyed by the request id in extra_args; a client-sent key is dropped."""
+    received: list = []
+
+    async def original(self, prompt, params, request_id, **kwargs):
+        received.append(params)
+        yield SimpleNamespace(finished=True)
+
+    monkeypatch.setattr(plugin, "_original_generate", original)
+    for name in ("vllm", "vllm.v1", "vllm.v1.engine"):
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    sys.modules["vllm.v1.engine"].EngineCoreRequest = type("EngineCoreRequest", (), {})  # type: ignore[attr-defined]
+
+    async def collective_rpc(method: str, args: tuple = ()) -> list:
+        return []
+
+    engine = SimpleNamespace(
+        vllm_config=SimpleNamespace(additional_config=None),
+        _hooks_installed=True,
+        _lens_projections=frozenset(),
+        collective_rpc=collective_rpc,
+    )
+    extra: dict[str, object] = {"_steering_id": "other"}
+    if vectors:
+        extra["apply_steering_vectors"] = [
+            SteeringVector(activations=torch.ones(1, 4), layer_indices=[0])
+        ]
+    params = SimpleNamespace(n=1, extra_args=extra, skip_reading_prefix_cache=False)
+    async for _ in plugin._patched_generate(engine, "p", params, "r"):  # type: ignore[arg-type]
+        pass
+    (sent,) = received
+    assert sent.extra_args.get("_steering_id") == ("r" if vectors else None)
