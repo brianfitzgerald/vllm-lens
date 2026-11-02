@@ -14,35 +14,20 @@ from pydantic import (
     field_serializer,
     field_validator,
     model_validator,
+    model_serializer,
 )
 
 from vllm_lens._helpers._serialize import deserialize_tensor, serialize_tensor
 
 
 class SteeringVector(BaseModel):
-    """A steering vector that modifies the residual stream during inference.
-
-    Supports automatic serialization/deserialization of ``torch.Tensor``
-    activations for JSON transport (HTTP API) and direct ``torch.Tensor``
-    values for in-process usage (offline ``LLM`` / ``AsyncLLMEngine``).
-
-    Example (offline)::
-
-        sv = SteeringVector(
-            activations=torch.randn(1, 4096),
-            layer_indices=[18],
-            scale=2.0,
-        )
-
-    Example (JSON round-trip)::
-
-        data = sv.model_dump()          # base64-encoded activations
-        sv2 = SteeringVector.model_validate(data)  # decoded back to tensor
-    """
+    """Steer with an inline tensor or a registered table row."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    activations: torch.Tensor
+    activations: torch.Tensor | None = None
+    table: str | None = None
+    row: int | None = None
     """Steering activations.  Shape ``(n_layers, hidden_dim)`` for broadcast
     or ``(n_layers, n_positions, hidden_dim)`` for position-specific."""
 
@@ -65,8 +50,10 @@ class SteeringVector(BaseModel):
 
     @field_validator("activations", mode="before")
     @classmethod
-    def _deserialize_activations(cls, v: Any) -> torch.Tensor:
+    def _deserialize_activations(cls, v: Any) -> torch.Tensor | None:
         """Accept base64 dicts (from JSON transport) or raw tensors."""
+        if v is None:
+            return None
         if isinstance(v, dict) and "data" in v:
             return deserialize_tensor(v)
         if isinstance(v, torch.Tensor):
@@ -76,13 +63,38 @@ class SteeringVector(BaseModel):
         )
 
     @field_serializer("activations")
-    def _serialize_activations(self, v: torch.Tensor, _info: Any) -> dict[str, Any]:
+    def _serialize_activations(
+        self, v: torch.Tensor | None, _info: Any
+    ) -> dict[str, Any] | None:
         """Serialize tensor to base64 dict for JSON transport."""
-        return serialize_tensor(v)
+        return serialize_tensor(v) if v is not None else None
+
+    @model_serializer(mode="wrap")
+    def _serialize_source(
+        self, handler: Callable[[Any], dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Serialize only the selected vector source."""
+        data = handler(self)
+        if self.activations is None:
+            data.pop("activations")
+        else:
+            data.pop("table")
+            data.pop("row")
+        return data
 
     @model_validator(mode="after")
     def _check_shape(self) -> Self:
         """Validate activation tensor shape matches layer_indices."""
+        if self.activations is None:
+            if self.table is None or self.row is None or self.row < 0:
+                raise ValueError("Supply activations or a table and non-negative row")
+            if not self.layer_indices or self.position_indices is not None:
+                raise ValueError(
+                    "Table references require layers and broadcast positions"
+                )
+            return self
+        if self.table is not None or self.row is not None:
+            raise ValueError("Activations and table references cannot be combined")
         if self.activations.dim() not in (2, 3):
             raise ValueError(
                 f"activations must be 2D or 3D, got {self.activations.dim()}D"
@@ -104,30 +116,6 @@ class SteeringVector(BaseModel):
                 {li: i for i, li in enumerate(self.layer_indices)},
             )
         return self._layer_index_map_cache  # type: ignore[reportAttributeAccessIssue]
-
-
-class SteeringRow(BaseModel):
-    """A row of a steering table registered on the server, added at each named layer.
-
-    The table is registered once with ``LLM.set_steering_table`` or
-    ``POST /v1/steering_tables``; the request then carries only this reference,
-    under ``extra_args["apply_steering_rows"]``. The addition is ``scale * table[row]``
-    at every position, as a 2D ``SteeringVector`` without ``norm_match``.
-    """
-
-    table: str
-    row: int
-    layer_indices: list[int]
-    scale: float = 1.0
-
-    @model_validator(mode="after")
-    def _check_row(self) -> Self:
-        """Validate a non-negative row and at least one layer."""
-        if self.row < 0:
-            raise ValueError(f"row must be non-negative, got {self.row}")
-        if not self.layer_indices:
-            raise ValueError("layer_indices must name at least one layer")
-        return self
 
 
 class HookContext:

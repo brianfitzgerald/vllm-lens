@@ -4,7 +4,7 @@ import pytest
 import torch
 from vllm import LLM, SamplingParams
 
-from vllm_lens import SteeringRow, SteeringVector
+from vllm_lens import SteeringVector
 
 from .conftest import LONG_PROMPT, lens_engine, relative_errors
 
@@ -70,8 +70,8 @@ def test_rows_match_vectors(request, engine, table, rows):
     by_row = _run(
         llm,
         {
-            "apply_steering_rows": [
-                SteeringRow(table=TABLE, row=r, layer_indices=[STEER_LAYER], scale=s)
+            "apply_steering_vectors": [
+                SteeringVector(table=TABLE, row=r, layer_indices=[STEER_LAYER], scale=s)
                 for r, s in rows
             ]
         },
@@ -107,14 +107,14 @@ def test_add_only_graph_matches_the_norm_graph(graph_llm, add_only_llm, table):
 
 def test_unknown_table_and_cleared_table_are_rejected(graph_llm, table):
     """A row of an unregistered or cleared table fails before generation."""
-    row = SteeringRow(table="missing", row=0, layer_indices=[STEER_LAYER])
+    row = SteeringVector(table="missing", row=0, layer_indices=[STEER_LAYER])
     with pytest.raises(ValueError, match="not registered"):
-        _run(graph_llm, {"apply_steering_rows": [row]})
+        _run(graph_llm, {"apply_steering_vectors": [row]})
     graph_llm.set_steering_table("cleared", table)  # type: ignore[attr-defined]
     graph_llm.clear_steering_table("cleared")  # type: ignore[attr-defined]
-    row = SteeringRow(table="cleared", row=0, layer_indices=[STEER_LAYER])
+    row = SteeringVector(table="cleared", row=0, layer_indices=[STEER_LAYER])
     with pytest.raises(ValueError, match="not registered"):
-        _run(graph_llm, {"apply_steering_rows": [row]})
+        _run(graph_llm, {"apply_steering_vectors": [row]})
 
 
 @pytest.mark.parametrize("kind", ["rows", "vectors"])
@@ -124,8 +124,10 @@ def test_every_parallel_sample_is_steered(graph_llm, table, kind):
     graph_llm.set_steering_table(TABLE, table)  # type: ignore[attr-defined]
     steering = (
         {
-            "apply_steering_rows": [
-                SteeringRow(table=TABLE, row=1, layer_indices=[STEER_LAYER], scale=8.0)
+            "apply_steering_vectors": [
+                SteeringVector(
+                    table=TABLE, row=1, layer_indices=[STEER_LAYER], scale=8.0
+                )
             ]
         }
         if kind == "rows"

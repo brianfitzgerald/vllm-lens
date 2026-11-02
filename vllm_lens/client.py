@@ -43,7 +43,7 @@ from vllm_lens._helpers._serialize import (
     decode_activations,
     deserialize_hook_results,
 )
-from vllm_lens._helpers.types import Hook, SteeringRow, SteeringVector
+from vllm_lens._helpers.types import Hook, SteeringVector
 
 
 if TYPE_CHECKING:
@@ -111,7 +111,6 @@ class VLLMLensClient:
         capture_qk: list[int] | bool | None = None,
         capture_positions: str | list[int] | None = None,
         capture_pool: Literal["mean"] | None = None,
-        steering_rows: list[SteeringRow] | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
@@ -133,10 +132,6 @@ class VLLMLensClient:
         if steering_vectors is not None:
             xargs["apply_steering_vectors"] = json.dumps(
                 [sv.model_dump() for sv in steering_vectors]
-            )
-        if steering_rows is not None:
-            xargs["apply_steering_rows"] = json.dumps(
-                [row.model_dump() for row in steering_rows]
             )
         return xargs
 
@@ -193,7 +188,6 @@ class VLLMLensClient:
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         capture_pool: Literal["mean"] | None = None,
-        steering_rows: list[SteeringRow] | None = None,
         logprobs: int | None = None,
         echo: bool = False,
         **kwargs: Any,
@@ -217,7 +211,7 @@ class VLLMLensClient:
         position of each captured row. Omit it to capture every position.
 
         ``capture_pool="mean"`` returns the prompt mean as one row per layer;
-        ``steering_rows`` adds rows from :meth:`set_steering_table`.
+        ``steering_vectors`` adds rows from :meth:`set_steering_table`.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -239,7 +233,6 @@ class VLLMLensClient:
             capture_qk,
             capture_positions,
             capture_pool=capture_pool,
-            steering_rows=steering_rows,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -262,7 +255,6 @@ class VLLMLensClient:
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         capture_pool: Literal["mean"] | None = None,
-        steering_rows: list[SteeringRow] | None = None,
         **kwargs: Any,
     ) -> GenerateOutput:
         """Generate a chat completion from a list of messages.
@@ -292,7 +284,6 @@ class VLLMLensClient:
             capture_qk,
             capture_positions,
             capture_pool=capture_pool,
-            steering_rows=steering_rows,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -308,7 +299,7 @@ class VLLMLensClient:
 
     def set_steering_table(self, name: str, vectors: torch.Tensor) -> None:
         """Hold ``(N, hidden)`` steering vectors on the server under ``name``, for
-        ``SteeringRow(table=name, ...)``."""
+        ``SteeringVector(table=name, row=0, ...)``."""
         resp = self._session.post(
             f"{self.base_url}/v1/steering_tables",
             json={"name": name, "vectors": serialize_tensor(vectors.float())},
