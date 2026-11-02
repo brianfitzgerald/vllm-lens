@@ -8,7 +8,7 @@ import torch
 from vllm_lens._activations_plugin import _trim_activations
 
 
-@pytest.mark.parametrize("projected", [False])
+@pytest.mark.parametrize("projected", [False, True])
 def test_capture_after_preemption(worker, projected):
     """Recomputed positions replace earlier rows without removing later positions."""
     extra = {"output_residual_stream": [0]}
