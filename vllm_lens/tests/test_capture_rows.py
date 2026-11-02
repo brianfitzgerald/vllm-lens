@@ -32,7 +32,7 @@ def _step(extension, rows: torch.Tensor, first: int) -> None:
     [
         (
             {},
-            lambda s, steps: torch.cat([s[first : first + n] for first, n in steps]),
+            lambda s, steps: s[: max(first + n for first, n in steps)],
         ),
         ({"output_residual_stream_pool": "mean"}, lambda s, _: s[:10].mean(0, True)),
         ({POSITIONS_KEY: "last_prompt_token"}, lambda s, _: s[9:10]),
@@ -42,7 +42,7 @@ def _step(extension, rows: torch.Tensor, first: int) -> None:
 )
 def test_each_position_is_captured_once(schedule, extra, expected):
     """The capture is exact for any step schedule, with a re-prefill too; a full capture
-    keeps the rows of every step."""
+    keeps the latest row of each position."""
     stream = torch.randn(12, 8, generator=torch.Generator().manual_seed(0)).to(
         torch.bfloat16
     )

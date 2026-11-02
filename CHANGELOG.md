@@ -10,6 +10,7 @@
 - Capture: A step's captured rows go to the host in one gather and one non-blocking pinned copy per layer, in place of a blocking copy per request.
 - Capture: Added `output_residual_stream_pool="mean"` (`capture_pool` on the client), which returns the mean over the prompt positions as one row per layer.
 - Capture: Added `output_residual_stream_positions` (`capture_positions` on the client), `"last_prompt_token"` or a list of absolute positions. The response carries `residual_stream_positions`. With async speculative decoding, a list of positions fails at submission.
+- Plugin: Added a CUDA-graph mode for capture: `capture_layers` in `additional_config["vllm_lens"]` keeps compilation and CUDA graphs on and captures those layers through the custom op `vllm_lens::capture`. Steering, hooks, Q/K capture and layers outside the list are rejected.
 
 ## v1.3.0 (2 October 2026)
 
