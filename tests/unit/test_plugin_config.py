@@ -69,9 +69,10 @@ def test_still_forces_eager_and_worker_ext(patched):
     ("lens", "enforce_eager"),
     [
         ({"capture_layers": [2]}, False),
+        ({"steer_layers": [3]}, False),
         ({"capture_layers": []}, True),
     ],
-    ids=["capture-layers", "empty"],
+    ids=["capture-layers", "steer-layers", "empty"],
 )
 def test_a_layer_list_keeps_compilation_on(patched, lens, enforce_eager):
     """A layer list in additional_config leaves enforce_eager off."""
@@ -83,20 +84,16 @@ def test_a_layer_list_keeps_compilation_on(patched, lens, enforce_eager):
     ("stored", "expected"),
     [
         ({"capture_layers": [5, 2, 2]}, LensGraphConfig(capture_layers=(2, 5))),
-        ({"capture_layers": ["3"]}, LensGraphConfig(capture_layers=(3,))),
-        ({"capture_layers": ["x"]}, "of layer numbers"),
+        ({"steer_layers": ["3"]}, LensGraphConfig(steer_layers=(3,))),
+        (
+            {"capture_layers": [2], "steer_layers": [4]},
+            LensGraphConfig(capture_layers=(2,), steer_layers=(4,)),
+        ),
+        ({"capture_layers": ["x"]}, "lists of layer numbers"),
         ({"layers": [1]}, r"unknown key\(s\) \['layers'\]"),
-        ({"capture_layers": [2], "steer_layers": [2]}, r"\['steer_layers'\]"),
-        ([2], "of layer numbers"),
+        ([2], "lists of layer numbers"),
     ],
-    ids=[
-        "sorted",
-        "string-int",
-        "not-a-layer",
-        "unknown-key",
-        "steer-layers",
-        "not-a-dict",
-    ],
+    ids=["sorted", "string-int", "both", "not-a-layer", "unknown-key", "not-a-dict"],
 )
 def test_layer_lists_are_read_and_checked(stored, expected):
     """Layer lists are sorted and deduplicated; anything else raises ValueError."""
@@ -114,13 +111,14 @@ def test_layer_lists_are_read_and_checked(stored, expected):
         ([2], None, None),
         ([5], None, "capture_layers"),
         (True, None, "must be a list"),
-        (None, [2], "steering is not available"),
+        (None, [3], None),
+        (None, [4], "steer_layers"),
     ],
-    ids=["served", "other-layer", "all-layers", "steered"],
+    ids=["served", "other-layer", "all-layers", "steered", "unsteered-layer"],
 )
 def test_unserved_requests_are_rejected(residual_stream, steering, match):
-    """A capture layer outside the list, every layer, or steering raises."""
-    config = LensGraphConfig(capture_layers=(2,))
+    """A capture or steering layer outside the lists, or every layer, raises."""
+    config = LensGraphConfig(capture_layers=(2,), steer_layers=(3,))
     vectors = steering and [
         SteeringVector(activations=torch.ones(1, 4), layer_indices=steering)
     ]
@@ -142,6 +140,25 @@ def test_hooks_and_qk_are_rejected(hooks, qk):
     LensGraphConfig().reject(hooks, qk=qk)
 
 
+@pytest.mark.parametrize(
+    "stored,expected",
+    [
+        ({"steer_layers": [1]}, True),
+        ({"steer_layers": [1], "steer_norm_match": False}, False),
+        ({"steer_layers": [1], "steer_norm_match": "no"}, "must be a bool"),
+    ],
+    ids=["default", "off", "not-a-bool"],
+)
+def test_norm_match_option_is_read(stored, expected):
+    """steer_norm_match defaults to true and must be a bool."""
+    config = SimpleNamespace(additional_config={CONFIG_KEY: stored})
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=expected):
+            LensGraphConfig.from_vllm_config(config)
+    else:
+        assert LensGraphConfig.from_vllm_config(config).steer_norm_match is expected
+
+
 @pytest.mark.parametrize("layers", [[2.9], [2.0], "12", [True], [-1]])
 def test_invalid_graph_layer_values(layers):
     """Invalid layer values fail before conversion."""
@@ -149,3 +166,17 @@ def test_invalid_graph_layer_values(layers):
         LensGraphConfig.from_vllm_config(
             SimpleNamespace(additional_config={CONFIG_KEY: {"capture_layers": layers}})
         )
+
+
+@pytest.mark.parametrize("norm_match", [False, True])
+def test_add_only_rejects_norm_matching(norm_match):
+    """An add-only engine accepts only unmatched steering vectors."""
+    config = LensGraphConfig(steer_layers=(1,), steer_norm_match=False)
+    vector = SteeringVector(
+        activations=torch.ones(1, 8), layer_indices=[1], norm_match=norm_match
+    )
+    if norm_match:
+        with pytest.raises(ValueError, match="norm_match"):
+            config.reject(vectors=[vector])
+    else:
+        config.reject(vectors=[vector])
