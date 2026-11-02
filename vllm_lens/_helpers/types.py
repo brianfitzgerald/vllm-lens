@@ -106,6 +106,30 @@ class SteeringVector(BaseModel):
         return self._layer_index_map_cache  # type: ignore[reportAttributeAccessIssue]
 
 
+class SteeringRow(BaseModel):
+    """A row of a steering table registered on the server, added at each named layer.
+
+    The table is registered once with ``LLM.set_steering_table`` or
+    ``POST /v1/steering_tables``; the request then carries only this reference,
+    under ``extra_args["apply_steering_rows"]``. The addition is ``scale * table[row]``
+    at every position, as a 2D ``SteeringVector`` without ``norm_match``.
+    """
+
+    table: str
+    row: int
+    layer_indices: list[int]
+    scale: float = 1.0
+
+    @model_validator(mode="after")
+    def _check_row(self) -> Self:
+        """Validate a non-negative row and at least one layer."""
+        if self.row < 0:
+            raise ValueError(f"row must be non-negative, got {self.row}")
+        if not self.layer_indices:
+            raise ValueError("layer_indices must name at least one layer")
+        return self
+
+
 class HookContext:
     """Mutable context passed to hook functions during forward passes.
 
