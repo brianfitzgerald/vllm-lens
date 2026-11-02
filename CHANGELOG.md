@@ -3,6 +3,7 @@
 - Steering: Fixed `position_indices` during decode and chunked prefill: the start of each forward pass was always 0, so position 0 was steered again on every decode step and positions in later prefill chunks were never steered. With async speculative decoding, a position-specific vector fails at submission.
 - Plugin: The package logs through the `vllm.lens` logger, a child of vLLM's `vllm` logger, so vLLM's handler, format and `VLLM_LOGGING_LEVEL` apply. Before, its INFO records were dropped.
 - Plugin: Generation uses copies of the supplied `SamplingParams`. Before, the entry points popped the vectors and hooks from the caller's `extra_args`, so a reused `SamplingParams` steered only its first call.
+- Plugin: Steered and hooked requests use a unique prefix-cache salt per request, so other requests cannot reuse their KV blocks. These requests still skip prefix-cache reads.
 
 ## v1.3.0 (2 October 2026)
 
