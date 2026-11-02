@@ -37,6 +37,7 @@ from typing import Any, Literal
 
 import requests
 
+from vllm_lens._helpers._positions import POSITIONS_KEY
 from vllm_lens._helpers._serialize import (
     decode_activations,
     deserialize_hook_results,
@@ -103,6 +104,7 @@ class VLLMLensClient:
         activations_transport: str | None = None,
         capture_qk: list[int] | bool | None = None,
         capture_pool: Literal["mean"] | None = None,
+        capture_positions: str | list[int] | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
@@ -113,6 +115,12 @@ class VLLMLensClient:
             xargs["output_qk"] = json.dumps(capture_qk)
         if capture_pool is not None:
             xargs["output_residual_stream_pool"] = capture_pool
+        if capture_positions is not None:
+            xargs[POSITIONS_KEY] = (
+                capture_positions
+                if isinstance(capture_positions, str)
+                else json.dumps(capture_positions)
+            )
         if hooks is not None:
             xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
         if steering_vectors is not None:
@@ -173,6 +181,7 @@ class VLLMLensClient:
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         capture_pool: Literal["mean"] | None = None,
+        capture_positions: str | list[int] | None = None,
         logprobs: int | None = None,
         echo: bool = False,
         **kwargs: Any,
@@ -190,7 +199,9 @@ class VLLMLensClient:
         layers (or all layers with ``True``); reconstruct patterns with
         :func:`vllm_lens.attention.attention_patterns`.
 
-        ``capture_pool="mean"`` returns the prompt mean as one row per layer.
+        ``capture_pool="mean"`` returns the prompt mean as one row per layer;
+        ``capture_positions`` keeps ``"last_prompt_token"`` or a list of absolute
+        positions and adds ``residual_stream_positions``.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -211,6 +222,7 @@ class VLLMLensClient:
             activations_transport,
             capture_qk,
             capture_pool=capture_pool,
+            capture_positions=capture_positions,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -232,6 +244,7 @@ class VLLMLensClient:
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         capture_pool: Literal["mean"] | None = None,
+        capture_positions: str | list[int] | None = None,
         **kwargs: Any,
     ) -> GenerateOutput:
         """Generate a chat completion from a list of messages.
@@ -260,6 +273,7 @@ class VLLMLensClient:
             activations_transport,
             capture_qk,
             capture_pool=capture_pool,
+            capture_positions=capture_positions,
         )
         if xargs:
             body["vllm_xargs"] = xargs
