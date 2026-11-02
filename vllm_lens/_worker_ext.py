@@ -1140,12 +1140,24 @@ class HiddenStatesExtension:
                     raise ValueError(
                         f"layer_index {idx} out of range [0, {num_layers})"
                     )
-            if sv.activations.shape[-1] != hidden:
+            activations = sv.activations
+            if activations is None:
+                table = (
+                    self._steering_tables.get(sv.table)
+                    if sv.table is not None
+                    else None
+                )
+                if table is None or sv.row is None or sv.row >= table.shape[0]:
+                    raise ValueError("Steering table or row is no longer available")
+                activations = table[sv.row : sv.row + 1].expand(
+                    len(sv.layer_indices), -1
+                )
+            if activations.shape[-1] != hidden:
                 raise ValueError(
-                    f"vector width {sv.activations.shape[-1]}, model width {hidden}"
+                    f"vector width {activations.shape[-1]}, model width {hidden}"
                 )
 
-            values = sv.activations.to(device=device, dtype=dtype).float()
+            values = activations.to(device=device, dtype=dtype).float()
             if sv.norm_match:
                 values = values / (values.norm(dim=-1, keepdim=True) + 1e-6)
             values = values * sv.scale
@@ -1181,25 +1193,9 @@ class HiddenStatesExtension:
         """Remove steering data for a completed request."""
         self._steering_data.pop(key, None)
 
-    def set_steering_rows(self, key: str, rows: list[dict[str, Any]]) -> None:
-        """Prepare table rows for one request before generation."""
-        prepared = {}
-        for entry in rows:
-            table = self._steering_tables.get(entry["table"])
-            index = entry["row"]
-            if table is None or not 0 <= index < table.shape[0]:
-                raise ValueError("Steering table or row is no longer available")
-            values = table[index : index + 1] * float(entry["scale"])
-            for layer in entry["layer_indices"]:
-                if layer in prepared:
-                    prepared[layer].add.add_(values)
-                else:
-                    prepared[layer] = _SteeringLayer(values.clone(), None, [])
-        self._steering_data[key] = prepared
-
     def set_steering_table(self, name: str, payload: dict[str, Any]) -> None:
         """Hold the ``(N, hidden)`` rows of a ``serialize_tensor`` payload under ``name``;
-        requests name a row in ``apply_steering_rows``."""
+        requests name a row in ``apply_steering_vectors``."""
         # Installing the hooks resets the worker state, so it must come first.
         self.install_hooks()
         parameter = next(self.model_runner.model.parameters())

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 import vllm_lens._activations_plugin as plugin
-from vllm_lens import SteeringRow, SteeringVector
+from vllm_lens import SteeringVector
 from vllm_lens._cudagraph import LensGraphConfig
 
 TABLE = torch.arange(24, dtype=torch.float32).reshape(3, 8)
@@ -33,31 +33,30 @@ def extension(requests):
         model_config=SimpleNamespace(get_total_num_hidden_layers=lambda: 4),
         _steering_data={},
         _steering_tables={"t": TABLE.clone()},
-        _row_steering={},
     )
 
 
 def row(index, layers, scale):
     """One steering row of table `t`, as the plugin passes it to the workers."""
-    return {"table": "t", "row": index, "layer_indices": layers, "scale": scale}
+    return SteeringVector(table="t", row=index, layer_indices=layers, scale=scale)
 
 
 def test_rows_sum_per_layer_and_are_dropped_with_their_request(worker, monkeypatch):
     """Each layer gets the sum of its rows; a finished request's rows are dropped."""
     ext = extension(
         {
-            "a-0": {"apply_steering_rows": [row(1, [2, 3], 2.0)]},
-            "b-0": {"apply_steering_rows": [row(0, [2], 1.0), row(2, [2], -0.5)]},
+            "a-0": {"apply_steering_vectors": [row(1, [2, 3], 2.0)]},
+            "b-0": {"apply_steering_vectors": [row(0, [2], 1.0), row(2, [2], -0.5)]},
         }
     )
     monkeypatch.setattr(
         worker, "_batch_layout", lambda *a, **k: torch.tensor([0, 3, 5])
     )
     for req in ext.model_runner.requests.values():
-        rows = req.sampling_params.extra_args.get("apply_steering_rows")
+        rows = req.sampling_params.extra_args.get("apply_steering_vectors")
         if rows:
-            worker.HiddenStatesExtension.set_steering_rows(
-                ext, req.sampling_params.extra_args["_steering_id"], rows
+            worker.HiddenStatesExtension.set_steering_data(
+                ext, req.sampling_params.extra_args["_steering_id"], pickle.dumps(rows)
             )
     plan = worker._steer_pass(ext)
     assert [(s.start, s.end) for s in plan[2]] == [(0, 3), (3, 5)]
@@ -98,43 +97,19 @@ def test_tables_are_set_and_cleared(worker):
     assert ext._steering_tables == {}
 
 
-def _vllm_config(layers=4):
-    """A VllmConfig stand-in with `layers` decoder layers."""
-    return SimpleNamespace(
-        model_config=SimpleNamespace(
-            hf_text_config=SimpleNamespace(num_hidden_layers=layers)
+@pytest.mark.parametrize("table,index", [("missing", 0), ("t", 3)])
+def test_invalid_reference_fails_at_submission(table, index):
+    """Reject unavailable table references before worker setup."""
+    with pytest.raises(ValueError):
+        plugin._decode_steering_vectors(
+            [SteeringVector(table=table, row=index, layer_indices=[0])], {"t": 3}
         )
-    )
 
 
-@pytest.mark.parametrize(
-    "rows,vectors,message",
-    [
-        ([SteeringRow(table="u", row=0, layer_indices=[0])], None, "not registered"),
-        ([SteeringRow(table="t", row=3, layer_indices=[0])], None, "has 3 rows"),
-        ([SteeringRow(table="t", row=0, layer_indices=[4])], None, "out of range"),
-        (
-            [SteeringRow(table="t", row=0, layer_indices=[0])],
-            [SteeringVector(activations=torch.ones(1, 8), layer_indices=[0])],
-            "cannot be combined",
-        ),
-    ],
-    ids=["unknown-table", "row", "layer", "with-vectors"],
-)
-def test_invalid_rows_fail_at_submission(rows, vectors, message):
-    """A bad row reference raises before the request reaches the engine."""
-    with pytest.raises(ValueError, match=message):
-        plugin._check_steering_rows(rows, {"t": 3}, vectors, _vllm_config())
-
-
-def test_rows_decode_from_the_wire_format():
-    """A JSON string of rows decodes and checks to plain dicts."""
-    wire = '[{"table": "t", "row": 2, "layer_indices": [1, 3], "scale": -1.5}]'
-    rows = plugin._decode_steering_rows(wire)
-    assert rows is not None
-    assert plugin._check_steering_rows(rows, {"t": 3}, None, _vllm_config()) == [
-        row(2, [1, 3], -1.5)
-    ]
+def test_reference_round_trip():
+    """References use the vector wire format without tensor data."""
+    vector = row(2, [1, 3], -1.5)
+    assert plugin._decode_steering_vectors([vector.model_dump()], {"t": 3}) == [vector]
 
 
 @pytest.mark.parametrize(
@@ -161,16 +136,18 @@ def test_parallel_sampling_rejects_capture(n, extra, hooks, fails):
 def test_graph_rejects_unserved_row_layer():
     """A row outside the configured steering layers fails at submission."""
     config = LensGraphConfig(steer_layers=(1,))
-    with pytest.raises(ValueError, match="apply_steering_rows"):
-        config.reject(rows=[SteeringRow(table="t", row=0, layer_indices=[2])])
+    with pytest.raises(ValueError, match="apply_steering_vectors"):
+        config.reject(vectors=[SteeringVector(table="t", row=0, layer_indices=[2])])
 
 
 @pytest.mark.parametrize("replace", [False, True])
 def test_active_rows_survive_table_clear(worker, monkeypatch, replace):
     """Prepared steering remains active after its table is removed."""
-    ext = extension({"a-0": {"apply_steering_rows": [row(1, [2], 2.0)]}})
+    ext = extension({"a-0": {"apply_steering_vectors": [row(1, [2], 2.0)]}})
     monkeypatch.setattr(worker, "_batch_layout", lambda *a, **k: torch.tensor([0, 1]))
-    worker.HiddenStatesExtension.set_steering_rows(ext, "a-0", [row(1, [2], 2.0)])
+    worker.HiddenStatesExtension.set_steering_data(
+        ext, "a-0", pickle.dumps([row(1, [2], 2.0)])
+    )
     before = worker._steer_pass(ext)[2][0].data.add.clone()
     ext._steering_tables.clear()
     if replace:
@@ -181,11 +158,15 @@ def test_active_rows_survive_table_clear(worker, monkeypatch, replace):
 
 
 def test_missing_table_preserves_other_requests(worker, monkeypatch):
-    ext = extension({"a-0": {"apply_steering_rows": [row(1, [2], 2.0)]}})
-    worker.HiddenStatesExtension.set_steering_rows(ext, "a-0", [row(1, [2], 2.0)])
+    ext = extension({"a-0": {"apply_steering_vectors": [row(1, [2], 2.0)]}})
+    worker.HiddenStatesExtension.set_steering_data(
+        ext, "a-0", pickle.dumps([row(1, [2], 2.0)])
+    )
     ext._steering_tables.clear()
     with pytest.raises(ValueError, match="no longer available"):
-        worker.HiddenStatesExtension.set_steering_rows(ext, "bad", [row(1, [2], 2.0)])
+        worker.HiddenStatesExtension.set_steering_data(
+            ext, "bad", pickle.dumps([row(1, [2], 2.0)])
+        )
     monkeypatch.setattr(worker, "_batch_layout", lambda *a, **k: torch.tensor([0, 1]))
     torch.testing.assert_close(worker._steer_pass(ext)[2][0].data.add, 2.0 * TABLE[1:2])
     assert "bad" not in ext._steering_data
@@ -199,5 +180,49 @@ def test_unavailable_row_is_atomic(worker, replace):
     else:
         ext._steering_tables.clear()
     with pytest.raises(ValueError):
-        worker.HiddenStatesExtension.set_steering_rows(ext, "bad", [row(1, [2], 1.0)])
+        worker.HiddenStatesExtension.set_steering_data(
+            ext, "bad", pickle.dumps([row(1, [2], 1.0)])
+        )
     assert "bad" not in ext._steering_data
+
+
+@pytest.mark.parametrize("scale", [-2.0, 0.0, 1.5])
+@pytest.mark.parametrize("norm_match", [False, True])
+def test_reference_matches_inline(worker, scale, norm_match):
+    """References prepare the same multi-layer steering as inline tensors."""
+    ext = extension({})
+    inline = SteeringVector(
+        activations=TABLE[1:2].expand(2, -1),
+        layer_indices=[1, 2],
+        scale=scale,
+        norm_match=norm_match,
+    )
+    reference = SteeringVector(
+        table="t", row=1, layer_indices=[1, 2], scale=scale, norm_match=norm_match
+    )
+    for key, vector in [("inline", inline), ("reference", reference)]:
+        worker.HiddenStatesExtension.set_steering_data(ext, key, pickle.dumps([vector]))
+    for layer in [1, 2]:
+        for field in ["add", "norm"]:
+            expected = getattr(ext._steering_data["inline"][layer], field)
+            actual = getattr(ext._steering_data["reference"][layer], field)
+            if expected is None:
+                assert actual is None
+            else:
+                torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {"table": "t"},
+        {"table": "t", "row": -1},
+        {"table": "t", "row": 0, "activations": torch.ones(1, 8)},
+        {"table": "t", "row": 0, "position_indices": [0]},
+    ],
+)
+def test_invalid_vector_source(fields):
+    """Reject incomplete, conflicting, and positional table references."""
+    with pytest.raises(ValueError):
+        SteeringVector(layer_indices=[1], **fields)
