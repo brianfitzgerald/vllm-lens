@@ -13,7 +13,6 @@ def test_vector_cleanup(monkeypatch, method, stage):
     calls = []
     engine = SimpleNamespace(
         _hooks_installed=True,
-        _lens_projections=set(),
         llm_engine=SimpleNamespace(vllm_config=SimpleNamespace(additional_config=None)),
         collective_rpc=lambda name, args=(): calls.append((name, args)) or [],
     )
