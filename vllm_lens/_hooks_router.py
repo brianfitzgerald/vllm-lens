@@ -15,7 +15,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from vllm_lens._cudagraph import LensGraphConfig
-from vllm_lens._helpers._serialize import serialize_hook_results
+from vllm_lens._helpers._serialize import deserialize_tensor, serialize_hook_results
 from vllm_lens._helpers.types import Hook
 
 router = APIRouter(prefix="/v1/hooks", tags=["vllm-lens"])
@@ -24,6 +24,9 @@ router = APIRouter(prefix="/v1/hooks", tags=["vllm-lens"])
 # independently of the hook-management router.
 activations_router = APIRouter(prefix="/v1/activations", tags=["vllm-lens"])
 
+
+# Named steering tables for apply_steering_vectors.
+steering_tables_router = APIRouter(prefix="/v1/steering_tables", tags=["vllm-lens"])
 
 _ACT_CHUNK_BYTES = 1 << 20  # 1 MiB
 
@@ -196,3 +199,36 @@ async def serve_ui(filename: str):
     if not os.path.isfile(path):
         raise HTTPException(404, f"File not found: {filename}")
     return FileResponse(path)
+
+
+@steering_tables_router.post("")
+async def set_steering_table(raw_request: Request):
+    """Hold ``{"name", "vectors"}`` on the workers; ``vectors`` is a ``serialize_tensor``
+    dict of shape ``(N, hidden)``."""
+    from vllm_lens._activations_plugin import _check_steering_vectors
+
+    body = await raw_request.json()
+    name = body.get("name") if isinstance(body, dict) else None
+    if not isinstance(name, str) or "vectors" not in body:
+        raise HTTPException(400, "Body must hold a string 'name' and 'vectors'")
+    engine = _engine_client(raw_request)
+    try:
+        vectors = deserialize_tensor(body["vectors"])
+        _check_steering_vectors(vectors, engine.model_config.get_hidden_size())
+    except (ValueError, KeyError, TypeError) as error:
+        raise HTTPException(400, str(error)) from error
+    rows = vectors.shape[0]
+    await engine.collective_rpc("set_steering_table", args=(name, body["vectors"]))
+    engine._lens_steering_tables = {**engine._lens_steering_tables, name: rows}
+    return JSONResponse({"status": "ok", "name": name, "rows": rows})
+
+
+@steering_tables_router.delete("/{name}")
+async def clear_steering_table(name: str, raw_request: Request):
+    """Drop the steering table under ``name``."""
+    engine = _engine_client(raw_request)
+    await engine.collective_rpc("clear_steering_table", args=(name,))
+    engine._lens_steering_tables = {
+        key: rows for key, rows in engine._lens_steering_tables.items() if key != name
+    }
+    return JSONResponse({"status": "ok"})
