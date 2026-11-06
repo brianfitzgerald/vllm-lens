@@ -105,7 +105,6 @@ async def test_async_generate_keys_vectors_by_request_id(monkeypatch, vectors):
     engine = SimpleNamespace(
         vllm_config=SimpleNamespace(additional_config=None),
         _hooks_installed=True,
-        _lens_projections=frozenset(),
         collective_rpc=collective_rpc,
     )
     extra: dict[str, object] = {"_steering_id": "other"}

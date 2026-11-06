@@ -60,7 +60,7 @@ client.clear_hooks()
 
 ## Disabling the plugin
 
-vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` entry point) and forces `enforce_eager=True` (disabling CUDA graphs) so its hooks can fire. To install it alongside another inference server without perturbing that server, set `VLLM_LENS_DISABLE=1` to make the plugin a complete no-op:
+vllm-lens auto-loads in **every** vLLM process (via the `vllm.general_plugins` entry point) and forces `enforce_eager=True` (disabling CUDA graphs) so its hooks can fire, unless the CUDA-graph mode is on (see [CUDA graphs](#cuda-graphs)). To install it alongside another inference server without perturbing that server, set `VLLM_LENS_DISABLE=1` to make the plugin a complete no-op:
 
 ```bash
 VLLM_LENS_DISABLE=1 vllm serve meta-llama/Llama-3.1-8B-Instruct
@@ -73,6 +73,28 @@ The plugin logs through the `vllm.lens` logger, a child of vLLM's `vllm` logger,
 ```bash
 VLLM_LOGGING_LEVEL=DEBUG vllm serve meta-llama/Llama-3.1-8B-Instruct
 ```
+
+## CUDA graphs
+
+Name the layers to steer and capture in vLLM's `additional_config` under `vllm_lens` to keep compilation and CUDA graphs on:
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --additional-config '{"vllm_lens": {"steer_layers": [18], "capture_layers": [15, 20]}}'
+```
+
+Offline, pass `additional_config={"vllm_lens": {...}}` to `LLM(...)`.
+
+Forward hooks on the named layers call the custom ops `vllm_lens::steer` and `vllm_lens::capture`, which stay inside the compiled graph; the request format does not change. The layer lists are part of vLLM's compile cache key, so each set gets its own compiled graph. The plugin sets vLLM's `worker_cls` to `vllm_lens._graph_worker.GraphWorker`, which replaces any other value.
+
+Set `steer_norm_match=False` in `additional_config["vllm_lens"]` for add-only steering. This removes the norm buffer and norm computation; vectors with `norm_match=True` are rejected.
+
+Limits:
+
+- A capture or steering layer that is not in the lists, `output_residual_stream=True` (all layers), hooks and Q/K capture fail with an error, as does the registration of a persistent hook.
+- The engine refuses to load with pipeline parallelism, micro-batching (DBO), sequence parallelism, Inductor graph partition or breakable CUDA graphs.
+- The buffers are allocated when the model loads, before vLLM sizes the KV cache: one `(max_num_batched_tokens, hidden_size)` buffer per captured layer in the model dtype, and one float32 addition buffer per steered layer, plus a float32 norm buffer when `steer_norm_match=True`.
+- Position-specific vectors that target generated tokens have the speculative decoding limit of the Steering vectors section.
 
 ## Examples
 
