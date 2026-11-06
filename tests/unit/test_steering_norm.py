@@ -3,6 +3,7 @@
 import pickle
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -23,6 +24,7 @@ def test_vectors_use_unsteered_norm(worker, monkeypatch, dtype, fused, reverse):
         model=torch.nn.Linear(2, 2, bias=False).to(dtype),
         model_config=SimpleNamespace(get_hidden_size=lambda: 2),
         input_batch=SimpleNamespace(num_reqs=1, req_ids=["request-0"]),
+        query_start_loc=SimpleNamespace(np=np.array([0, 2])),
         requests={
             "request-0": SimpleNamespace(
                 sampling_params=SimpleNamespace(extra_args={"_steering_id": "a"}),
