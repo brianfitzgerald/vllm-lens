@@ -990,7 +990,11 @@ class HiddenStatesExtension:
                     f"vector width {sv.activations.shape[-1]}, model width {hidden}"
                 )
 
-            values = sv.activations.to(device=device, dtype=dtype).float()
+            activations = sv.activations
+            if device.type == "cuda" and not activations.is_cuda:
+                # A pinned copy does not wait for the work queued on the GPU.
+                activations = activations.pin_memory().to(device, non_blocking=True)
+            values = activations.to(device=device, dtype=dtype).float()
             if sv.norm_match:
                 values = values / (values.norm(dim=-1, keepdim=True) + 1e-6)
             values = values * sv.scale
