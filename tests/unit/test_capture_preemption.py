@@ -2,18 +2,14 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from vllm_lens._activations_plugin import _trim_activations
 
 
-@pytest.mark.parametrize("projected", [False])
-def test_capture_after_preemption(worker, projected):
+def test_capture_after_preemption(worker):
     """Recomputed positions replace earlier rows without removing later positions."""
     extra = {"output_residual_stream": [0]}
-    if projected:
-        extra["output_residual_stream_project"] = "t"
     request = SimpleNamespace(
         sampling_params=SimpleNamespace(extra_args=extra),
         num_computed_tokens=0,
@@ -27,9 +23,7 @@ def test_capture_after_preemption(worker, projected):
         _captured_states={},
         _captured_positions={},
         _selected_capture=set(),
-        _projections={},
         _pooled={},
-        _direction_tables={"t": torch.eye(2)},
     )
     stream = torch.arange(10).reshape(5, 2).float()
     for first, count in [(0, 2), (0, 2), (2, 2), (4, 1)]:
@@ -39,6 +33,5 @@ def test_capture_after_preemption(worker, projected):
         )
     acts = worker.HiddenStatesExtension._build_payload(ext, "r-0")["activations"]
     _trim_activations(acts, 5)
-    key = "residual_stream_projection" if projected else "residual_stream"
-    torch.testing.assert_close(acts[key][0], stream)
+    torch.testing.assert_close(acts["residual_stream"][0], stream)
     assert "residual_stream_positions" not in acts
