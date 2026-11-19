@@ -28,9 +28,10 @@ from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_lens._helpers._hook_output import _replace_hook_output
 from vllm_lens._helpers._positions import (
-    LAST_PROMPT_TOKEN,
     POSITIONS_KEY,
     POSITIONS_META_KEY,
+    order_positions,
+    positions_in_slice,
 )
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
@@ -451,9 +452,9 @@ def _capture_rows(
                 )
         elif selector is not None:
             extension._selected_capture.add(req_id)
-            n_prompt = req_state.num_prompt_tokens
-            wanted = [n_prompt - 1] if selector == LAST_PROMPT_TOKEN else selector
-            positions = [p for p in wanted if first <= p < first + end - start]
+            positions = positions_in_slice(
+                selector, first, end - start, req_state.num_prompt_tokens
+            )
             extension._captured_positions.setdefault(req_id, {}).setdefault(
                 layer_idx, []
             ).extend(positions)
@@ -1186,10 +1187,14 @@ class HiddenStatesExtension:
             stacked = stacked.cpu()
         activations: dict[str, Any] = {}
         if positions is not None:
+            first_layer = positions.get(sorted_indices[0], [])
+            if any(positions.get(idx, []) != first_layer for idx in sorted_indices):
+                raise RuntimeError(
+                    "vllm-lens captured different positions per layer for "
+                    f"request {internal_req_id!r}: {positions}"
+                )
             # A position computed twice (after a preemption) keeps its latest row.
-            latest = {p: row for row, p in enumerate(positions[sorted_indices[0]])}
-            ordered = sorted(latest)
-            keep = [latest[p] for p in ordered]
+            ordered, keep = order_positions(first_layer)
             if keep != list(range(stacked.shape[1])):
                 stacked = stacked[:, keep]
             if selected:

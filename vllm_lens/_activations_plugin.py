@@ -30,7 +30,7 @@ from vllm_lens._helpers._positions import (
     LAST_PROMPT_TOKEN,
     POSITIONS_KEY,
     POSITIONS_META_KEY,
-    parse_capture_positions,
+    normalize_capture_positions,
 )
 from vllm_lens._helpers._serialize import (
     serialize_activations,
@@ -354,9 +354,7 @@ def _check_capture_options(extra: dict[str, Any]) -> None:
     pool = extra.get("output_residual_stream_pool")
     if pool not in (None, "mean"):
         raise ValueError(f"output_residual_stream_pool must be 'mean', got {pool!r}")
-    selector = parse_capture_positions(extra.pop(POSITIONS_KEY, None))
-    if selector is not None:
-        extra[POSITIONS_KEY] = selector
+    normalize_capture_positions(extra)
     chosen = [
         key
         for key, value in (
@@ -386,20 +384,18 @@ def _trim_activations(
     during that extra pass.  This trims the surplus positions so the
     residual stream shape is always deterministic.
     """
+    rs = activations.get("residual_stream")
     positions = activations.get(POSITIONS_META_KEY)
-    if positions is not None:
-        # Selected rows are sparse: a row of the extra pass is at or past expected_len.
-        keep = [
-            row for row, position in enumerate(positions) if position < expected_len
-        ]
+    if rs is not None and positions is not None:
+        # Position-selected rows are sparse, so trim by position rather than
+        # by count: a row from the surplus pass sits at or past expected_len.
+        keep = [row for row, pos in enumerate(positions) if pos < expected_len]
         if len(keep) < len(positions):
-            activations["residual_stream"] = activations["residual_stream"][:, keep]
+            activations["residual_stream"] = rs[:, keep, :]
             activations[POSITIONS_META_KEY] = [positions[row] for row in keep]
-    for key in (
-        *(() if positions is not None else ("residual_stream",)),
-        "attn_q",
-        "attn_k",
-    ):
+    elif rs is not None and rs.shape[1] > expected_len:
+        activations["residual_stream"] = rs[:, :expected_len, :]
+    for key in ("attn_q", "attn_k"):
         t = activations.get(key)
         if t is not None and t.shape[1] > expected_len:
             activations[key] = t[:, :expected_len]
