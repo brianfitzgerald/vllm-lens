@@ -1082,11 +1082,15 @@ class HiddenStatesExtension:
             """Plan this forward pass's steering and hook work, then run it."""
             try:
                 self._steer_pass = _steer_pass(self)
-                self._hook_pass = _hook_pass(self)
             except Exception:
                 # As for a bad hook: one request must not stop the engine.
                 logger.warning("Steering failed for this step", exc_info=True)
                 self._steer_pass = None
+            try:
+                self._hook_pass = _hook_pass(self)
+            except Exception:
+                # Without a plan, every layer runs its hooks.
+                logger.warning("Hook planning failed for this step", exc_info=True)
                 self._hook_pass = None
             try:
                 return model_forward(*args, **kwargs)

@@ -32,3 +32,25 @@ def test_hook_layer_plan(worker, monkeypatch, pre, persistent):
     )
     assert worker._hook_inner(ext, 2, torch.zeros(1, 2)) is None
     assert worker._pre_hook_inner(ext, 2, torch.zeros(1, 2)) is None
+
+
+def test_hook_plan_failure_keeps_steering(worker, monkeypatch):
+    """A failed hook plan leaves the step's steering plan in place."""
+    seen = []
+    ext = worker.HiddenStatesExtension()
+    ext.model_runner = SimpleNamespace(
+        _model_forward=lambda: seen.append((ext._steer_pass, ext._hook_pass))
+    )
+    ext.parallel_config = SimpleNamespace(tensor_parallel_size=1)
+    ext.rank = 0
+    ext._init_state()
+    plan = object()
+    monkeypatch.setattr(worker, "_steer_pass", lambda _ext: plan)
+
+    def fail(_ext):
+        raise RuntimeError("bad hook plan")
+
+    monkeypatch.setattr(worker, "_hook_pass", fail)
+    ext.model_runner._model_forward()
+    assert seen == [(plan, None)]
+    assert ext._steer_pass is None
