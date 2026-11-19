@@ -146,10 +146,14 @@ from vllm_lens.attention import attention_patterns
 
 llm = LLM("meta-llama/Llama-3.1-8B-Instruct")
 layer = 15  # decoder-layer index to capture
-sp = SamplingParams(max_tokens=8, extra_args={"output_qk": [layer]})  # or True for all layers
+sp = SamplingParams(
+    max_tokens=8, extra_args={"output_qk": [layer]}
+)  # or True for all layers
 out = llm.generate(["Hello world"], sp)
 
-weights = attention_patterns(out[0].activations, layer=layer)  # (num_heads, n_positions, n_positions)
+weights = attention_patterns(
+    out[0].activations, layer=layer
+)  # (num_heads, n_positions, n_positions)
 ```
 
 Over HTTP, use the client's `capture_qk`:
@@ -171,10 +175,12 @@ from vllm import LLM, SamplingParams
 from vllm_lens import SteeringVector
 
 sv = SteeringVector(
-    activations=torch.randn(1, 4096),  # (n_layers, hidden) or (n_layers, n_positions, hidden)
+    activations=torch.randn(
+        1, 4096
+    ),  # (n_layers, hidden) or (n_layers, n_positions, hidden)
     layer_indices=[15],
     scale=4.0,
-    norm_match=True,        # scale the added vector so its magnitude is ‖residual‖ · scale
+    norm_match=True,  # scale the added vector so its magnitude is ‖residual‖ · scale
     position_indices=None,  # None = all positions (2D) or sequential 0..n-1 (3D)
 )
 sp = SamplingParams(max_tokens=20, extra_args={"apply_steering_vectors": [sv]})
@@ -190,6 +196,8 @@ client.generate("I think the best dessert is", steering_vectors=[sv])
 ```
 
 `position_indices` are absolute positions in the sequence (prompt and generated tokens). With async speculative decoding, a position-specific vector fails at submission, because the positions of generated tokens are not known before the forward pass.
+
+Residual-stream capture, Q/K capture, and per-request hooks require `n=1`. Send separate requests for capture. Steering state is cleared if offline generation fails.
 
 ### Generic hooks
 
@@ -219,11 +227,13 @@ The `ctx` (a `HookContext`) passed to `fn` exposes:
 from vllm import LLM, SamplingParams
 from vllm_lens import Hook
 
+
 def ablate_neuron(ctx, h):
     ctx.saved[f"pre_L{ctx.layer_idx}"] = h[:, 42].cpu()
     h = h.clone()
     h[:, 42] = 0
     return h  # return None to skip modification
+
 
 hook = Hook(fn=ablate_neuron, layer_indices=[15, 16])
 sp = SamplingParams(
@@ -241,6 +251,7 @@ Pre-hooks run before the layer forward pass (useful for corrupting inputs):
 def corrupt_embeddings(ctx, h):
     noise = torch.randn_like(h) * 3.0
     return h + noise
+
 
 hook = Hook(fn=corrupt_embeddings, layer_indices=[0], pre=True)
 ```
