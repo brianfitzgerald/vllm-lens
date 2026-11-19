@@ -1,5 +1,7 @@
 ## Unreleased (fork)
 
+- Hooks: `HookContext.position_offset` is the absolute position of the slice's first token; `neuron_offset` is always 0.
+- Steering: Register tables once and reference rows per request; parallel sampling supports steering but rejects capture and per-request hooks.
 - Steering: All vectors in one layer use the unsteered stream norm for `norm_match`.
 - Steering: Fixed `position_indices` during decode and chunked prefill: the start of each forward pass was always 0, so position 0 was steered again on every decode step and positions in later prefill chunks were never steered. With async speculative decoding, a position-specific vector fails at submission.
 - Plugin: The package logs through the `vllm.lens` logger, a child of vLLM's `vllm` logger, so vLLM's handler, format and `VLLM_LOGGING_LEVEL` apply. Before, its INFO records were dropped.

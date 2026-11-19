@@ -33,6 +33,7 @@ from vllm_lens._helpers._positions import (
     order_positions,
     positions_in_slice,
 )
+from vllm_lens._helpers._serialize import deserialize_tensor
 from vllm_lens._helpers.types import Hook, HookContext, SteeringVector
 
 if TYPE_CHECKING:
@@ -304,7 +305,8 @@ def _hook_pass(extension: HiddenStatesExtension) -> _HookPass:
 def _steer_pass(
     extension: HiddenStatesExtension,
 ) -> dict[int, list[_SteerSlice]] | None:
-    """Group the token slices of the steered requests by layer, once per forward pass."""
+    """Group the token slices of the steered requests by layer, once per forward pass.
+    Prepared rows remain valid until request cleanup, even if their table is cleared."""
     if not extension._steering_data:
         return None
     runner = extension.model_runner
@@ -319,9 +321,10 @@ def _steer_pass(
         if start == end:
             continue
         request = runner.requests[req_id]
-        extra = getattr(request.sampling_params, "extra_args", None)
-        key = (extra or {}).get("_steering_id", "")
-        for layer, data in extension._steering_data.get(key, {}).items():
+        extra = getattr(request.sampling_params, "extra_args", None) or {}
+        key = extra.get("_steering_id", "")
+        prepared = extension._steering_data.get(key, {})
+        for layer, data in prepared.items():
             layers.setdefault(layer, []).append(
                 _SteerSlice(start, end, request.num_computed_tokens, data)
             )
@@ -627,6 +630,7 @@ def _hook_inner(
             req_id: str,
             start: int,
             end: int,
+            position_offset: int,
         ) -> None:
             """Run the post-hooks in one category list at this layer.
 
@@ -643,6 +647,7 @@ def _hook_inner(
                     ctxs[pos] = ctx
                 ctx.layer_idx = layer_idx
                 ctx.seq_len = end - start
+                ctx.position_offset = position_offset
                 ctx.model = runner.model
                 ctx._prefetched = extension._prefetched_params
 
@@ -658,6 +663,8 @@ def _hook_inner(
             req_id = req_ids[i]
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
+            req_state = runner.requests.get(req_id)
+            offset = req_state.num_computed_tokens if req_state else 0
             # Persistent hooks fire first (base layer); per-request hooks
             # see the persistent-modified state.
             _run_post_category(
@@ -666,9 +673,10 @@ def _hook_inner(
                 req_id,
                 start,
                 end,
+                offset,
             )
             _run_post_category(
-                per_req_hooks[i], extension._hook_contexts, req_id, start, end
+                per_req_hooks[i], extension._hook_contexts, req_id, start, end, offset
             )
 
     # --- Phase 3: capture activations (rank 0 only) -----------------
@@ -721,6 +729,7 @@ def _pre_hook_inner(
         req_id: str,
         start: int,
         end: int,
+        position_offset: int,
     ) -> None:
         """Run the pre-hooks in one category list at this layer."""
         nonlocal working, modified
@@ -734,6 +743,7 @@ def _pre_hook_inner(
                 ctxs[pos] = hctx
             hctx.layer_idx = layer_idx
             hctx.seq_len = end - start
+            hctx.position_offset = position_offset
             hctx.model = runner.model
             hctx._prefetched = extension._prefetched_params
 
@@ -758,10 +768,16 @@ def _pre_hook_inner(
 
         start = int(query_start_loc[i].item())
         end = int(query_start_loc[i + 1].item())
+        offset = req_state.num_computed_tokens if req_state else 0
         _run_pre_category(
-            persistent_hooks, extension._persistent_hook_contexts, req_id, start, end
+            persistent_hooks,
+            extension._persistent_hook_contexts,
+            req_id,
+            start,
+            end,
+            offset,
         )
-        _run_pre_category(per_req, extension._hook_contexts, req_id, start, end)
+        _run_pre_category(per_req, extension._hook_contexts, req_id, start, end, offset)
 
     return working if modified else None
 
@@ -1017,6 +1033,8 @@ class HiddenStatesExtension:
 
     # Prepared steering by request key and layer.
     _steering_data: dict[str, dict[int, _SteeringLayer]] = {}
+    # Registered steering tables by name, float32 on the device.
+    _steering_tables: dict[str, torch.Tensor] = {}
 
     # Per-request hook definitions:
     # key (external_req_id or _hook_id) → list of Hook
@@ -1063,6 +1081,7 @@ class HiddenStatesExtension:
         self._pooled = {}
         self._captured_positions = {}
         self._steering_data = {}
+        self._steering_tables = {}
         self._hook_data = {}
         self._steer_pass = None
         if not isinstance(self.__dict__.get("_persistent_hooks"), list):
@@ -1138,12 +1157,23 @@ class HiddenStatesExtension:
                     raise ValueError(
                         f"layer_index {idx} out of range [0, {num_layers})"
                     )
-            if sv.activations.shape[-1] != hidden:
+            activations = sv.activations
+            if activations is None:
+                table = (
+                    self._steering_tables.get(sv.table)
+                    if sv.table is not None
+                    else None
+                )
+                if table is None or sv.row is None or sv.row >= table.shape[0]:
+                    raise ValueError("Steering table or row is no longer available")
+                activations = table[sv.row : sv.row + 1].expand(
+                    len(sv.layer_indices), -1
+                )
+            if activations.shape[-1] != hidden:
                 raise ValueError(
-                    f"vector width {sv.activations.shape[-1]}, model width {hidden}"
+                    f"vector width {activations.shape[-1]}, model width {hidden}"
                 )
 
-            activations = sv.activations
             if device.type == "cuda" and not activations.is_cuda:
                 # A pinned copy does not wait for the work queued on the GPU.
                 activations = activations.pin_memory().to(device, non_blocking=True)
@@ -1182,6 +1212,26 @@ class HiddenStatesExtension:
     def clear_steering_data(self, key: str) -> None:
         """Remove steering data for a completed request."""
         self._steering_data.pop(key, None)
+
+    def set_steering_table(self, name: str, payload: dict[str, Any]) -> None:
+        """Hold the ``(N, hidden)`` rows of a ``serialize_tensor`` payload under ``name``;
+        requests name a row in ``apply_steering_vectors``."""
+        # Installing the hooks resets the worker state, so it must come first.
+        self.install_hooks()
+        parameter = next(self.model_runner.model.parameters())
+        # Rounded to the model dtype, as set_steering_data rounds a vector.
+        self._steering_tables[name] = (
+            deserialize_tensor(payload)
+            .to(device=parameter.device, dtype=parameter.dtype)
+            .float()
+        )
+
+    def clear_steering_table(self, name: str | None) -> None:
+        """Drop the table under ``name``; None drops every table."""
+        if name is None:
+            self._steering_tables = {}
+        else:
+            self._steering_tables.pop(name, None)
 
     def clear_captured_states(self, external_req_id: str) -> None:
         """Remove captured activations without returning them.
