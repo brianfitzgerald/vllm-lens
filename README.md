@@ -119,6 +119,8 @@ out = client.generate("Hello world", capture_layers=[15, 20])
 print(out.activations["residual_stream"].shape)
 ```
 
+To get the mean over the prompt positions as one row per layer, pass `output_residual_stream_pool="mean"` (the client's `capture_pool`); the result has shape `(n_layers, 1, hidden_dim)` and does not include generated positions.
+
 Layers are stacked in ascending order along dim 0. Capture runs on TP rank 0 only (residual streams are identical across TP ranks after all-reduce).
 
 #### Binary transport for large captures
