@@ -3,6 +3,8 @@ import multiprocessing
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -46,6 +48,24 @@ def hf_model():
     del model, tokenizer
     gc.collect()
     torch.cuda.empty_cache()
+
+
+def fake_extension(extras: dict[str, dict[str, Any] | None]) -> SimpleNamespace:
+    """A worker stand-in whose runner holds one request per entry of ``extras``, each with
+    10 prompt tokens and none computed."""
+    requests = {
+        req_id: SimpleNamespace(
+            sampling_params=SimpleNamespace(extra_args=extra),
+            num_computed_tokens=0,
+            num_prompt_tokens=10,
+        )
+        for req_id, extra in extras.items()
+    }
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=len(extras), req_ids=list(extras)),
+        requests=requests,
+    )
+    return SimpleNamespace(model_runner=runner, _captured_states={})
 
 
 @pytest.fixture(autouse=True, scope="module")
