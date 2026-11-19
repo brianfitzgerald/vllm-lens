@@ -630,6 +630,7 @@ def _hook_inner(
             req_id: str,
             start: int,
             end: int,
+            position_offset: int,
         ) -> None:
             """Run the post-hooks in one category list at this layer.
 
@@ -646,6 +647,7 @@ def _hook_inner(
                     ctxs[pos] = ctx
                 ctx.layer_idx = layer_idx
                 ctx.seq_len = end - start
+                ctx.position_offset = position_offset
                 ctx.model = runner.model
                 ctx._prefetched = extension._prefetched_params
 
@@ -661,6 +663,8 @@ def _hook_inner(
             req_id = req_ids[i]
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
+            req_state = runner.requests.get(req_id)
+            offset = req_state.num_computed_tokens if req_state else 0
             # Persistent hooks fire first (base layer); per-request hooks
             # see the persistent-modified state.
             _run_post_category(
@@ -669,9 +673,10 @@ def _hook_inner(
                 req_id,
                 start,
                 end,
+                offset,
             )
             _run_post_category(
-                per_req_hooks[i], extension._hook_contexts, req_id, start, end
+                per_req_hooks[i], extension._hook_contexts, req_id, start, end, offset
             )
 
     # --- Phase 3: capture activations (rank 0 only) -----------------
@@ -724,6 +729,7 @@ def _pre_hook_inner(
         req_id: str,
         start: int,
         end: int,
+        position_offset: int,
     ) -> None:
         """Run the pre-hooks in one category list at this layer."""
         nonlocal working, modified
@@ -737,6 +743,7 @@ def _pre_hook_inner(
                 ctxs[pos] = hctx
             hctx.layer_idx = layer_idx
             hctx.seq_len = end - start
+            hctx.position_offset = position_offset
             hctx.model = runner.model
             hctx._prefetched = extension._prefetched_params
 
@@ -761,10 +768,16 @@ def _pre_hook_inner(
 
         start = int(query_start_loc[i].item())
         end = int(query_start_loc[i + 1].item())
+        offset = req_state.num_computed_tokens if req_state else 0
         _run_pre_category(
-            persistent_hooks, extension._persistent_hook_contexts, req_id, start, end
+            persistent_hooks,
+            extension._persistent_hook_contexts,
+            req_id,
+            start,
+            end,
+            offset,
         )
-        _run_pre_category(per_req, extension._hook_contexts, req_id, start, end)
+        _run_pre_category(per_req, extension._hook_contexts, req_id, start, end, offset)
 
     return working if modified else None
 

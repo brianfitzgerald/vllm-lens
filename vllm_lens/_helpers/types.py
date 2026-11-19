@@ -123,15 +123,30 @@ class HookContext:
 
     Created per (hook, request) pair.  ``saved`` persists across layers
     for the same hook, so hooks can accumulate data as each layer fires.
-    ``layer_idx`` and ``seq_len`` are updated by the dispatcher before
-    each call.
+    ``layer_idx``, ``seq_len``, ``position_offset`` and ``neuron_offset``
+    are updated by the dispatcher before each call.
+
+    ``position_offset`` is the absolute position, within the request, of the
+    slice's first token: 0 on the first prefill chunk, then offset for later
+    chunks and decode steps.  ``neuron_offset`` is always 0: no hook here reads
+    a rank-local slice of MLP neurons.
     """
 
-    __slots__ = ("layer_idx", "seq_len", "saved", "model", "_prefetched")
+    __slots__ = (
+        "layer_idx",
+        "seq_len",
+        "position_offset",
+        "neuron_offset",
+        "saved",
+        "model",
+        "_prefetched",
+    )
 
     def __init__(self) -> None:
         self.layer_idx: int = 0
         self.seq_len: int = 0
+        self.position_offset: int = 0
+        self.neuron_offset: int = 0
         self.saved: dict[str, Any] = {}
         self.model: Any = None
         self._prefetched: dict[str, torch.Tensor] = {}
