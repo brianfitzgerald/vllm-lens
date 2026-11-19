@@ -340,6 +340,34 @@ class TestSteering:
         # propagates through attention, but the direct delta should only
         # be at pos 0.
 
+    async def test_position_steering_is_absolute_during_decode(self, vllm_model):
+        """A vector at position 0 must not be applied to the decode steps.
+        A steered row has cosine ~0.97 with the vector (``scale=4``); other rows ~0."""
+        hidden_dim = vllm_model.model_config.get_hidden_size()
+        vectors = _make_steering_vector(
+            hidden_dim,
+            [LAYER_IDX],
+            scale=4.0,
+            norm_match=True,
+            position_indices=[0],
+            n_positions=1,
+        )
+        steered = await _generate(
+            vllm_model,
+            PROMPT,
+            "pos-decode",
+            max_tokens=8,
+            extra_args={
+                "output_residual_stream": [LAYER_IDX],
+                "apply_steering_vectors": vectors,
+            },
+        )
+        rows = steered.activations["residual_stream"][0].float()  # type: ignore[reportAttributeAccessIssue]
+        direction = vectors[0].activations[0, 0].float()
+        cosines = torch.nn.functional.cosine_similarity(rows, direction.unsqueeze(0))
+        moved = torch.nonzero(cosines > 0.5).flatten().tolist()
+        assert moved == [0], f"Only row 0 should be steered, got rows {moved}"
+
     async def test_norm_match_scales_to_residual_stream(self, vllm_model):
         """``norm_match=True`` must scale the steering vector to the L2 norm of
         the *full residual stream*.

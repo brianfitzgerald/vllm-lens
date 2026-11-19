@@ -1,3 +1,7 @@
+## Unreleased (fork)
+
+- Steering: Fixed `position_indices` during decode and chunked prefill: the start of each forward pass was always 0, so position 0 was steered again on every decode step and positions in later prefill chunks were never steered. With async speculative decoding, a position-specific vector fails at submission.
+
 ## Unreleased
 
 ## v1.3.0 (2 October 2026)

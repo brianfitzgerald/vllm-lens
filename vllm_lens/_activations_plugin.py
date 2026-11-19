@@ -287,6 +287,27 @@ def _decode_hooks(value: Any) -> list[Hook] | None:
     return [h if isinstance(h, Hook) else Hook.model_validate(h) for h in value]
 
 
+def _reject_async_spec_positions(
+    vllm_config: Any, vectors: list[SteeringVector] | None
+) -> None:
+    """Raise ``ValueError`` for a position-specific vector under async speculative decoding,
+    where the computed-token count of a request is optimistic during the forward pass."""
+    scheduler = getattr(vllm_config, "scheduler_config", None)
+    if getattr(vllm_config, "speculative_config", None) is None or not getattr(
+        scheduler, "async_scheduling", False
+    ):
+        return
+    if any(
+        vector.position_indices is not None or vector.activations.dim() == 3
+        for vector in vectors or ()
+    ):
+        raise ValueError(
+            "Position-specific steering vectors are not available with async speculative "
+            "decoding: the positions of generated tokens are not known before the forward "
+            "pass. Disable async scheduling or speculative decoding to steer by position."
+        )
+
+
 def _trim_activations(
     activations: dict[str, Any],
     expected_len: int,
@@ -425,6 +446,7 @@ async def _patched_generate(
     steering_vectors = _decode_steering_vectors(
         extra.pop("apply_steering_vectors", None)
     )
+    _reject_async_spec_positions(self.vllm_config, steering_vectors)
 
     # Extract hooks (callables can't survive msgspec).
     hooks_list = _decode_hooks(extra.pop("apply_hooks", None))
@@ -556,6 +578,7 @@ def _prepare_offline_params(
     for idx, sp in enumerate(params_list):
         extra = sp.extra_args or {}
         vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
+        _reject_async_spec_positions(self.llm_engine.vllm_config, vectors)
         if vectors is not None:
             steering_id = f"_steer_{idx}"
             steering_payloads[steering_id] = pickle.dumps(vectors)
