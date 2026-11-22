@@ -32,9 +32,11 @@ Both the default development setup and optional benchmarking group install
 from public dependencies; benchmark image paths are supplied explicitly.
 Newer stable releases must pass both suites before advancing this pin.
 
-V2 model-runner mode is unsupported and rejected by the plugin. The plugin
-defaults to V1 and forces eager execution; native V2/CUDA-graph support is outside
-this matrix work. Model-specific features requiring V2 cannot use the fallback.
+This fork serves only on vLLM's V2 model runner, with the layers that
+`additional_config["vllm_lens"]` arms (see the README); the plugin sets
+`VLLM_USE_V2_MODEL_RUNNER=1`, so vLLM refuses features V2 does not serve. The
+validation records below are of the upstream V1 eager plugin and do not apply
+to this fork.
 Passing the small Qwen suite does not establish support for every model,
 quantization mode, attention backend, hardware platform or distributed layout.
 

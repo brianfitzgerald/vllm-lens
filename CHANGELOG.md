@@ -5,6 +5,9 @@
 - Plugin: Generation uses copies of the supplied `SamplingParams`. Before, the entry points popped the vectors and hooks from the caller's `extra_args`, so a reused `SamplingParams` steered only its first call.
 - Plugin: Steered and hooked requests use a unique prefix-cache salt per request, so other requests cannot reuse their KV blocks. These requests still skip prefix-cache reads.
 - Capture: A layer list sent as a JSON string in `output_residual_stream` is parsed once when the request is submitted, not again in every layer and step. Behavior change: an invalid JSON string now fails at submission; before, the worker captured every layer.
+- Worker: vllm-lens serves only on vLLM's V2 model runner, on the layers an engine arms with `capture_layers` and `steer_layers` in `additional_config["vllm_lens"]`, with CUDA graphs (or `enforce_eager`). An engine that arms no layers runs as plain vLLM and refuses capture and steering. Removed: the eager hook path, forward hooks and pre-hooks, persistent hooks, Q/K capture and `vllm_lens.attention`, parameter prefetch, pipeline parallelism, and vectors with values per position.
+- Steering: Each steered request gets rows in one table, written when vLLM admits it; a forward hook adds each token's row with plain torch ops, which Inductor fuses. `norm_match` uses the unsteered stream norm for every vector of a layer. A 2-D vector with `position_indices` steers only those positions; before, it steered every position. Steering supports `n > 1`.
+- Capture: Each captured token's stream goes to a GPU ring inside the graph. A thread copies the ring rows on its own CUDA stream and writes one file per request, so the engine loop does no copy or serialization. `activations_transport="file"` returns the file's path. Activations are no longer zstd-compressed. With async speculative decoding, a capture fails at submission.
 
 ## Unreleased
 

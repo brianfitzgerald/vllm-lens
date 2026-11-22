@@ -1,6 +1,6 @@
 """Integration tests for vllm-lens features against a running vLLM server.
 
-These test activation extraction, steering vectors, and the generic hook
+These test activation extraction, steering vectors and steering tables
 system over the OpenAI-compatible HTTP API.
 """
 
@@ -8,10 +8,13 @@ import json
 
 import requests
 import torch
-from vllm_lens import Hook, deserialize_hook_results, deserialize_tensor, SteeringVector
+
+from vllm_lens import (
+    SteeringVector,
+    deserialize_tensor,
+)
 
 from .conftest import MODEL
-
 
 # ---------------------------------------------------------------------------
 # Activation extraction
@@ -110,321 +113,6 @@ def test_steering_scale_zero_matches_baseline(vllm_server):
     assert steered["choices"][0]["text"] == baseline["choices"][0]["text"]
 
 
-# ---------------------------------------------------------------------------
-# Generic hooks
-# ---------------------------------------------------------------------------
-
-
-def test_hook_capture(vllm_server):
-    def capture_norm(ctx, h):
-        ctx.saved[f"norm_L{ctx.layer_idx}"] = h.norm(dim=-1).cpu()
-        return None
-
-    hook = Hook(fn=capture_norm, layer_indices=[15, 16])
-    resp = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": "Hello world",
-            "max_tokens": 5,
-            "temperature": 0.0,
-            "vllm_xargs": {
-                "apply_hooks": json.dumps([hook.model_dump()]),
-            },
-        },
-    ).json()
-
-    assert "error" not in resp, resp
-    assert "hook_results" in resp
-    results = deserialize_hook_results(resp["hook_results"])
-    hook_0 = results["0"]
-    assert "norm_L15" in hook_0
-    assert "norm_L16" in hook_0
-    assert isinstance(hook_0["norm_L15"], torch.Tensor)
-
-
-def test_hook_modification_changes_output(vllm_server):
-    prompt = "The meaning of life is"
-
-    baseline = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": 20,
-            "temperature": 0.0,
-        },
-    ).json()
-
-    def zero_residual(ctx, h):
-        return torch.zeros_like(h)
-
-    hook = Hook(fn=zero_residual, layer_indices=[15])
-    modified = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": 20,
-            "temperature": 0.0,
-            "vllm_xargs": {
-                "apply_hooks": json.dumps([hook.model_dump()]),
-            },
-        },
-    ).json()
-
-    assert "error" not in modified, modified
-    assert modified["choices"][0]["text"] != baseline["choices"][0]["text"]
-
-
-def test_hook_none_preserves_output(vllm_server):
-    prompt = "The capital of France is"
-
-    baseline = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": 20,
-            "temperature": 0.0,
-        },
-    ).json()
-
-    def noop_hook(ctx, h):
-        return None
-
-    hook = Hook(fn=noop_hook, layer_indices=[15])
-    hooked = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": 20,
-            "temperature": 0.0,
-            "vllm_xargs": {
-                "apply_hooks": json.dumps([hook.model_dump()]),
-            },
-        },
-    ).json()
-
-    assert "error" not in hooked, hooked
-    assert hooked["choices"][0]["text"] == baseline["choices"][0]["text"]
-
-
-def test_hook_matches_native_activation_extraction(vllm_server):
-    """A hook capturing hidden states must produce identical activations
-    to the native ``output_residual_stream`` system."""
-    layer = 15
-
-    def capture_accumulate(ctx, h):
-        if "parts" not in ctx.saved:
-            ctx.saved["parts"] = []
-        ctx.saved["parts"].append(h.cpu())
-        return None
-
-    hook = Hook(fn=capture_accumulate, layer_indices=[layer])
-
-    # Request both native capture and hook capture in the same call.
-    resp = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": "The future of AI is",
-            "max_tokens": 10,
-            "temperature": 0.0,
-            "vllm_xargs": {
-                "output_residual_stream": f"[{layer}]",
-                "apply_hooks": json.dumps([hook.model_dump()]),
-            },
-        },
-    ).json()
-
-    assert "error" not in resp, resp
-
-    native_all = deserialize_tensor(resp["activations"]["residual_stream"])
-    native_layer = native_all[0]  # (seq_len, hidden_dim) — single layer requested
-
-    hook_results = deserialize_hook_results(resp["hook_results"])
-    parts = hook_results["0"]["parts"]
-    hook_acts = torch.cat(parts, dim=0)
-
-    min_len = min(native_layer.shape[0], hook_acts.shape[0])
-    n = native_layer[:min_len].float()
-    h = hook_acts[:min_len].float()
-
-    mean_diff = (n - h).abs().mean().item()
-    assert mean_diff < 1e-4, f"Mean abs diff {mean_diff} too large"
-
-
-# ---------------------------------------------------------------------------
-# Pre-hooks
-# ---------------------------------------------------------------------------
-
-
-def test_pre_hook_modification_changes_output(vllm_server):
-    """A pre-hook that corrupts layer 0 input should change the output."""
-    prompt = "The capital of France is"
-
-    baseline = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": 20,
-            "temperature": 0.0,
-        },
-    ).json()
-
-    def corrupt_input(ctx, h):
-        gen = torch.Generator(device=h.device).manual_seed(42)
-        noise = torch.randn(h.shape, generator=gen, device=h.device, dtype=h.dtype)
-        return h + noise * 100.0
-
-    hook = Hook(fn=corrupt_input, layer_indices=[0], pre=True)
-    corrupted = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": 20,
-            "temperature": 0.0,
-            "vllm_xargs": {
-                "apply_hooks": json.dumps([hook.model_dump()]),
-            },
-        },
-    ).json()
-
-    assert "error" not in corrupted, corrupted
-    assert corrupted["choices"][0]["text"] != baseline["choices"][0]["text"]
-
-
-def test_pre_hook_none_preserves_output(vllm_server):
-    """A pre-hook returning None should not change the output."""
-    prompt = "The capital of France is"
-
-    baseline = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": 20,
-            "temperature": 0.0,
-        },
-    ).json()
-
-    def noop(ctx, h):
-        return None
-
-    hook = Hook(fn=noop, layer_indices=[0], pre=True)
-    hooked = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": prompt,
-            "max_tokens": 20,
-            "temperature": 0.0,
-            "vllm_xargs": {
-                "apply_hooks": json.dumps([hook.model_dump()]),
-            },
-        },
-    ).json()
-
-    assert "error" not in hooked, hooked
-    assert hooked["choices"][0]["text"] == baseline["choices"][0]["text"]
-
-
-# ---------------------------------------------------------------------------
-# Regression tests (PR review bugfixes)
-# ---------------------------------------------------------------------------
-
-
-def test_pre_hook_capture_is_returned(vllm_server):
-    """Pre-hook ctx.saved data must be included in hook_results.
-
-    Regression: pre-hook contexts were stored under a 'pre_' key prefix
-    that get_hook_results didn't match, so pre-hook captures were lost.
-    """
-
-    def capture_input(ctx, h):
-        ctx.saved["input_norm"] = h.norm().item()
-        return None
-
-    hook = Hook(fn=capture_input, layer_indices=[0], pre=True)
-    resp = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": "Hello",
-            "max_tokens": 1,
-            "temperature": 0.0,
-            "vllm_xargs": {
-                "apply_hooks": json.dumps([hook.model_dump()]),
-            },
-        },
-    ).json()
-
-    assert "error" not in resp, resp
-    assert "hook_results" in resp, "Pre-hook results missing from response"
-    results = deserialize_hook_results(resp["hook_results"])
-    assert "0" in results
-    assert "input_norm" in results["0"], (
-        f"Pre-hook ctx.saved not returned. Got keys: {list(results['0'].keys())}"
-    )
-
-
-def test_pre_and_post_hooks_do_not_share_contexts(vllm_server):
-    """A request mixing one pre-hook with several post-hooks must give each
-    hook its own isolated ``ctx.saved``, indexed by its position.
-
-    Regression: pre- and post-hook contexts were stored in the same
-    per-request list, sized independently by each path.  With unequal
-    pre/post counts the post path reused the (shorter) pre-sized list and
-    indexed out of bounds — the error was swallowed and later hooks' data
-    was silently dropped.
-    """
-
-    def capture_pre(ctx, h):
-        ctx.saved["pre_marker"] = float(h.shape[0])  # seq length
-        return None
-
-    def capture_post_a(ctx, h):
-        ctx.saved["post_a"] = 1.0
-        return None
-
-    def capture_post_b(ctx, h):
-        ctx.saved["post_b"] = 2.0
-        return None
-
-    hooks = [
-        Hook(fn=capture_pre, layer_indices=[0], pre=True),
-        Hook(fn=capture_post_a, layer_indices=[1]),
-        Hook(fn=capture_post_b, layer_indices=[2]),
-    ]
-    resp = requests.post(
-        f"{vllm_server}/v1/completions",
-        json={
-            "model": MODEL,
-            "prompt": "Hello world",
-            "max_tokens": 1,
-            "temperature": 0.0,
-            "vllm_xargs": {
-                "apply_hooks": json.dumps([h.model_dump() for h in hooks]),
-            },
-        },
-    ).json()
-
-    assert "error" not in resp, resp
-    results = deserialize_hook_results(resp["hook_results"])
-
-    # Each hook is keyed by its position in the passed hook list, and no
-    # hook's saved data leaks into another's.
-    assert set(results) == {"0", "1", "2"}, results
-    assert set(results["0"]) == {"pre_marker"}, results["0"]
-    assert results["1"] == {"post_a": 1.0}, results["1"]
-    assert results["2"] == {"post_b": 2.0}, results["2"]
-    assert results["0"]["pre_marker"] > 0
-
-
 def test_layer_filtering_respects_list(vllm_server):
     """output_residual_stream=[15] should capture only 1 layer, not all 32.
 
@@ -447,3 +135,56 @@ def test_layer_filtering_respects_list(vllm_server):
     assert rs.shape[0] == 1, (
         f"Expected 1 layer (layer 15 only), got {rs.shape[0]} layers"
     )
+
+
+# ---------------------------------------------------------------------------
+# Parallel samples
+# ---------------------------------------------------------------------------
+
+
+def _complete(vllm_server, xargs: dict, **body):
+    """One completion of a fixed prompt with the given ``vllm_xargs``."""
+    return requests.post(
+        f"{vllm_server}/v1/completions",
+        json={
+            "model": MODEL,
+            "prompt": "My favourite animal is",
+            "max_tokens": 16,
+            **body,
+            "vllm_xargs": xargs,
+        },
+    ).json()
+
+
+def test_every_parallel_sample_is_steered(vllm_server):
+    """Each of n choices equals a single request with its seed and the same steering."""
+    vector = SteeringVector(
+        activations=torch.randn(1, 4096, generator=torch.Generator().manual_seed(1)),
+        layer_indices=[15],
+        scale=8.0,
+    )
+    xargs = {"apply_steering_vectors": json.dumps([vector.model_dump()])}
+    parallel = _complete(vllm_server, xargs, n=3, seed=100, temperature=1.0)
+    texts = [
+        choice["text"]
+        for choice in sorted(parallel["choices"], key=lambda c: c["index"])
+    ]
+    single = [
+        _complete(vllm_server, xargs, seed=100 + index, temperature=1.0)["choices"][0][
+            "text"
+        ]
+        for index in range(3)
+    ]
+    assert texts == single
+    unsteered = _complete(vllm_server, {}, n=3, seed=100, temperature=1.0)
+    assert [
+        c["text"] for c in sorted(unsteered["choices"], key=lambda c: c["index"])
+    ] != texts
+
+
+def test_capture_with_parallel_samples_is_rejected(vllm_server):
+    """Capture with n > 1 fails with a clear error."""
+    response = _complete(
+        vllm_server, {"output_residual_stream": "[15]"}, n=2, temperature=1.0
+    )
+    assert "n > 1" in json.dumps(response), response

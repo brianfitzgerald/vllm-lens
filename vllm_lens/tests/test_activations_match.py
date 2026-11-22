@@ -6,7 +6,7 @@ import torch
 from syrupy.assertion import SnapshotAssertion
 from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
-from .conftest import LAYER_IDX, MODEL_NAME, PROMPT, PROMPTS, REFERENCE_DTYPE
+from .conftest import ARMED, LAYER_IDX, MODEL_NAME, PROMPT, PROMPTS, REFERENCE_DTYPE
 
 # The activation snapshot is bit-sensitive to the GPU architecture (bf16
 # accumulation order differs across devices), so the committed values are only
@@ -23,6 +23,7 @@ def _current_gpu() -> str:
 async def vllm_reference():
     engine_args = AsyncEngineArgs(
         model=MODEL_NAME,
+        additional_config=ARMED,
         dtype=REFERENCE_DTYPE,
         gpu_memory_utilization=0.3,
     )
@@ -37,6 +38,7 @@ async def vllm_reference():
 async def vllm_model():
     engine_args = AsyncEngineArgs(
         model=MODEL_NAME,
+        additional_config=ARMED,
         dtype="auto",
         gpu_memory_utilization=0.3,
     )

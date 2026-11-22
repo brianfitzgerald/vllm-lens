@@ -7,15 +7,16 @@ import pytest
 import torch
 from vllm import AsyncEngineArgs, AsyncLLMEngine, RequestOutput, SamplingParams
 
-from vllm_lens import Hook, SteeringVector
+from vllm_lens import SteeringVector
 
-from .conftest import LAYER_IDX, MODEL_NAME, PROMPT
+from .conftest import ARMED, LAYER_IDX, MODEL_NAME, PROMPT
 
 
 @pytest.fixture(scope="module")
 async def vllm_model():
     engine_args = AsyncEngineArgs(
         model=MODEL_NAME,
+        additional_config=ARMED,
         dtype="auto",
         gpu_memory_utilization=0.3,
     )
@@ -31,25 +32,10 @@ async def vllm_model_tp2():
     """Tensor-parallel (TP=2) engine for cross-rank steering coverage."""
     engine_args = AsyncEngineArgs(
         model=MODEL_NAME,
+        additional_config=ARMED,
         dtype="auto",
         gpu_memory_utilization=0.3,
         tensor_parallel_size=2,
-    )
-    engine = AsyncLLMEngine.from_engine_args(engine_args)
-    yield engine
-    engine.shutdown()
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-@pytest.fixture(scope="module")
-async def vllm_model_pp2():
-    """Pipeline-parallel (PP=2) engine for cross-stage steering coverage."""
-    engine_args = AsyncEngineArgs(
-        model=MODEL_NAME,
-        dtype="auto",
-        gpu_memory_utilization=0.3,
-        pipeline_parallel_size=2,
     )
     engine = AsyncLLMEngine.from_engine_args(engine_args)
     yield engine
@@ -89,18 +75,9 @@ def _make_steering_vector(
     scale: float = 1.0,
     norm_match: bool = False,
     position_indices: list[int] | None = None,
-    n_positions: int | None = None,
 ) -> list[SteeringVector]:
-    """Build an ``apply_steering_vectors`` list with a single config.
-
-    If *n_positions* is given, creates a 3D tensor ``(n_layers, n_pos, hidden_dim)``.
-    Otherwise creates 2D ``(n_layers, hidden_dim)``.
-    """
-    n_layers = len(layer_indices)
-    if n_positions is not None:
-        activations = torch.randn(n_layers, n_positions, hidden_dim)
-    else:
-        activations = torch.randn(n_layers, hidden_dim)
+    """An ``apply_steering_vectors`` list with one ``(n_layers, hidden_dim)`` vector."""
+    activations = torch.randn(len(layer_indices), hidden_dim)
     return [
         SteeringVector(
             activations=activations,
@@ -142,7 +119,6 @@ async def _assert_norm_match_residual(
         scale=scale,
         norm_match=True,
         position_indices=[pos],
-        n_positions=1,
     )
     steered = await _generate(
         engine,
@@ -225,26 +201,15 @@ class TestSteering:
         )
         assert steered.outputs[0].text == baseline_text
 
-    @pytest.mark.parametrize("kind", ["steering", "hooks"])
-    async def test_intervention_prefix_is_not_reused(self, vllm_model, kind):
+    async def test_intervention_prefix_is_not_reused(self, vllm_model):
         """Interventions isolate writes; ordinary requests still reuse the cache."""
         prompt = uuid.uuid4().hex + " The quick brown fox jumps over the lazy dog." * 20
         hidden_dim = vllm_model.model_config.get_hidden_size()
-        extra = (
-            {
-                "apply_steering_vectors": _make_steering_vector(
-                    hidden_dim, [LAYER_IDX], scale=10.0
-                )
-            }
-            if kind == "steering"
-            else {
-                "apply_hooks": [
-                    Hook(
-                        fn=lambda ctx, h: torch.zeros_like(h), layer_indices=[LAYER_IDX]
-                    )
-                ]
-            }
-        )
+        extra = {
+            "apply_steering_vectors": _make_steering_vector(
+                hidden_dim, [LAYER_IDX], scale=10.0
+            )
+        }
         for index in range(2):
             result = await _generate(
                 vllm_model, prompt, f"isolated-{index}", max_tokens=1, extra_args=extra
@@ -338,9 +303,8 @@ class TestSteering:
         )
         assert steered.outputs[0].text != baseline_text
 
-    async def test_3d_positional_steering(self, vllm_model):
-        """3D activations with position_indices should only affect
-        those positions."""
+    async def test_positional_steering(self, vllm_model):
+        """A vector with position_indices steers only those positions."""
         # Capture baseline
         baseline = await _generate(
             vllm_model,
@@ -357,7 +321,6 @@ class TestSteering:
             [LAYER_IDX],
             scale=10.0,
             position_indices=[0],
-            n_positions=1,
         )
         steered = await _generate(
             vllm_model,
@@ -393,7 +356,6 @@ class TestSteering:
             scale=4.0,
             norm_match=True,
             position_indices=[0],
-            n_positions=1,
         )
         steered = await _generate(
             vllm_model,
@@ -406,7 +368,7 @@ class TestSteering:
             },
         )
         rows = steered.activations["residual_stream"][0].float()  # type: ignore[reportAttributeAccessIssue]
-        direction = vectors[0].activations[0, 0].float()
+        direction = vectors[0].activations[0].float()
         cosines = torch.nn.functional.cosine_similarity(rows, direction.unsqueeze(0))
         moved = torch.nonzero(cosines > 0.5).flatten().tolist()
         assert moved == [0], f"Only row 0 should be steered, got rows {moved}"
@@ -448,7 +410,6 @@ class TestSteering:
             scale=scale,
             norm_match=True,
             position_indices=[pos],
-            n_positions=1,
         )
         steered = await _generate(
             vllm_model,
@@ -489,9 +450,3 @@ class TestSteeringParallel:
     )
     async def test_norm_match_scales_to_residual_stream_tp2(self, vllm_model_tp2):
         await _assert_norm_match_residual(vllm_model_tp2, "normmatch-tp2")
-
-    @pytest.mark.skipif(
-        torch.cuda.device_count() < 2, reason="PP=2 requires at least 2 GPUs"
-    )
-    async def test_norm_match_scales_to_residual_stream_pp2(self, vllm_model_pp2):
-        await _assert_norm_match_residual(vllm_model_pp2, "normmatch-pp2")

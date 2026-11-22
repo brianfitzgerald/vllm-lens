@@ -26,13 +26,9 @@ def test_invalid_json_raises() -> None:
         plugin._check_capture_options({"output_residual_stream": "[1,"})
 
 
-def test_offline_params_carry_the_parsed_list() -> None:
+def test_offline_params_carry_the_parsed_list(stub_engine) -> None:
     """Test that the params sent to vLLM hold the list and the caller's keep the string."""
-    llm = SimpleNamespace(
-        _hooks_installed=True,
-        llm_engine=SimpleNamespace(vllm_config=SimpleNamespace(additional_config=None)),
-        collective_rpc=lambda method, args=(): [],
-    )
+    llm = stub_engine(lambda method, args=(): [], offline=True)
     params = SimpleNamespace(
         extra_args={"output_residual_stream": "[0, 2]"}, skip_reading_prefix_cache=False
     )

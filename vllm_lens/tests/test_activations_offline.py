@@ -5,6 +5,7 @@ import torch
 from vllm import LLM, SamplingParams
 
 from .conftest import (
+    ARMED,
     LAYER_IDX,
     MODEL_NAME,
     NUM_LAYERS,
@@ -13,9 +14,7 @@ from .conftest import (
     REFERENCE_DTYPE,
 )
 
-# Layers straddling the PP=2 stage boundary (stage 0 = [0, NUM_LAYERS//2)),
-# so the per-request cross-rank concat in _merge_captured_states_batch is
-# actually exercised (a single layer lives on one stage only).
+# Two layers far apart, so a request's rows of both layers are checked.
 _CROSS_STAGE_LAYERS = [LAYER_IDX, NUM_LAYERS - 4]
 
 
@@ -24,6 +23,7 @@ def llm_reference():
     """FP32 engine for HF parity; llm_model retains native-dtype coverage."""
     llm = LLM(
         model=MODEL_NAME,
+        additional_config=ARMED,
         dtype=REFERENCE_DTYPE,
         gpu_memory_utilization=0.3,
     )
@@ -37,6 +37,7 @@ def llm_reference():
 def llm_model():
     llm = LLM(
         model=MODEL_NAME,
+        additional_config=ARMED,
         dtype="auto",
         gpu_memory_utilization=0.3,
     )
@@ -51,28 +52,10 @@ def llm_model_tp2():
     """Tensor-parallel (TP=2) offline engine for batched-fetch coverage."""
     llm = LLM(
         model=MODEL_NAME,
+        additional_config=ARMED,
         dtype="auto",
         gpu_memory_utilization=0.3,
         tensor_parallel_size=2,
-    )
-    yield llm
-    del llm
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
-@pytest.fixture(scope="module")
-def llm_model_pp2():
-    """Pipeline-parallel (PP=2) offline engine for batched-fetch coverage.
-
-    Exercises ``get_captured_states_batch`` + ``_merge_captured_states_batch``
-    across PP stages (per-request cross-rank concat).
-    """
-    llm = LLM(
-        model=MODEL_NAME,
-        dtype="auto",
-        gpu_memory_utilization=0.3,
-        pipeline_parallel_size=2,
     )
     yield llm
     del llm
@@ -198,18 +181,8 @@ def _assert_batched_matches_individual(llm: LLM, layers: list[int]) -> None:
 
 
 class TestBatchedFetch:
-    """Coverage for the batched ``get_captured_states_batch`` offline path.
-
-    On ``LLM.generate`` the plugin fetches every request's captured
-    activations in one RPC and demultiplexes them by request id. These verify
-    each request gets *its own* activations (no cross-request mixing/dropping)
-    and that the cross-rank batched merge is correct under TP and PP.
-
-    (End-to-end value correctness vs HuggingFace is already covered — at TP=1
-    by ``TestOfflineMatchesTransformers`` and under PP by
-    ``test_activations_pp.py`` — both of which now route through the batched
-    fetch on the offline path.)
-    """
+    """Each request of one ``LLM.generate`` call gets its own capture file, also under
+    tensor parallelism, where rank 0 alone captures."""
 
     def test_batched_fetch_matches_individual(self, llm_model):
         _assert_batched_matches_individual(llm_model, [LAYER_IDX])
@@ -218,14 +191,4 @@ class TestBatchedFetch:
         torch.cuda.device_count() < 2, reason="TP=2 requires at least 2 GPUs"
     )
     def test_batched_fetch_matches_individual_tp2(self, llm_model_tp2):
-        # Capture runs on TP rank 0 only; verify the batch demux still routes
-        # every request correctly under TP.
         _assert_batched_matches_individual(llm_model_tp2, _CROSS_STAGE_LAYERS)
-
-    @pytest.mark.skipif(
-        torch.cuda.device_count() < 2, reason="PP=2 requires at least 2 GPUs"
-    )
-    def test_batched_fetch_matches_individual_pp2(self, llm_model_pp2):
-        # _CROSS_STAGE_LAYERS straddle both PP stages, so this exercises the
-        # per-request cross-rank concat in _merge_captured_states_batch.
-        _assert_batched_matches_individual(llm_model_pp2, _CROSS_STAGE_LAYERS)

@@ -11,12 +11,13 @@ import gc
 import torch
 from vllm import LLM, SamplingParams
 
-from .conftest import LAYER_IDX, MODEL_NAME, NUM_LAYERS, PROMPT, REFERENCE_DTYPE
+from .conftest import ARMED, LAYER_IDX, MODEL_NAME, NUM_LAYERS, PROMPT, REFERENCE_DTYPE
 
 
 def test_registry_discovery_and_capture(hf_model):
     llm = LLM(
         model=MODEL_NAME,
+        additional_config=ARMED,
         dtype=REFERENCE_DTYPE,
         gpu_memory_utilization=0.3,
     )
@@ -66,6 +67,7 @@ def test_layer_path_override(monkeypatch):
     monkeypatch.setenv("VLLM_LENS_LAYER_PATH", "model.layers.{i}")
     llm = LLM(
         model=MODEL_NAME,
+        additional_config=ARMED,
         dtype="auto",
         gpu_memory_utilization=0.3,
     )

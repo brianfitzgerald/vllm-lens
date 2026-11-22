@@ -40,21 +40,12 @@ def test_round_trip_activations(dtype: torch.dtype) -> None:
     assert torch.equal(recovered["residual_stream"], tensors["residual_stream"])
 
 
-def test_zstd_compression_present() -> None:
-    """Serialized output includes compression metadata."""
+def test_tensors_are_not_compressed() -> None:
+    """Serialized output holds the raw bytes and the original dtype."""
     t = torch.randn(4, 8)
     serialized = serialize_tensor(t)
-    assert serialized["compression"] == "zstd"
-    assert "original_dtype" in serialized
-
-
-def test_zstd_reduces_size() -> None:
-    """Compressed payload is smaller than uncompressed for typical tensors."""
-    t = torch.zeros(32, 128, 4096)  # highly compressible
-    serialized = serialize_tensor(t)
-    compressed_size = len(base64.b64decode(serialized["data"]))
-    raw_size = t.nelement() * t.element_size()
-    assert compressed_size < raw_size / 2
+    assert "compression" not in serialized and "original_dtype" in serialized
+    assert len(base64.b64decode(serialized["data"])) == t.nelement() * t.element_size()
 
 
 def test_backward_compat_legacy_format() -> None:

@@ -18,9 +18,9 @@ import pytest
 import torch
 from vllm import LLM, RequestOutput, SamplingParams
 
-from vllm_lens import Hook, SteeringVector
+from vllm_lens import SteeringVector
 
-from .conftest import LAYER_IDX, MODEL_NAME, PROMPT
+from .conftest import ARMED, LAYER_IDX, MODEL_NAME, PROMPT
 
 MAX_TOKENS = 20
 
@@ -29,6 +29,7 @@ MAX_TOKENS = 20
 def llm_model():
     llm = LLM(
         model=MODEL_NAME,
+        additional_config=ARMED,
         dtype="auto",
         gpu_memory_utilization=0.3,
     )
@@ -87,49 +88,6 @@ def _wire_format(sv: SteeringVector) -> str:
 
 
 class TestOfflineSteeringEntryPoints:
-    @pytest.mark.parametrize("run", [_generate, _chat], ids=["generate", "chat"])
-    def test_hook_values_and_request_cleanup(self, llm_model, run):
-        """Both offline entry points must execute hooks and return their values."""
-
-        def capture(ctx, h):
-            ctx.saved.setdefault("parts", []).append(h.detach().cpu())
-
-        baseline = run(llm_model, {"output_residual_stream": [LAYER_IDX]}, max_tokens=1)
-        captured = run(
-            llm_model,
-            {
-                "output_residual_stream": [LAYER_IDX],
-                "apply_hooks": [Hook(fn=capture, layer_indices=[LAYER_IDX])],
-            },
-            max_tokens=1,
-        )
-        saved = torch.cat(captured.hook_results["0"]["parts"], dim=0)
-        native = captured.activations["residual_stream"][0]
-        assert saved.shape[0] >= native.shape[0]
-        torch.testing.assert_close(saved[: native.shape[0]], native, rtol=0, atol=0)
-
-        def zero(ctx, h):
-            return torch.zeros_like(h)
-
-        modified = run(
-            llm_model,
-            {
-                "output_residual_stream": [LAYER_IDX],
-                "apply_hooks": [Hook(fn=zero, layer_indices=[LAYER_IDX])],
-            },
-            max_tokens=1,
-        )
-        assert baseline.activations["residual_stream"].abs().max() > 0.1
-        assert modified.activations["residual_stream"].abs().max() < 0.02
-        restored = run(llm_model, {"output_residual_stream": [LAYER_IDX]}, max_tokens=1)
-        torch.testing.assert_close(
-            restored.activations["residual_stream"],
-            baseline.activations["residual_stream"],
-            rtol=0.02,
-            atol=0.02,
-        )
-        assert not getattr(restored, "hook_results", None)
-
     def test_generate_accepts_json_wire_format(self, llm_model, steering_vector):
         """``LLM.generate`` must decode the JSON-string wire format.
 
@@ -241,8 +199,7 @@ class TestOfflineSteeringEntryPoints:
 
 
 @pytest.mark.parametrize("endpoint", ["generate", "chat"])
-@pytest.mark.parametrize("kind", ["steering", "hooks", "persistent"])
-def test_intervention_cache_isolation(llm_model, endpoint, kind):
+def test_intervention_cache_isolation(llm_model, endpoint):
     """Interventions isolate cache writes for both offline entry points."""
     llm_model.reset_prefix_cache()
     prompt = uuid.uuid4().hex + " The quick brown fox jumps over the lazy dog." * 20
@@ -250,27 +207,18 @@ def test_intervention_cache_isolation(llm_model, endpoint, kind):
         [prompt] if endpoint == "generate" else [[{"role": "user", "content": prompt}]]
     )
     run = getattr(llm_model, endpoint)
-    hook = Hook(fn=lambda ctx, h: torch.zeros_like(h), layer_indices=[LAYER_IDX])
-    extra = {}
-    if kind == "steering":
-        extra["apply_steering_vectors"] = [
+    extra = {
+        "apply_steering_vectors": [
             SteeringVector(
                 activations=torch.ones(1, llm_model.model_config.get_hidden_size()),
                 layer_indices=[LAYER_IDX],
                 scale=10.0,
             )
         ]
-    elif kind == "hooks":
-        extra["apply_hooks"] = [hook]
-    else:
-        llm_model.register_hooks([hook])
-    try:
-        params = SamplingParams(temperature=0.0, max_tokens=1, extra_args=extra)
-        for _ in range(2):
-            assert run(inputs, params)[0].num_cached_tokens == 0
-    finally:
-        if kind == "persistent":
-            llm_model.clear_hooks()
+    }
+    params = SamplingParams(temperature=0.0, max_tokens=1, extra_args=extra)
+    for _ in range(2):
+        assert run(inputs, params)[0].num_cached_tokens == 0
     params = SamplingParams(temperature=0.0, max_tokens=20)
     first = run(inputs, params)[0]
     assert first.num_cached_tokens == 0

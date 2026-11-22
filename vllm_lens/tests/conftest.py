@@ -22,6 +22,15 @@ REFERENCE_DTYPE = "float32"
 LAYER_IDX = 2
 NUM_LAYERS = 24
 PROMPT = "The future of AI is"
+CAPTURE_LAYERS = [LAYER_IDX, LAYER_IDX + 3]
+LONG_PROMPT = "The quick brown fox jumps over the lazy dog. " * 20
+# Every layer captured and steered, for tests that compare with a reference.
+ARMED = {
+    "vllm_lens": {
+        "capture_layers": list(range(NUM_LAYERS)),
+        "steer_layers": list(range(NUM_LAYERS)),
+    }
+}
 PROMPTS = [
     "The future of AI is",
     "Once upon a time in a land far away",
@@ -46,6 +55,54 @@ def hf_model():
     del model, tokenizer
     gc.collect()
     torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module", params=[None, 64], ids=["single-pass", "chunked-64"])
+def capture_llm(request):
+    """Offline engine with every layer armed, with and without a 64-token prefill chunk."""
+    kwargs = {}
+    if request.param is not None:
+        kwargs = {
+            "max_num_batched_tokens": request.param,
+            "enable_chunked_prefill": True,
+        }
+    yield from lens_engine(ARMED["vllm_lens"], gpu_memory_utilization=0.3, **kwargs)
+
+
+def lens_engine(
+    lens: dict[str, list[int] | bool] | None = None, model: str = MODEL_NAME, **kwargs
+):
+    """A module fixture's offline engine, freed after; ``lens`` is its
+    ``additional_config["vllm_lens"]``."""
+    from vllm import LLM
+
+    kwargs.setdefault("gpu_memory_utilization", 0.2)
+    # Few graph sizes, so each engine start captures fewer graphs.
+    kwargs.setdefault(
+        "compilation_config", {"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64]}
+    )
+    if lens:
+        kwargs["additional_config"] = {"vllm_lens": lens}
+    engine = LLM(model=model, dtype="auto", **kwargs)
+    yield engine
+    del engine
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+def relative_errors(actual: torch.Tensor, expected: torch.Tensor) -> torch.Tensor:
+    """``||actual - expected|| / ||expected||`` per leading index, in float32."""
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype
+    diff = (actual.float() - expected.float()).flatten(1).norm(dim=1)
+    return diff / expected.float().flatten(1).norm(dim=1)
+
+
+@pytest.fixture(scope="module")
+def eager_llm():
+    """The reference of the CUDA-graph tests: every layer armed, with eager kernels."""
+    yield from lens_engine(
+        ARMED["vllm_lens"], enforce_eager=True, enable_prefix_caching=False
+    )
 
 
 @pytest.fixture(autouse=True, scope="module")

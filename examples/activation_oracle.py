@@ -64,6 +64,10 @@ from vllm_lens import SteeringVector
 MODEL_NAME = "Qwen/Qwen3-8B"
 LORA_PATH = "adamkarvonen/checkpoints_latentqa_cls_past_lens_addition_Qwen3-8B"
 LAYER = 18
+# The layers a server arms: capture at LAYER, steering at any layer of Qwen3-8B.
+LENS_CONFIG = {
+    "vllm_lens": {"capture_layers": [LAYER], "steer_layers": list(range(36))}
+}
 
 TARGET_MESSAGES = [
     {
@@ -195,6 +199,8 @@ async def query_oracle(
     question: str,
 ) -> str:
     num_positions = activation_vector.shape[1]
+    if num_positions != 1:
+        raise ValueError("vllm-lens steers one value per request at its positions")
     oracle_prompt = create_oracle_prompt(
         config, layer, num_positions, question, tokenizer
     )
@@ -209,7 +215,7 @@ async def query_oracle(
 
     steering_vectors = [
         SteeringVector(
-            activations=activation_vector,
+            activations=activation_vector[:, 0],
             layer_indices=[config.hook_onto_layer],
             scale=config.steering_coefficient,
             norm_match=True,
@@ -294,6 +300,7 @@ async def main(device: int = 0) -> pd.DataFrame:
 
     engine_args = AsyncEngineArgs(
         model=MODEL_NAME,
+        additional_config=LENS_CONFIG,
         enable_lora=True,
         max_lora_rank=64,
         max_model_len=4096,

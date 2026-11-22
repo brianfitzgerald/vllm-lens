@@ -1,5 +1,6 @@
 """Fixtures for integration tests against a running vLLM server."""
 
+import json
 import os
 import subprocess
 import sys
@@ -11,7 +12,6 @@ import requests
 SERVER_PORT = int(os.environ.get("VLLM_TEST_PORT", "8100"))
 MODEL = os.environ.get("VLLM_TEST_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
 TP_SIZE = int(os.environ.get("VLLM_TEST_TP_SIZE", "1"))
-PP_SIZE = int(os.environ.get("VLLM_TEST_PP_SIZE", "1"))
 BASE_URL = f"http://localhost:{SERVER_PORT}"
 
 # How long to wait for the server to start (seconds).  Large models
@@ -45,6 +45,11 @@ def vllm_server(tmp_path_factory):
         yield BASE_URL
         return
 
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(MODEL)
+    layers = list(range(getattr(config, "text_config", config).num_hidden_layers))
+    lens = {"vllm_lens": {"capture_layers": layers, "steer_layers": layers}}
     vllm_bin = os.path.join(os.path.dirname(sys.executable), "vllm")
     command = [
         vllm_bin,
@@ -59,8 +64,8 @@ def vllm_server(tmp_path_factory):
         str(SERVER_PORT),
         "--tensor-parallel-size",
         str(TP_SIZE),
-        "--pipeline-parallel-size",
-        str(PP_SIZE),
+        "--additional-config",
+        json.dumps(lens),
     ]
     if max_len := os.environ.get("VLLM_TEST_MAX_MODEL_LEN"):
         command.extend(["--max-model-len", max_len])
