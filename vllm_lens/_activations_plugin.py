@@ -33,6 +33,12 @@ from vllm_lens._helpers._capture_file import (
     wait_capture,
     wait_capture_async,
 )
+from vllm_lens._helpers._positions import (
+    LAST_PROMPT_TOKEN,
+    POSITIONS_KEY,
+    POSITIONS_META_KEY,
+    normalize_capture_positions,
+)
 from vllm_lens._helpers._serialize import (
     serialize_activations,
     serialize_activations_binary,
@@ -90,8 +96,8 @@ def _reject_parallel_capture(params: SamplingParams, extra: dict[str, Any]) -> N
 def _reject_async_spec_positions(
     vllm_config: Any, vectors: list[SteeringVector] | None, extra: dict[str, Any]
 ) -> None:
-    """Raise ``ValueError`` for a positional vector or a capture under async speculative
-    decoding, where a request's computed count is optimistic."""
+    """Raise ``ValueError`` for a positional vector or a capture of generated positions
+    under async speculative decoding, where a request's computed count is optimistic."""
     scheduler = getattr(vllm_config, "scheduler_config", None)
     if getattr(vllm_config, "speculative_config", None) is None or not getattr(
         scheduler, "async_scheduling", False
@@ -103,32 +109,62 @@ def _reject_async_spec_positions(
             "decoding: the positions of generated tokens are not known before the forward "
             "pass. Disable async scheduling or speculative decoding to steer by position."
         )
-    if extra.get("output_residual_stream") is not None:
+    selector = extra.get(POSITIONS_KEY)
+    full = selector is None and extra.get("output_residual_stream_pool") is None
+    if extra.get("output_residual_stream") is not None and (
+        full or isinstance(selector, list)
+    ):
         raise ValueError(
-            "Capture is not available with async speculative decoding: the positions of "
-            "generated tokens are not known before the forward pass. Disable async "
-            "scheduling or speculative decoding to capture."
+            "A capture of generated positions is not available with async speculative "
+            "decoding: their positions are not known before the forward pass. Use "
+            f"{POSITIONS_KEY}={LAST_PROMPT_TOKEN!r} or a mean, or disable async scheduling "
+            "or speculative decoding."
         )
 
 
 def _check_capture_options(extra: dict[str, Any]) -> None:
-    """Parse the layer list that ``vllm_xargs`` passes as a JSON string, and raise
-    ``ValueError`` for an unknown transport."""
+    """Parse the layer list and selector that ``vllm_xargs`` passes as strings, and raise
+    ``ValueError`` for a bad pool value, selector or transport, an option without
+    ``output_residual_stream``, or a combination of options."""
     layers = extra.get("output_residual_stream")
     if isinstance(layers, str):
         extra["output_residual_stream"] = json.loads(layers)
+    pool = extra.get("output_residual_stream_pool")
+    if pool not in (None, "mean"):
+        raise ValueError(f"output_residual_stream_pool must be 'mean', got {pool!r}")
     if extra.get("activations_transport") not in _TRANSPORTS:
         raise ValueError(
             f"activations_transport must be one of {_TRANSPORTS[1:]}, got "
             f"{extra['activations_transport']!r}"
         )
+    normalize_capture_positions(extra)
+    chosen = [
+        key
+        for key, value in (
+            ("output_residual_stream_pool", pool),
+            (POSITIONS_KEY, extra.get(POSITIONS_KEY)),
+        )
+        if value is not None
+    ]
+    if len(chosen) > 1:
+        raise ValueError(f"{' and '.join(chosen)} cannot be combined")
+    if chosen and extra.get("output_residual_stream") is None:
+        raise ValueError(f"{chosen[0]} requires output_residual_stream")
 
 
 def _trim_activations(activations: dict[str, Any], expected_len: int) -> None:
     """Drop the rows of the pass vLLM runs after a stop condition, so a capture has one row
     per processed position: ``expected_len`` is prompt plus generated tokens minus one."""
     rs = activations.get("residual_stream")
-    if rs is not None and rs.shape[1] > expected_len:
+    positions = activations.get(POSITIONS_META_KEY)
+    if rs is None:
+        return
+    if positions is not None:
+        keep = sum(1 for pos in positions if pos < expected_len)
+        if keep < len(positions):
+            activations["residual_stream"] = rs[:, :keep]
+            activations[POSITIONS_META_KEY] = positions[:keep]
+    elif rs.shape[1] > expected_len:
         activations["residual_stream"] = rs[:, :expected_len]
 
 

@@ -173,7 +173,12 @@ def decode_activations(
 
             wait_capture(encoded["path"], timeout)
             capture = read_capture(encoded["path"])
-            out[name] = capture["residual_stream"][:, : encoded["rows"]]
+            rows = encoded["rows"]
+            positions = capture.get("residual_stream_positions")
+            if positions is not None:
+                rows = sum(1 for pos in positions if pos < rows)
+                out["residual_stream_positions"] = positions[:rows]
+            out[name] = capture["residual_stream"][:, :rows]
         elif "handle" in encoded:
             if fetch_bytes is None:
                 raise ValueError(

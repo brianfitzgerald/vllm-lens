@@ -1,4 +1,4 @@
-"""CPU tests for the rejection of positions and capture under async speculative decoding."""
+"""CPU tests for the rejection of generated positions under async speculative decoding."""
 
 from types import SimpleNamespace
 
@@ -20,7 +20,16 @@ INDEXED = SteeringVector(
         (True, True, [INDEXED], None, True),
         (True, True, [PLAIN], None, False),
         (True, True, None, None, False),
+        (True, True, None, {"output_residual_stream_positions": [3, 9]}, True),
         (True, True, None, {}, True),
+        (True, True, None, {"output_residual_stream_pool": "mean"}, False),
+        (
+            True,
+            True,
+            None,
+            {"output_residual_stream_positions": "last_prompt_token"},
+            False,
+        ),
         (True, False, [INDEXED], {}, False),
         (False, True, [INDEXED], {}, False),
     ],
@@ -28,7 +37,10 @@ INDEXED = SteeringVector(
         "indexed",
         "plain",
         "none",
-        "capture",
+        "capture-list",
+        "capture-every-position",
+        "capture-mean",
+        "capture-last-prompt",
         "sync",
         "no-spec",
     ],
