@@ -12,6 +12,7 @@ import torch
 from vllm_lens import (
     SteeringVector,
     deserialize_tensor,
+    serialize_tensor,
 )
 
 from .conftest import MODEL
@@ -138,7 +139,7 @@ def test_layer_filtering_respects_list(vllm_server):
 
 
 # ---------------------------------------------------------------------------
-# Parallel samples
+# Steering tables and parallel samples
 # ---------------------------------------------------------------------------
 
 
@@ -154,6 +155,39 @@ def _complete(vllm_server, xargs: dict, **body):
             "vllm_xargs": xargs,
         },
     ).json()
+
+
+def test_steering_rows_match_steering_vectors(vllm_server):
+    """A row of a registered table steers as the same vector sent in the request."""
+    vectors = torch.randn(2, 4096, generator=torch.Generator().manual_seed(0))
+    registered = requests.post(
+        f"{vllm_server}/v1/steering_tables",
+        json={"name": "server-rows", "vectors": serialize_tensor(vectors)},
+    )
+    assert registered.status_code == 200, registered.text
+    assert registered.json()["rows"] == 2
+    try:
+        row = SteeringVector(table="server-rows", row=1, layer_indices=[15], scale=6.0)
+        vector = SteeringVector(activations=vectors[1:2], layer_indices=[15], scale=6.0)
+        by_row = _complete(
+            vllm_server,
+            {"apply_steering_vectors": json.dumps([row.model_dump()])},
+            temperature=0.0,
+        )
+        by_vector = _complete(
+            vllm_server,
+            {"apply_steering_vectors": json.dumps([vector.model_dump()])},
+            temperature=0.0,
+        )
+        baseline = _complete(vllm_server, {}, temperature=0.0)
+        assert by_row["choices"][0]["text"] == by_vector["choices"][0]["text"]
+        assert by_row["choices"][0]["text"] != baseline["choices"][0]["text"]
+    finally:
+        requests.delete(f"{vllm_server}/v1/steering_tables/server-rows")
+    missing = _complete(
+        vllm_server, {"apply_steering_vectors": json.dumps([row.model_dump()])}
+    )
+    assert "not registered" in json.dumps(missing), missing
 
 
 def test_every_parallel_sample_is_steered(vllm_server):

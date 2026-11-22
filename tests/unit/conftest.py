@@ -1,5 +1,6 @@
 """Fixtures for the plugin tests without vLLM or CUDA."""
 
+import collections
 from types import SimpleNamespace
 from typing import Any
 
@@ -24,6 +25,8 @@ def _engine(collective_rpc: Any, *, offline: bool, **attrs: Any) -> SimpleNamesp
     )
     return SimpleNamespace(
         collective_rpc=collective_rpc,
+        _lens_steering_tables={},
+        _lens_table_users=collections.Counter(),
         **where,
         **attrs,
     )

@@ -216,7 +216,7 @@ def test_positional_rows_add_the_every_token_rows():
     at = SteeringVector(
         activations=torch.full((1, 4), 3.0), layer_indices=[3], position_indices=[5, 1]
     )
-    prepared = _prepare([add, at], [1, 3], 4, torch.device("cpu"), torch.float32)
+    prepared = _prepare([add, at], {}, [1, 3], 4, torch.device("cpu"), torch.float32)
     assert torch.equal(prepared.add, torch.tensor([[0.0] * 4, [2.0] * 4]))
     assert prepared.pos_add is not None and prepared.norm is None
     assert torch.equal(prepared.pos_add, torch.tensor([[0.0] * 4, [5.0] * 4]))

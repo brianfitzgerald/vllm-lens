@@ -26,6 +26,7 @@ from vllm_lens._helpers._capture_file import (
     seal,
 )
 from vllm_lens._helpers._positions import LAST_PROMPT_TOKEN, POSITIONS_KEY
+from vllm_lens._helpers._serialize import deserialize_tensor
 from vllm_lens._helpers.types import SteeringVector
 from vllm_lens._layers import _discover_layer_modules
 
@@ -279,12 +280,13 @@ class _Drain:
 
 def _prepare(
     vectors: list[SteeringVector],
+    tables: dict[tuple[str, int], torch.Tensor],
     steer_layers: list[int],
     hidden: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> _Prepared:
-    """Sum the vectors of one request into float32 rows per steer layer; the values are
+    """Sum the vectors of one request into float32 rows per steer layer; inline values are
     rounded to the model dtype first, as the model would hold them."""
     position = {layer: k for k, layer in enumerate(steer_layers)}
     rows = {
@@ -296,11 +298,19 @@ def _prepare(
     matched = False
     positions: list[int] | None = None
     for sv in vectors:
-        values = sv.activations
-        if device.type == "cuda" and not values.is_cuda:
-            # A pinned copy does not wait for the work queued on the GPU.
-            values = values.pin_memory().to(device, non_blocking=True)
-        values = values.to(device=device, dtype=dtype).float()
+        if sv.activations is None:
+            table = tables.get((sv.table or "", sv.version))
+            if table is None or sv.row is None or sv.row >= table.shape[0]:
+                raise ValueError(
+                    f"Steering table {sv.table!r} row {sv.row} is not available"
+                )
+            values = table[sv.row : sv.row + 1].expand(len(sv.layer_indices), -1)
+        else:
+            values = sv.activations
+            if device.type == "cuda" and not values.is_cuda:
+                # A pinned copy does not wait for the work queued on the GPU.
+                values = values.pin_memory().to(device, non_blocking=True)
+            values = values.to(device=device, dtype=dtype).float()
         if values.dim() != 2 or values.shape[-1] != hidden:
             raise ValueError(
                 f"vector shape {tuple(values.shape)}, model width {hidden}"
@@ -387,6 +397,7 @@ class GraphWorker(Worker):
         self._steer_layers = steer_layers
         self._capture_layers = capture_layers
         self._steering_data: dict[str, _Prepared] = {}
+        self._steering_tables: dict[tuple[str, int], torch.Tensor] = {}
         self._captures: dict[str, _Capture] = {}
         self._capture_dir = os.environ.get(CAPTURE_DIR_ENV, "")
         if capture_layers and not os.path.isdir(self._capture_dir):
@@ -545,6 +556,25 @@ class GraphWorker(Worker):
             prepared = self._steering_data.get(key)
             if prepared is None:
                 logger.error("Steering data of request %s is not available", req_id)
+        elif extra.get("_steer_rows"):
+            try:
+                prepared = self._prepare_vectors(
+                    [
+                        SteeringVector(
+                            table=name,
+                            version=version,
+                            row=row,
+                            scale=scale,
+                            layer_indices=layers,
+                            norm_match=norm_match,
+                        )
+                        for name, version, row, scale, layers, norm_match in extra[
+                            "_steer_rows"
+                        ]
+                    ]
+                )
+            except ValueError:
+                logger.exception("Steering of request %s is not available", req_id)
         if prepared is not None:
             # These copies run on the compute stream after the steps of the request that
             # held this index before, so they never change a step in flight.
@@ -682,19 +712,46 @@ class GraphWorker(Worker):
             rows = 1
         self._drain.queue.put((capture, rows, mean, event))
 
-    def set_steering_data(self, key: str, pickled_data: bytes) -> None:
-        """Prepare the steering vectors of one request."""
-        self._steering_data[key] = _prepare(
-            pickle.loads(pickled_data),
+    def _prepare_vectors(self, vectors: list[SteeringVector]) -> _Prepared:
+        """Prepare one request's vectors for this worker's steer layers."""
+        return _prepare(
+            vectors,
+            self._steering_tables,
             self._steer_layers,
             self._lens_hidden,
             self.device,  # type: ignore
             self._lens_dtype,
         )
 
+    def set_steering_data(self, key: str, pickled_data: bytes) -> None:
+        """Prepare the inline steering vectors of one request."""
+        self._steering_data[key] = self._prepare_vectors(pickle.loads(pickled_data))
+
     def clear_steering_data(self, key: str) -> None:
         """Drop the prepared vectors of a completed request."""
         self._steering_data.pop(key, None)
+
+    def set_steering_table(
+        self, name: str, payload: dict[str, Any], version: int = 0
+    ) -> None:
+        """Hold the ``(N, hidden)`` rows of a ``serialize_tensor`` payload as version
+        ``version`` of table ``name``, rounded to the model dtype as a vector is."""
+        self._steering_tables[(name, version)] = (
+            deserialize_tensor(payload)
+            .to(device=self.device, dtype=self._lens_dtype)
+            .float()
+        )
+
+    def clear_steering_table(
+        self, name: str | None, version: int | None = None
+    ) -> None:
+        """Drop one version of table ``name``, every version of it, or every table."""
+        self._steering_tables = {
+            key: table
+            for key, table in self._steering_tables.items()
+            if name is not None
+            and (key[0] != name or (version is not None and key[1] != version))
+        }
 
     def _debug_layer_discovery(self) -> list[int]:
         """Global indices of the decoder layers found by discovery (testing)."""

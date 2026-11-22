@@ -9,6 +9,7 @@
 - Steering: Each steered request gets rows in one table, written when vLLM admits it; a forward hook adds each token's row with plain torch ops, which Inductor fuses. `norm_match` uses the unsteered stream norm for every vector of a layer. A 2-D vector with `position_indices` steers only those positions; before, it steered every position. Steering supports `n > 1`.
 - Capture: Each captured token's stream goes to a GPU ring inside the graph. A thread copies the ring rows on its own CUDA stream and writes one file per request, so the engine loop does no copy or serialization. `activations_transport="file"` returns the file's path. Activations are no longer zstd-compressed. With async speculative decoding, a capture of every position fails at submission.
 - Capture: Added `output_residual_stream_pool="mean"` (`capture_pool` on the client), which returns the mean over the prompt positions as one row per layer, and `output_residual_stream_positions` (`capture_positions` on the client), `"last_prompt_token"` or a list of absolute positions. The response carries `residual_stream_positions`. The worker writes only the selected rows. With async speculative decoding, a list of positions fails at submission.
+- Steering: Register tables once (`POST /v1/steering_tables`, `LLM.set_steering_table`) and reference rows per request. A request of table rows only sends no RPC: the rows ride in `extra_args`, and the worker reads them when it admits the request. A replaced or cleared table stays on the workers until the requests that use it finish.
 
 ## Unreleased
 

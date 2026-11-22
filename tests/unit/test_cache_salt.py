@@ -1,5 +1,6 @@
 """CPU tests of prefix-cache isolation for intervention requests."""
 
+import collections
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -76,6 +77,8 @@ async def test_async_intervention_params(monkeypatch, tmp_path, built, kind):
     engine = SimpleNamespace(
         collective_rpc=rpc,
         vllm_config=ARMED,
+        _lens_steering_tables={},
+        _lens_table_users=collections.Counter(),
     )
     async for _ in plugin._patched_generate(engine, prompt, params, "r"):
         pass
@@ -111,6 +114,8 @@ def test_offline_intervention_params(kind, many):
     engine = SimpleNamespace(
         collective_rpc=lambda *a, **k: [],
         llm_engine=SimpleNamespace(vllm_config=ARMED),
+        _lens_steering_tables={},
+        _lens_table_users=collections.Counter(),
     )
     state = plugin._prepare_offline_params(engine, [params, params] if many else params)
     sent = state["params"] if many else [state["params"]]

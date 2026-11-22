@@ -5,6 +5,7 @@ vLLM-lens captures residual-stream activations and steers them inside vLLM's com
 Features:
 - Activation capture: every position, the last prompt token, a list of positions, or the prompt mean, at the layers a server arms.
 - Steering vectors: add vectors to the residual stream, at every position or at chosen positions, optionally scaled to the residual norm.
+- Steering tables: register vectors once and send row references with each request.
 
 The package registers as a [vLLM general plugin](https://docs.vllm.ai/en/latest/design/plugin_system.html) and an [Inspect](https://inspect.aisi.org.uk/) model provider on install. Requests set options in `SamplingParams.extra_args` (offline), `vllm_xargs` (HTTP) or `GenerateConfig.extra_body` (Inspect).
 
@@ -136,6 +137,22 @@ llm.generate(["I think the best dessert is"], sp)
 Via the client (or `vllm_xargs` over HTTP): `client.generate("...", steering_vectors=[sv])`. `llm.chat(...)` accepts the same `extra_args`, and both offline entry points accept the JSON wire form (`json.dumps([sv.model_dump(mode="json")])`).
 
 Steered requests skip prefix-cache reads and write under a unique cache salt, so other requests cannot reuse their KV blocks. Capture requests also skip prefix-cache reads. Steering supports `n > 1`; capture requires `n = 1`.
+
+### Steering tables
+
+Register a table once and send row references with each request:
+
+```python
+client.set_steering_table("features", vectors)  # shape (rows, hidden_size)
+client.generate(
+    "Hello", steering_vectors=[SteeringVector(table="features", row=0, layer_indices=[15])]
+)
+client.clear_steering_table("features")
+```
+
+A request of table rows only sends no RPC: the rows ride in `extra_args`, and the worker reads them when it admits the request. Replacing or clearing a table does not change requests in flight, which keep the version they started with. A missing table or row fails before generation.
+
+Offline, use `llm.set_steering_table` and `llm.clear_steering_table`. Over HTTP, register with `POST /v1/steering_tables` (`name` and serialized `vectors`) and delete with `DELETE /v1/steering_tables/{name}`.
 
 ## Inspect AI provider
 
