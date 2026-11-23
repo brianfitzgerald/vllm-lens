@@ -33,6 +33,7 @@ from vllm_lens._helpers._positions import LAST_PROMPT_TOKEN, POSITIONS_KEY
 from vllm_lens._helpers._serialize import deserialize_tensor
 from vllm_lens._helpers.types import SteeringVector
 from vllm_lens._layers import _discover_layer_modules
+from vllm_lens._route import COUNT, RING, SKIP, START, STEER, route_kernel
 
 logger = logging.getLogger("vllm.lens")
 
@@ -572,8 +573,20 @@ class GraphWorker(Worker):
         self._meta = torch.tensor(
             [[0], [self._sentinel]], dtype=torch.int64, device=device
         ).repeat(1, max_tokens)
-        # Two pinned copies, so a step never writes the one the last copy reads.
-        self._host_meta = [self._meta.cpu().pin_memory() for _ in range(2)]
+        # Each step's plan, one column per request (see _route), and its patches: tokens
+        # and values for position-list steering rows and ring rows. Two pinned copies, so a
+        # step never writes the one the last copy reads.
+        self._plan_table = torch.zeros((5, max_reqs), dtype=torch.int64, device=device)
+        self._host_plan = [
+            torch.zeros((5, max_reqs), dtype=torch.int64).pin_memory() for _ in range(2)
+        ]
+        self._patches = torch.zeros(
+            (2, 2, max_tokens), dtype=torch.int64, device=device
+        )
+        self._host_patches = [
+            torch.zeros((2, 2, max_tokens), dtype=torch.int64).pin_memory()
+            for _ in range(2)
+        ]
         self._meta_events = [torch.cuda.Event() for _ in range(2)]
         self._meta_slot = 0
         self._meta_length = 0
@@ -894,68 +907,99 @@ class GraphWorker(Worker):
             return None, []
         self._meta_signature = None if captured or positional else signature
         counts = np.diff(bounds)
+        n_reqs = len(step.req_ids)
         slot = self._meta_slot = self._meta_slot ^ 1
         self._meta_events[slot].synchronize()
-        host = self._host_meta[slot].numpy()
-        length = max(n, self._meta_length)
-        host[0, :n] = np.repeat(self._every[step.req_idx], counts)
-        host[0, n:length] = 0
-        host[1, :length] = self._sentinel
+        plan = self._host_plan[slot].numpy()
+        patches = self._host_patches[slot].numpy()
+        plan[STEER, :n_reqs] = self._every[step.req_idx]
+        plan[RING, :n_reqs] = -1
+        plan[SKIP, :n_reqs] = 0
+        plan[COUNT, :n_reqs] = 0
+        plan[START, :n_reqs] = bounds[:-1]
+        # The number of steering-row and ring-row patches.
+        patched = [0, 0]
         for i in positional:
             index = int(step.req_idx[i])
             first = int(step.computed[i])
             positions = self._positional[index]
             inside = positions[(positions >= first) & (positions < first + counts[i])]
-            host[0, bounds[i] + inside - first] = 2 * index + 2
+            k = patched[0]
+            patches[0, 0, k : k + len(inside)] = bounds[i] + inside - first
+            patches[0, 1, k : k + len(inside)] = 2 * index + 2
+            patched[0] += len(inside)
         runs: list[_Run] | None = None
         pooled: list[tuple[int, int, int, bool]] = []
-        # Each capture's batch rows (a start, or explicit rows), count, file row (-1 for a
-        # mean), runner index and whether its mean starts again.
+        # Each capture's batch row, its batch rows (None for a run from the row's start, or
+        # explicit rows), count, file row (-1 for a mean), runner index and whether its mean
+        # starts again.
         wanted: list[tuple[_Capture, int, np.ndarray | None, int, int, int, bool]] = []
         for i, capture in captured:
             first = int(step.computed[i])
             count = int(counts[i])
-            start = int(bounds[i])
             if capture.mean:
                 high = min(first + count, capture.prompt_len)
                 capture.done = high >= capture.prompt_len
                 if high > first:
                     index = int(step.req_idx[i])
                     wanted.append(
-                        (capture, start, None, high - first, -1, index, first == 0)
+                        (capture, i, None, high - first, -1, index, first == 0)
                     )
             elif capture.selector is None:
                 count = min(count, capture.rows_max - first)
                 if count > 0:
-                    wanted.append((capture, start, None, count, first, 0, False))
+                    wanted.append((capture, i, None, count, first, 0, False))
                     capture.rows = max(capture.rows, first + count)
             else:
                 low = int(np.searchsorted(capture.selector, first))
                 high = int(np.searchsorted(capture.selector, first + count))
                 capture.done = high == len(capture.selector)
                 if high > low:
-                    rows = start + capture.selector[low:high] - first
-                    wanted.append((capture, start, rows, high - low, low, 0, False))
+                    rows = int(bounds[i]) + capture.selector[low:high] - first
+                    wanted.append((capture, i, rows, high - low, low, 0, False))
                     capture.rows = max(capture.rows, high)
         total = sum(item[3] for item in wanted)
         if total:
             assert self._drain is not None
             offset = self._drain.take(total)
             runs = []
-            for capture, start, rows, count, file_row, index, reset in wanted:
-                ring_rows = np.arange(offset, offset + count)
-                if rows is None:
-                    host[1, start : start + count] = ring_rows
+            for capture, i, rows, count, file_row, index, reset in wanted:
+                if rows is None or count == 1:
+                    plan[RING, i] = offset
+                    plan[SKIP, i] = 0 if rows is None else rows[0] - bounds[i]
+                    plan[COUNT, i] = count
                 else:
-                    host[1, rows] = ring_rows
+                    k = patched[1]
+                    patches[1, 0, k : k + count] = rows
+                    patches[1, 1, k : k + count] = np.arange(offset, offset + count)
+                    patched[1] += count
                 if file_row < 0:
                     pooled.append((index, offset, count, reset))
                 else:
                     runs.append(_Run(capture, offset, count, file_row))
                 offset += count
-        self._meta[:, :length].copy_(
-            self._host_meta[slot][:, :length], non_blocking=True
+        length = max(n, self._meta_length)
+        self._plan_table.copy_(self._host_plan[slot], non_blocking=True)
+        route_kernel[(triton.cdiv(length, 256),)](  # type: ignore[reportIndexIssue]
+            self._plan_table,
+            self._meta,
+            self._plan_table.stride(0),
+            self._meta.stride(0),
+            n_reqs,
+            n,
+            length,
+            self._sentinel,
+            STEPS=max(1, self._plan_table.shape[1].bit_length()),
+            BLOCK=256,
         )
+        for kind, count in enumerate(patched):
+            if count:
+                self._patches[kind, :, :count].copy_(
+                    self._host_patches[slot][kind, :, :count], non_blocking=True
+                )
+                self._meta[kind].index_put_(
+                    (self._patches[kind, 0, :count],), self._patches[kind, 1, :count]
+                )
         self._meta_events[slot].record()
         self._meta_length = n
         return runs, pooled
