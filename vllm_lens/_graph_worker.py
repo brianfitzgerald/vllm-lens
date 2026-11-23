@@ -119,6 +119,8 @@ class _Capture:
             )
         # One past the last file row written so far.
         self.rows = 0
+        # Whether every row this capture selects is written.
+        self.done = False
 
 
 class _Run(NamedTuple):
@@ -201,31 +203,38 @@ class _Drain:
             position += written
 
     def _copy(self, event: torch.cuda.Event, runs: list[_Run]) -> None:
-        """Copy the runs of one step to their files through the two pinned slabs, so one
-        slab is written while the other is copied."""
+        """Copy the contiguous ring rows of one step through the two pinned slabs, so one
+        slab is written to the files while the other is copied."""
         self.stream.wait_event(event)
-        pending: tuple[int, int, _Run, int] | None = None
+        low = runs[0].start
+        total = runs[-1].start + runs[-1].rows - low
+        pending: tuple[int, int, int] | None = None
         slot = 0
-        for run in runs:
-            for offset in range(0, run.rows, self.slab_rows):
-                count = min(self.slab_rows, run.rows - offset)
-                slot ^= 1
-                low = run.start + offset
-                with torch.cuda.stream(self.stream):
-                    self.slabs[slot][:count].copy_(
-                        self.ring[low : low + count], non_blocking=True
-                    )
-                    self.events[slot].record(self.stream)
-                if pending is not None:
-                    self._finish(*pending)
-                pending = (slot, count, run, offset)
+        for chunk in range(0, total, self.slab_rows):
+            count = min(self.slab_rows, total - chunk)
+            slot ^= 1
+            with torch.cuda.stream(self.stream):
+                self.slabs[slot][:count].copy_(
+                    self.ring[low + chunk : low + chunk + count], non_blocking=True
+                )
+                self.events[slot].record(self.stream)
+            if pending is not None:
+                self._finish(*pending, runs)
+            pending = (slot, low + chunk, count)
         if pending is not None:
-            self._finish(*pending)
+            self._finish(*pending, runs)
 
-    def _finish(self, slot: int, count: int, run: _Run, offset: int) -> None:
-        """Wait for one slab copy, then write it."""
+    def _finish(self, slot: int, low: int, count: int, runs: list[_Run]) -> None:
+        """Wait for the slab copy of ring rows ``[low, low + count)``, then write the part of
+        each run inside them."""
         self.events[slot].synchronize()
-        self._write(self.slabs[slot][:count], run, offset)
+        for run in runs:
+            first = max(run.start, low)
+            last = min(run.start + run.rows, low + count)
+            if first < last:
+                self._write(
+                    self.slabs[slot][first - low : last - low], run, first - run.start
+                )
 
     def _seal(
         self,
@@ -398,6 +407,8 @@ class GraphWorker(Worker):
         self._capture_layers = capture_layers
         self._steering_data: dict[str, _Prepared] = {}
         self._steering_tables: dict[tuple[str, int], torch.Tensor] = {}
+        # The prepared rows of each distinct ``_steer_rows`` value.
+        self._row_cache: dict[str, _Prepared] = {}
         self._captures: dict[str, _Capture] = {}
         self._capture_dir = os.environ.get(CAPTURE_DIR_ENV, "")
         if capture_layers and not os.path.isdir(self._capture_dir):
@@ -557,24 +568,31 @@ class GraphWorker(Worker):
             if prepared is None:
                 logger.error("Steering data of request %s is not available", req_id)
         elif extra.get("_steer_rows"):
-            try:
-                prepared = self._prepare_vectors(
-                    [
-                        SteeringVector(
-                            table=name,
-                            version=version,
-                            row=row,
-                            scale=scale,
-                            layer_indices=layers,
-                            norm_match=norm_match,
-                        )
-                        for name, version, row, scale, layers, norm_match in extra[
-                            "_steer_rows"
+            rows_key = repr(extra["_steer_rows"])
+            prepared = self._row_cache.get(rows_key)
+            if prepared is None:
+                try:
+                    prepared = self._prepare_vectors(
+                        [
+                            SteeringVector(
+                                table=name,
+                                version=version,
+                                row=row,
+                                scale=scale,
+                                layer_indices=layers,
+                                norm_match=norm_match,
+                            )
+                            for name, version, row, scale, layers, norm_match in extra[
+                                "_steer_rows"
+                            ]
                         ]
-                    ]
-                )
-            except ValueError:
-                logger.exception("Steering of request %s is not available", req_id)
+                    )
+                except ValueError:
+                    logger.exception("Steering of request %s is not available", req_id)
+                else:
+                    if len(self._row_cache) >= 1024:
+                        self._row_cache.clear()
+                    self._row_cache[rows_key] = prepared
         if prepared is not None:
             # These copies run on the compute stream after the steps of the request that
             # held this index before, so they never change a step in flight.
@@ -597,7 +615,10 @@ class GraphWorker(Worker):
         key = extra.get("_capture_key")
         if wanted is None or key is None or self._drain is None:
             return
-        if req_id not in self._captures:
+        if req_id in self._captures:
+            # A resumed request computes its positions again.
+            self._captures[req_id].done = False
+        else:
             keep = [
                 k
                 for k, layer in enumerate(self._capture_layers)
@@ -622,7 +643,7 @@ class GraphWorker(Worker):
         captured = [
             (i, self._captures[req_id])
             for i, req_id in enumerate(step.req_ids)
-            if req_id in self._captures
+            if req_id in self._captures and not self._captures[req_id].done
         ]
         positional = [
             i for i, index in enumerate(step.req_idx) if int(index) in self._positional
@@ -656,6 +677,7 @@ class GraphWorker(Worker):
             start = int(bounds[i])
             if capture.mean:
                 high = min(first + count, capture.prompt_len)
+                capture.done = high >= capture.prompt_len
                 if high > first:
                     index = int(step.req_idx[i])
                     wanted.append(
@@ -667,6 +689,7 @@ class GraphWorker(Worker):
             else:
                 low = int(np.searchsorted(capture.selector, first))
                 high = int(np.searchsorted(capture.selector, first + count))
+                capture.done = high == len(capture.selector)
                 if high > low:
                     rows = start + capture.selector[low:high] - first
                     wanted.append((capture, start, rows, high - low, low, 0, False))
@@ -746,6 +769,7 @@ class GraphWorker(Worker):
         self, name: str | None, version: int | None = None
     ) -> None:
         """Drop one version of table ``name``, every version of it, or every table."""
+        self._row_cache.clear()
         self._steering_tables = {
             key: table
             for key, table in self._steering_tables.items()
