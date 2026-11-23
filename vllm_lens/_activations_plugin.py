@@ -505,6 +505,12 @@ def _finalize_offline_outputs(self: LLM, outputs: list, state: dict[str, Any]) -
     """Attach each output's capture, read from the file its worker wrote."""
     if not state["captures"]:
         return outputs
+    from vllm import envs
+
+    if not envs.VLLM_ENABLE_V1_MULTIPROCESSING:
+        # An in-process engine stops when its requests finish; one more step passes their
+        # finished ids to the workers, which seal the files.
+        self.llm_engine.step()
     params_list = state["params_list"]
     directory = os.environ[CAPTURE_DIR_ENV]
     for idx, output in enumerate(outputs):

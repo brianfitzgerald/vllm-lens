@@ -1,4 +1,7 @@
 import gc
+import os
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -192,3 +195,22 @@ class TestBatchedFetch:
     )
     def test_batched_fetch_matches_individual_tp2(self, llm_model_tp2):
         _assert_batched_matches_individual(llm_model_tp2, _CROSS_STAGE_LAYERS)
+
+
+def test_in_process_engine_seals_last_captures():
+    """An in-process engine (no engine-core process) returns the captures of its last batch."""
+    script = f"""
+from vllm import LLM, SamplingParams
+llm = LLM(model={MODEL_NAME!r}, additional_config={ARMED!r}, gpu_memory_utilization=0.2)
+sp = SamplingParams(max_tokens=4, extra_args={{"output_residual_stream": [{LAYER_IDX}]}})
+outputs = llm.generate({PROMPTS[:2]!r}, sp)
+for out in outputs:
+    rows = len(out.prompt_token_ids) + len(out.outputs[0].token_ids) - 1
+    assert out.activations["residual_stream"].shape[:2] == (1, rows)
+"""
+    env = {
+        **os.environ,
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "VLLM_LENS_CAPTURE_TIMEOUT": "30",
+    }
+    subprocess.run([sys.executable, "-c", script], check=True, env=env, timeout=900)
