@@ -195,43 +195,56 @@ class _Run(NamedTuple):
     file_row: int
 
 
-# The run count changes every step; a specialization per value class would compile again.
-@triton.jit(do_not_specialize=["n_runs"])
+# The counts change every step; a specialization per value class would compile again.
+@triton.jit(do_not_specialize=["n_runs", "n_tiles"])
 def _gather_kernel(
     ring,
     arena,
     runs,
     keep,
     n_runs,
+    n_tiles,
     ring_stride,
     width,
     max_layers,
     BLOCK: tl.constexpr,
 ):
-    """Copy ring row ``r`` of a step, layer slot ``k``, to its chunk in the arena; a run is
+    """Copy the step's ring rows to their chunks in the arena, one ``BLOCK`` of one layer of
+    one row per tile; a few programs loop over the tiles, since the copy is bound by the
+    link to host memory, and the other SMs stay with the forward pass. A run is
     ``(ring start, first step row, chunk element offset, layers kept)``."""
-    row = tl.program_id(0)
-    slot = tl.program_id(1)
-    cols = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
-    low = 0
-    high = n_runs - 1
-    while low < high:
-        middle = (low + high + 1) // 2
-        if tl.load(runs + middle * 4 + 1) <= row:
-            low = middle
-        else:
-            high = middle - 1
-    ring_start = tl.load(runs + low * 4)
-    first = tl.load(runs + low * 4 + 1)
-    dest = tl.load(runs + low * 4 + 2)
-    kept = tl.load(runs + low * 4 + 3)
-    mask = (cols < width) & (slot < kept)
-    layer = tl.load(keep + low * max_layers + slot, mask=slot < kept, other=0)
-    offset = row - first
-    values = tl.load(
-        ring + (ring_start + offset) * ring_stride + layer * width + cols, mask=mask
-    )
-    tl.store(arena + dest + (offset * kept + slot) * width + cols, values, mask=mask)
+    blocks = tl.cdiv(width, BLOCK)
+    for tile in range(tl.program_id(0), n_tiles, tl.num_programs(0)):
+        row = tile // (max_layers * blocks)
+        slot = (tile // blocks) % max_layers
+        cols = (tile % blocks) * BLOCK + tl.arange(0, BLOCK)
+        low = 0
+        high = n_runs - 1
+        while low < high:
+            middle = (low + high + 1) // 2
+            if tl.load(runs + middle * 4 + 1) <= row:
+                low = middle
+            else:
+                high = middle - 1
+        ring_start = tl.load(runs + low * 4)
+        first = tl.load(runs + low * 4 + 1)
+        dest = tl.load(runs + low * 4 + 2)
+        kept = tl.load(runs + low * 4 + 3)
+        if slot < kept:
+            mask = cols < width
+            layer = tl.load(keep + low * max_layers + slot)
+            offset = row - first
+            values = tl.load(
+                ring + (ring_start + offset) * ring_stride + layer * width + cols,
+                mask=mask,
+            )
+            tl.store(
+                arena + dest + (offset * kept + slot) * width + cols, values, mask=mask
+            )
+
+
+# Programs of the gather kernel: enough to fill the link to host memory.
+_GATHER_PROGRAMS = int(os.environ.get("VLLM_LENS_GATHER_PROGRAMS", "16"))
 
 
 class _Drain:
@@ -333,12 +346,14 @@ class _Drain:
             self.stream.wait_event(after)
             self.runs[:n].copy_(self.host_runs[slot][:n], non_blocking=True)
             self.keep[:n].copy_(self.host_keep[slot][:n], non_blocking=True)
-            _gather_kernel[(first, len(self.layers), triton.cdiv(self.hidden, block))](  # type: ignore[reportIndexIssue]
+            tiles = first * len(self.layers) * triton.cdiv(self.hidden, block)
+            _gather_kernel[(min(_GATHER_PROGRAMS, tiles),)](  # type: ignore[reportIndexIssue]
                 self.ring,
                 self.elements,
                 self.runs,
                 self.keep,
                 n,
+                tiles,
                 self.ring.stride(0),
                 self.hidden,
                 len(self.layers),
