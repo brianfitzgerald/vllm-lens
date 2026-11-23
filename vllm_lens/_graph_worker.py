@@ -15,6 +15,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 from vllm import envs
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.worker.gpu_worker import Worker
 
@@ -36,16 +37,68 @@ logger = logging.getLogger("vllm.lens")
 _LIBRARY = torch.library.Library("vllm_lens", "FRAGMENT")
 
 
+@triton.jit
+def _capture_kernel(
+    hidden,
+    residual,
+    ring,
+    dest,
+    sentinel,
+    width,
+    hidden_stride,
+    residual_stride,
+    ring_stride,
+    HAS_RESIDUAL: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Write token ``t``'s stream to ring row ``dest[t]``, unless that row is the sentinel."""
+    token = tl.program_id(0)
+    row = tl.load(dest + token).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = (cols < width) & (row != sentinel)
+    stream = tl.load(hidden + token * hidden_stride + cols, mask=mask)
+    if HAS_RESIDUAL:
+        added = stream.to(tl.float32) + tl.load(
+            residual + token * residual_stride + cols, mask=mask
+        ).to(tl.float32)
+        stream = added.to(stream.dtype)
+    tl.store(ring + row * ring_stride + cols, stream, mask=mask)
+
+
 def _capture_op(
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
     ring: torch.Tensor,
     dest: torch.Tensor,
 ) -> None:
-    """Write each token's stream (``hidden + residual``) to its ring row in ``dest``."""
-    n = hidden_states.shape[0]
-    stream = hidden_states if residual is None else hidden_states + residual
-    ring.index_copy_(0, dest[:n], stream)
+    """Write each token's stream (``hidden + residual``) to its ring row in ``dest``; rows
+    at the sentinel (the last ring row) are not read or written."""
+    n, width = hidden_states.shape
+    other = hidden_states if residual is None else residual
+    if n == 0:
+        return
+    if (
+        not hidden_states.is_cuda
+        or hidden_states.stride(1) != 1
+        or other.stride(1) != 1
+    ):
+        stream = hidden_states if residual is None else hidden_states + residual
+        ring.index_copy_(0, dest[:n], stream)
+        return
+    block = 1024
+    _capture_kernel[(n, triton.cdiv(width, block))](  # type: ignore[reportIndexIssue]
+        hidden_states,
+        other,
+        ring,
+        dest,
+        ring.shape[0] - 1,
+        width,
+        hidden_states.stride(0),
+        other.stride(0),
+        ring.stride(0),
+        HAS_RESIDUAL=residual is not None,
+        BLOCK=block,
+    )
 
 
 direct_register_custom_op(
@@ -65,8 +118,10 @@ def _steer_hook(module: Any, args: Any, output: Any) -> Any:
             stream, dim=-1, keepdim=True, dtype=torch.float32
         )
         delta = delta + module._lens_norm.index_select(0, ids) * norm
-    hidden = hidden + delta.to(hidden.dtype)
-    return hidden if residual is None else (hidden, residual)
+    if residual is None:
+        return hidden + delta.to(hidden.dtype)
+    # The same stream; Inductor fuses an add to the residual into the next layer's norm.
+    return hidden, residual + delta.to(residual.dtype)
 
 
 def _capture_hook(module: Any, args: Any, output: Any) -> None:
