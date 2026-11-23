@@ -243,8 +243,8 @@ def _gather_kernel(
             )
 
 
-# Programs of the gather kernel: enough to fill the link to host memory.
-_GATHER_PROGRAMS = int(os.environ.get("VLLM_LENS_GATHER_PROGRAMS", "16"))
+# Programs of the gather kernel, which copies captures of a subset of the layers.
+_GATHER_PROGRAMS = int(os.environ.get("VLLM_LENS_GATHER_PROGRAMS", "132"))
 
 
 class _Drain:
@@ -266,8 +266,13 @@ class _Drain:
         self.layers = layers
         self.hidden = hidden
         self.arena = Arena(arena_gib, timeout)
-        # The arena as elements of the model dtype, which the kernel writes.
+        # The arena as elements of the model dtype, which the copies write.
         self.elements = self.arena.bytes.view(ring.dtype)
+        if not self.arena.bytes.is_pinned():
+            raise RuntimeError(
+                "The registered capture arena is not pinned memory to torch, so copies "
+                "into it would block the engine loop."
+            )
         self.stream = torch.cuda.Stream(ring.device)
         # Each live ring segment: its rows and the event after which it is free.
         self.live: collections.deque[list[Any]] = collections.deque()
@@ -320,49 +325,71 @@ class _Drain:
         self.live.pop()
 
     def launch(self, after: torch.cuda.Event, runs: list[_Run]) -> None:
-        """Copy the runs of the last segment to their chunks once ``after`` completes."""
+        """Copy the runs of the last segment to their chunks once ``after`` completes. A
+        run of every capture layer is one copy on the GPU's copy engines, which leaves the
+        SMs to the forward pass; runs of fewer layers share one gather kernel."""
         segment = self.live[-1]
         if not runs:
             segment[2] = after
             return
+        every = len(self.layers)
+        row_elements = every * self.hidden
+        element = self.ring.element_size()
+        partial = [run for run in runs if len(run.capture.keep) < every]
+        with torch.cuda.stream(self.stream):
+            self.stream.wait_event(after)
+            for run in runs:
+                if len(run.capture.keep) < every:
+                    continue
+                start = (run.capture.chunk[2] + HEADER_BYTES) // element
+                start += run.file_row * row_elements
+                count = run.rows * row_elements
+                self.elements[start : start + count].copy_(
+                    self.ring[run.start : run.start + run.rows].view(-1),
+                    non_blocking=True,
+                )
+            if partial:
+                self._gather(partial)
+            done = torch.cuda.Event()
+            done.record(self.stream)
+        segment[2] = done
+
+    def _gather(self, runs: list[_Run]) -> None:
+        """Copy runs of fewer than every capture layer with one kernel, on the side stream."""
         slot = self.slot = self.slot ^ 1
         previous = self.events[slot]
         if previous is not None:
             previous.synchronize()
         table = self.host_runs[slot].numpy()
         keep = self.host_keep[slot].numpy()
-        row_elements = self.hidden
         first = 0
         for i, run in enumerate(runs):
             kept = len(run.capture.keep)
             data = run.capture.chunk[2] + HEADER_BYTES
-            dest = data // self.ring.element_size() + run.file_row * kept * row_elements
+            dest = data // self.ring.element_size() + run.file_row * kept * self.hidden
             table[i] = (run.start, first, dest, kept)
             keep[i, :kept] = run.capture.keep
             first += run.rows
         n = len(runs)
         block = 1024
-        with torch.cuda.stream(self.stream):
-            self.stream.wait_event(after)
-            self.runs[:n].copy_(self.host_runs[slot][:n], non_blocking=True)
-            self.keep[:n].copy_(self.host_keep[slot][:n], non_blocking=True)
-            tiles = first * len(self.layers) * triton.cdiv(self.hidden, block)
-            _gather_kernel[(min(_GATHER_PROGRAMS, tiles),)](  # type: ignore[reportIndexIssue]
-                self.ring,
-                self.elements,
-                self.runs,
-                self.keep,
-                n,
-                tiles,
-                self.ring.stride(0),
-                self.hidden,
-                len(self.layers),
-                BLOCK=block,
-            )
-            done = torch.cuda.Event()
-            done.record(self.stream)
+        self.runs[:n].copy_(self.host_runs[slot][:n], non_blocking=True)
+        self.keep[:n].copy_(self.host_keep[slot][:n], non_blocking=True)
+        tiles = first * len(self.layers) * triton.cdiv(self.hidden, block)
+        _gather_kernel[(min(_GATHER_PROGRAMS, tiles),)](  # type: ignore[reportIndexIssue]
+            self.ring,
+            self.elements,
+            self.runs,
+            self.keep,
+            n,
+            tiles,
+            self.ring.stride(0),
+            self.hidden,
+            len(self.layers),
+            BLOCK=block,
+        )
+        done = torch.cuda.Event()
+        done.record(self.stream)
         self.events[slot] = done
-        segment[2] = done
 
     def seal(
         self, capture: _Capture, rows: int, after: torch.cuda.Event | None
