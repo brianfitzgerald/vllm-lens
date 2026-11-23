@@ -53,6 +53,9 @@ class _FakeRing:
         self.size = size
         self.end = 0
         self.next_id = 0
+        # Monotonic id to chunk address, and the oldest live id, as in vLLM's class.
+        self.metadata: dict[int, int] = {}
+        self.monotonic_id_start = 0
 
     def allocate_buf(self, size: int) -> tuple[int, int]:
         size += 8
@@ -63,6 +66,7 @@ class _FakeRing:
         assert buf is not None
         buf[address : address + 4] = ident.to_bytes(4, "little", signed=True)
         buf[address + 4 : address + 8] = size.to_bytes(4, "little", signed=True)
+        self.metadata[ident] = address
         self.end += size
         self.next_id += 1
         return address, ident

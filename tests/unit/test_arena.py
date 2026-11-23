@@ -96,3 +96,10 @@ async def test_one_watcher_wakes_every_waiting_request(tmp_path):
     waits[2].cancel()
     with pytest.raises(TimeoutError, match="was not written"):
         await wait_capture_async(str(tmp_path / "missing.lens"), 0.05)
+
+
+def test_a_full_arena_of_running_captures_does_not_wait(arena):
+    """When the oldest chunk belongs to a running request, waiting would stop it from
+    finishing, so allocation returns None at once."""
+    assert arena.allocate(arena.size // 2) is not None
+    assert arena.allocate(arena.size // 2) is None

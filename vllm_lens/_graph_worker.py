@@ -885,7 +885,17 @@ class GraphWorker(Worker):
                 )
                 capture.done = True
             else:
-                capture.chunk = self._drain.arena.allocate(nbytes)
+                chunk = self._drain.arena.allocate(nbytes)
+                if chunk is None:
+                    capture.error = (
+                        f"The capture of request {req_id[:-9]} does not fit the arena, "
+                        "which holds the captures of running requests: raise "
+                        "capture_arena_gib or capture fewer requests at once."
+                    )
+                    capture.done = True
+                    logger.warning(capture.error)
+                else:
+                    capture.chunk = chunk
         self._mean[index].zero_()
 
     def _plan(

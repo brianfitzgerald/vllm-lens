@@ -9,6 +9,7 @@ import asyncio
 import atexit
 import hashlib
 import json
+import logging
 import os
 import struct
 import time
@@ -80,9 +81,11 @@ class Arena:
         ready, released, _length, sealed = _HEADER.unpack_from(data)
         return bool(released) or (bool(ready) and time.time() - sealed > self.timeout)
 
-    def allocate(self, nbytes: int) -> tuple[int, int, int]:
+    def allocate(self, nbytes: int) -> tuple[int, int, int] | None:
         """A chunk of at least ``nbytes`` data bytes, as its address, monotonic id and data
-        offset in the arena; waits for readers to release the oldest chunks."""
+        offset in the arena. Waits while the oldest chunk is sealed, for its reader to release
+        it; returns None when the oldest chunk belongs to a request still running, since
+        waiting on the engine loop would stop that request from finishing."""
         size = -(-(nbytes + _CHUNK_MD) // ALIGN) * ALIGN - _CHUNK_MD
         while True:
             try:
@@ -94,10 +97,11 @@ class Arena:
                 address, ident = self.ring.allocate_buf(size)
                 break
             except MemoryError:
+                head = self.ring.metadata.get(self.ring.monotonic_id_start)
+                if head is None or not self.bytes[head % self.size + _CHUNK_MD]:
+                    return None
                 if not self._warned:
                     self._warned = True
-                    import logging
-
                     logging.getLogger("vllm.lens").warning(
                         "vllm-lens: the capture arena is full; waiting for readers to "
                         "release captures (capture_arena_gib sets its size)."

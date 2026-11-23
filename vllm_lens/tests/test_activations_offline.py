@@ -218,11 +218,12 @@ for out in outputs:
 
 def test_offline_captures_larger_than_the_arena():
     """An offline call whose captures need more than the arena still gets every capture:
-    the call's collector releases each one as the worker seals it."""
+    the call's collector releases each one as the worker seals it. Four requests run at
+    once, so the running captures fit."""
     from .conftest import lens_engine
 
     lens = {**ARMED["vllm_lens"], "capture_arena_gib": 0.25}
-    engines = lens_engine(lens, enable_prefix_caching=False)
+    engines = lens_engine(lens, enable_prefix_caching=False, max_num_seqs=4)
     llm = next(engines)
     try:
         prompts = [
