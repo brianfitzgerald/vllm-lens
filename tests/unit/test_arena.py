@@ -76,3 +76,23 @@ def test_an_error_marker_raises(tmp_path):
     with pytest.raises(RuntimeError, match="needs 9 bytes"):
         load_capture(path)
     assert not list(tmp_path.iterdir())
+
+
+async def test_one_watcher_wakes_every_waiting_request(tmp_path):
+    """Requests waiting for markers share one scan task, and each wakes when its own marker
+    appears; a missing marker times out."""
+    import asyncio
+
+    from vllm_lens._helpers._arena import _WATCHERS, wait_capture_async
+
+    paths = [capture_path(str(tmp_path), "key", f"req-{i}") for i in range(3)]
+    waits = [asyncio.ensure_future(wait_capture_async(p, 5.0)) for p in paths]
+    await asyncio.sleep(0.01)
+    assert len(_WATCHERS) == 1 and not any(w.done() for w in waits)
+    for path in paths[:2]:
+        write_marker(path, {"error": "x"})
+    await asyncio.wait_for(asyncio.gather(*waits[:2]), 1.0)
+    assert not waits[2].done()
+    waits[2].cancel()
+    with pytest.raises(TimeoutError, match="was not written"):
+        await wait_capture_async(str(tmp_path / "missing.lens"), 0.05)

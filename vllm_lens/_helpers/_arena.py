@@ -236,10 +236,53 @@ def wait_capture(path: str, timeout: float) -> None:
         time.sleep(0.001)
 
 
+class _Watcher:
+    """One task per event loop that scans the marker directories each millisecond and wakes
+    the requests whose markers appeared, so the poll cost does not grow with the requests."""
+
+    def __init__(self) -> None:
+        self.waiting: dict[str, dict[str, asyncio.Future[None]]] = {}
+        self.task: asyncio.Task[None] | None = None
+
+    async def wait(self, path: str, timeout: float) -> None:
+        """Wait for the marker at ``path``."""
+        directory, name = os.path.split(path)
+        future = asyncio.get_running_loop().create_future()
+        self.waiting.setdefault(directory, {})[name] = future
+        if self.task is None or self.task.done():
+            self.task = asyncio.get_running_loop().create_task(self.run())
+        try:
+            await asyncio.wait_for(future, timeout)
+        except TimeoutError:
+            raise TimeoutError(
+                f"The capture {path} was not written in {timeout} s"
+            ) from None
+        finally:
+            self.waiting.get(directory, {}).pop(name, None)
+
+    async def run(self) -> None:
+        """Scan while any request waits."""
+        while any(self.waiting.values()):
+            for directory, names in list(self.waiting.items()):
+                if not names:
+                    continue
+                for entry in os.scandir(directory):
+                    future = names.get(entry.name)
+                    if future is not None and not future.done():
+                        future.set_result(None)
+            await asyncio.sleep(0.001)
+
+
+# One watcher per event loop.
+_WATCHERS: dict[int, _Watcher] = {}
+
+
 async def wait_capture_async(path: str, timeout: float) -> None:
     """Wait until the worker writes the marker at ``path``, without blocking the loop."""
-    deadline = time.monotonic() + timeout
-    while not os.path.exists(path):
-        if time.monotonic() > deadline:
-            raise TimeoutError(f"The capture {path} was not written in {timeout} s")
-        await asyncio.sleep(0.001)
+    if os.path.exists(path):
+        return
+    loop = id(asyncio.get_running_loop())
+    watcher = _WATCHERS.get(loop)
+    if watcher is None:
+        watcher = _WATCHERS[loop] = _Watcher()
+    await watcher.wait(path, timeout)

@@ -468,7 +468,9 @@ class _Collector(threading.Thread):
         self.stopped = False
 
     def run(self) -> None:
-        """Load each sealed capture of this call until stopped."""
+        """Load each sealed capture of this call until stopped; the scans back off to 10 ms
+        while no capture is sealed."""
+        pause = 0.001
         while not self.stopped:
             found = False
             for entry in os.scandir(self.directory):
@@ -483,8 +485,9 @@ class _Collector(threading.Thread):
                     self.loaded[entry.path] = value
                     self.changed.notify_all()
                 found = True
+            pause = 0.001 if found else min(2 * pause, 0.01)
             if not found:
-                time.sleep(0.001)
+                time.sleep(pause)
 
     def take(self, path: str, timeout: float) -> dict[str, Any]:
         """The capture of one marker, once loaded."""
