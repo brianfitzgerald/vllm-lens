@@ -229,13 +229,15 @@ def test_offline_captures_larger_than_the_arena():
             f"{i} " + "The river runs past the old mill. " * 50 for i in range(16)
         ]
         sp = SamplingParams(
-            max_tokens=8, ignore_eos=True, extra_args={"output_residual_stream": [0, 1]}
+            max_tokens=8,
+            ignore_eos=True,
+            extra_args={"output_residual_stream": list(range(NUM_LAYERS))},
         )
         outputs = llm.generate(prompts, sp)
         total = 0
         for out in outputs:
             rows = len(out.prompt_token_ids) + len(out.outputs[0].token_ids) - 1
-            assert out.activations["residual_stream"].shape[:2] == (2, rows)
+            assert out.activations["residual_stream"].shape[:2] == (NUM_LAYERS, rows)
             total += (
                 rows * NUM_LAYERS * llm.llm_engine.model_config.get_hidden_size() * 2
             )
