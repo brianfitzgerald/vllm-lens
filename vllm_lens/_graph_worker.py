@@ -195,7 +195,8 @@ class _Run(NamedTuple):
     file_row: int
 
 
-@triton.jit
+# The run count changes every step; a specialization per value class would compile again.
+@triton.jit(do_not_specialize=["n_runs"])
 def _gather_kernel(
     ring,
     arena,

@@ -49,3 +49,35 @@ def test_route_matches_the_per_token_plan(seed):
         BLOCK=256,
     )
     assert torch.equal(meta.cpu(), expected)
+
+
+def test_route_does_not_compile_again_for_new_counts():
+    """A launch with counts of another value class (1, a multiple of 16, other) reuses the
+    compiled kernel, so a step never waits for Triton."""
+    import time
+
+    from vllm_lens._route import route_kernel
+
+    plan = torch.zeros((5, 64), dtype=torch.int64, device="cuda")
+    meta = torch.zeros((2, 512), dtype=torch.int64, device="cuda")
+
+    def launch(n_reqs: int, n_tokens: int) -> float:
+        start = time.perf_counter()
+        route_kernel[(-(-n_tokens // 256),)](  # type: ignore[reportIndexIssue]
+            plan,
+            meta,
+            plan.stride(0),
+            meta.stride(0),
+            n_reqs,
+            n_tokens,
+            n_tokens,
+            99,
+            STEPS=7,
+            BLOCK=256,
+        )
+        torch.cuda.synchronize()
+        return time.perf_counter() - start
+
+    launch(3, 37)
+    seconds = [launch(n, t) for n, t in ((1, 1), (16, 32), (17, 48), (64, 320), (5, 7))]
+    assert max(seconds) < 0.02, seconds

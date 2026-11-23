@@ -10,7 +10,8 @@ from vllm.triton_utils import tl, triton
 STEER, RING, SKIP, COUNT, START = range(5)
 
 
-@triton.jit
+# These counts change every step; a specialization per value class would compile again.
+@triton.jit(do_not_specialize=["n_reqs", "n_tokens", "length"])
 def route_kernel(
     plan,
     meta,
