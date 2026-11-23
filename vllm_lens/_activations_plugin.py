@@ -19,6 +19,7 @@ import os
 import pickle
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from importlib.metadata import PackageNotFoundError, version
@@ -454,6 +455,48 @@ async def _patched_generate(
             threading.Thread(target=_release_unread, args=(path,), daemon=True).start()
 
 
+class _Collector(threading.Thread):
+    """Copy and release the captures of one offline call as the worker seals them, so the
+    arena never has to hold the whole call."""
+
+    def __init__(self, directory: str, prefix: str) -> None:
+        super().__init__(daemon=True, name="vllm-lens-collect")
+        self.directory = directory
+        self.prefix = prefix
+        self.loaded: dict[str, Any] = {}
+        self.changed = threading.Condition()
+        self.stopped = False
+
+    def run(self) -> None:
+        """Load each sealed capture of this call until stopped."""
+        while not self.stopped:
+            found = False
+            for entry in os.scandir(self.directory):
+                name = entry.name
+                if not name.startswith(self.prefix) or not name.endswith(".lens"):
+                    continue
+                try:
+                    value: Any = load_capture(entry.path)
+                except (OSError, RuntimeError, ValueError) as error:
+                    value = error
+                with self.changed:
+                    self.loaded[entry.path] = value
+                    self.changed.notify_all()
+                found = True
+            if not found:
+                time.sleep(0.001)
+
+    def take(self, path: str, timeout: float) -> dict[str, Any]:
+        """The capture of one marker, once loaded."""
+        with self.changed:
+            if not self.changed.wait_for(lambda: path in self.loaded, timeout):
+                raise TimeoutError(f"The capture {path} was not written in {timeout} s")
+            value = self.loaded.pop(path)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+
 def _prepare_offline_params(
     self: LLM,
     sampling_params: SamplingParams | Sequence[SamplingParams] | None,
@@ -483,28 +526,33 @@ def _prepare_offline_params(
         vectors_list.append(vectors)
         if "_steering_id" in extra:
             steering[extra["_steering_id"]] = pickle.dumps(vectors)
-    try:
-        for steering_id, payload in steering.items():
-            self.collective_rpc("set_steering_data", args=(steering_id, payload))
-    except BaseException:
-        _end_offline(self, {"steering": steering, "vectors": vectors_list})
-        raise
-    return {
+    state: dict[str, Any] = {
         "params": sampling_params,
         "params_list": params_list,
         "captures": captures,
         "steering": steering,
         "vectors": vectors_list,
+        "collector": None,
     }
+    try:
+        for steering_id, payload in steering.items():
+            self.collective_rpc("set_steering_data", args=(steering_id, payload))
+    except BaseException:
+        _end_offline(self, state)
+        raise
+    if captures and os.environ.get(CAPTURE_DIR_ENV):
+        state["collector"] = _Collector(os.environ[CAPTURE_DIR_ENV], key)
+        state["collector"].start()
+    return state
 
 
 def _finalize_offline_outputs(self: LLM, outputs: list, state: dict[str, Any]) -> list:
-    """Attach each output's capture, read from the file its worker wrote."""
+    """Attach each output's capture, which the call's collector read from the arena."""
     if not state["captures"]:
         return outputs
     if not int(os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1")):
         # An in-process engine stops when its requests finish; one more step passes their
-        # finished ids to the workers, which seal the files.
+        # finished ids to the workers, which seal the captures.
         self.llm_engine.step()
     params_list = state["params_list"]
     directory = os.environ[CAPTURE_DIR_ENV]
@@ -513,8 +561,11 @@ def _finalize_offline_outputs(self: LLM, outputs: list, state: dict[str, Any]) -
         if "_capture_key" not in extra:
             continue
         path = capture_path(directory, extra["_capture_key"], output.request_id)
-        wait_capture(path, _CAPTURE_TIMEOUT)
-        activations = load_capture(path)
+        if state["collector"] is None:
+            wait_capture(path, _CAPTURE_TIMEOUT)
+            activations = load_capture(path)
+        else:
+            activations = state["collector"].take(path, _CAPTURE_TIMEOUT)
         n_prompt = len(output.prompt_token_ids)
         _trim_activations(activations, n_prompt + len(output.outputs[0].token_ids) - 1)
         output.activations = activations
@@ -522,7 +573,10 @@ def _finalize_offline_outputs(self: LLM, outputs: list, state: dict[str, Any]) -
 
 
 def _end_offline(self: LLM, state: dict[str, Any]) -> None:
-    """Drop the inline steering data and the table versions nothing uses any more."""
+    """Stop the call's collector, and drop the inline steering data and the table versions
+    nothing uses any more."""
+    if state.get("collector") is not None:
+        state["collector"].stopped = True
     for steering_id in state["steering"]:
         self.collective_rpc("clear_steering_data", args=(steering_id,))
     for vectors in state["vectors"]:

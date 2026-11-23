@@ -214,3 +214,31 @@ for out in outputs:
         "VLLM_LENS_CAPTURE_TIMEOUT": "30",
     }
     subprocess.run([sys.executable, "-c", script], check=True, env=env, timeout=900)
+
+
+def test_offline_captures_larger_than_the_arena():
+    """An offline call whose captures need more than the arena still gets every capture:
+    the call's collector releases each one as the worker seals it."""
+    from .conftest import lens_engine
+
+    lens = {**ARMED["vllm_lens"], "capture_arena_gib": 0.25}
+    engines = lens_engine(lens, enable_prefix_caching=False)
+    llm = next(engines)
+    try:
+        prompts = [
+            f"{i} " + "The river runs past the old mill. " * 50 for i in range(16)
+        ]
+        sp = SamplingParams(
+            max_tokens=8, ignore_eos=True, extra_args={"output_residual_stream": [0, 1]}
+        )
+        outputs = llm.generate(prompts, sp)
+        total = 0
+        for out in outputs:
+            rows = len(out.prompt_token_ids) + len(out.outputs[0].token_ids) - 1
+            assert out.activations["residual_stream"].shape[:2] == (2, rows)
+            total += (
+                rows * NUM_LAYERS * llm.llm_engine.model_config.get_hidden_size() * 2
+            )
+        assert total > 0.25 * (1 << 30)
+    finally:
+        engines.close()
