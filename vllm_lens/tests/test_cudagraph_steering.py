@@ -90,12 +90,13 @@ VECTOR_CASES = {
 def test_one_armed_layer_steers_as_every_armed_layer(
     eager_llm, op_eager_llm, hidden, case
 ):
-    """With the same kernels, an engine arming one layer steers as one arming them all."""
+    """An engine arming one layer steers as one arming them all. Each armed layer's next
+    norm is the fused lens norm, and the other layers keep vLLM's kernel, whose rounding
+    differs, so the limit is 3% per row."""
     eager = _run(eager_llm, [VECTOR_CASES[case](hidden)])[0]
     op = _run(op_eager_llm, [VECTOR_CASES[case](hidden)])[0]
     error = row_error(prompt_rows(op), prompt_rows(eager))
-    # Both paths run the same float32 steering math on the same kernels.
-    assert error < 1e-3, f"largest row error {error:.4f}"
+    assert error < 3e-2, f"largest row error {error:.4f}"
 
 
 @pytest.mark.parametrize("case", VECTOR_CASES)

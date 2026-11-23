@@ -29,6 +29,7 @@ def _lens_norm_kernel(
     x_stride,
     residual_stride,
     table_stride,
+    norm_stride,
     ring_stride,
     eps,
     STEER: tl.constexpr,
@@ -54,7 +55,7 @@ def _lens_norm_kernel(
         if NORM:
             magnitude = tl.sqrt(tl.sum(stream * stream, axis=0))
             delta += (
-                tl.load(norm_table + row * table_stride + cols, mask=mask, other=0.0)
+                tl.load(norm_table + row * norm_stride + cols, mask=mask, other=0.0)
                 * magnitude
             )
         stream += delta
@@ -109,6 +110,7 @@ def _lens_norm(
         x.stride(0),
         residual.stride(0),
         0 if add is None else add.stride(0),
+        0 if norm_table is None else norm_table.stride(0),
         ring.stride(0),
         eps,
         STEER=add is not None,
