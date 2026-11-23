@@ -169,9 +169,9 @@ class VLLMLensClient:
         ``activations_transport="binary"`` returns captured activations as a
         handle fetched from ``GET /v1/activations/{handle}`` (no base64); the
         default inlines them as base64 in the JSON response.
-        ``activations_transport="file"`` returns the path of the capture file the
-        server wrote, which works only on the server's host; the client maps it
-        and the caller removes it. Decoding is transparent in every case.
+        ``activations_transport="shm"`` returns the marker of the capture in the
+        server's shared-memory arena, which works only on the server's host; the
+        client copies and releases it. Decoding is transparent in every case.
 
         ``capture_positions`` narrows the residual-stream capture to
         ``"last_prompt_token"`` or to a list of absolute token positions;

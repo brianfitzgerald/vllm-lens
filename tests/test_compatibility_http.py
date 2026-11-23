@@ -22,7 +22,7 @@ def client(vllm_server):
 
 
 @pytest.mark.parametrize("endpoint", ["generate", "chat"])
-@pytest.mark.parametrize("transport", ["base64", "binary", "file"])
+@pytest.mark.parametrize("transport", ["base64", "binary", "shm"])
 def test_capture_and_interventions(client, endpoint, transport):
     def generate(**kwargs):
         prompt = (

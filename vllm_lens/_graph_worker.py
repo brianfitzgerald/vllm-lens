@@ -1,6 +1,7 @@
 """The vLLM worker of vllm-lens, on vLLM's V2 model runner with CUDA graphs. Ops inside the
 graph steer each armed layer from a table indexed per token and write each captured token's
-stream to a GPU ring; a thread copies the ring rows to one file per request."""
+stream to a GPU ring; after each step a kernel copies the ring rows into a shared-memory
+arena, one chunk per request."""
 
 from __future__ import annotations
 
@@ -20,11 +21,13 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.worker.gpu_worker import Worker
 
 from vllm_lens._cudagraph import LensGraphConfig
-from vllm_lens._helpers._capture_file import (
+from vllm_lens._helpers._arena import (
     CAPTURE_DIR_ENV,
     HEADER_BYTES,
+    MAX_CHUNK_BYTES,
+    Arena,
     capture_path,
-    seal,
+    write_marker,
 )
 from vllm_lens._helpers._positions import LAST_PROMPT_TOKEN, POSITIONS_KEY
 from vllm_lens._helpers._serialize import deserialize_tensor
@@ -154,14 +157,13 @@ class _Prepared(NamedTuple):
 
 
 class _Capture:
-    """One request's capture: its partial file, its capture-layer indices, and its mode:
-    every position, a sorted position list, or the mean over the prompt."""
+    """One request's capture: its arena chunk and marker, its capture-layer indices, and its
+    mode: every position, a sorted position list, or the mean over the prompt."""
 
     def __init__(
-        self, path: str, keep: list[int], extra: dict[str, Any], prompt_len: int
+        self, marker: str, keep: list[int], extra: dict[str, Any], prompt_len: int
     ) -> None:
-        self.path = path
-        self.fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+        self.marker = marker
         self.keep = keep
         self.prompt_len = prompt_len
         self.mean = extra.get("output_residual_stream_pool") == "mean"
@@ -172,14 +174,19 @@ class _Capture:
                 [prompt_len - 1] if selector == LAST_PROMPT_TOKEN else selector,
                 dtype=np.int64,
             )
-        # One past the last file row written so far.
+        # One past the last chunk row written so far, and the rows the chunk holds.
         self.rows = 0
+        self.rows_max = 0
+        # The chunk's address, monotonic id and data offset in the arena.
+        self.chunk: tuple[int, int, int] = (0, 0, 0)
+        # Why the capture has no chunk, if it has none.
+        self.error: str | None = None
         # Whether every row this capture selects is written.
         self.done = False
 
 
 class _Run(NamedTuple):
-    """Ring rows ``[start, start + rows)`` that go to file rows from ``file_row``."""
+    """Ring rows ``[start, start + rows)`` that go to chunk rows from ``file_row``."""
 
     capture: _Capture
     start: int
@@ -187,159 +194,212 @@ class _Run(NamedTuple):
     file_row: int
 
 
-class _Drain:
-    """The GPU ring and the thread that copies its rows to the request files in step order,
-    on its own CUDA stream; the engine takes ring rows and waits when too few are free."""
+@triton.jit
+def _gather_kernel(
+    ring,
+    arena,
+    runs,
+    keep,
+    n_runs,
+    ring_stride,
+    width,
+    max_layers,
+    BLOCK: tl.constexpr,
+):
+    """Copy ring row ``r`` of a step, layer slot ``k``, to its chunk in the arena; a run is
+    ``(ring start, first step row, chunk element offset, layers kept)``."""
+    row = tl.program_id(0)
+    slot = tl.program_id(1)
+    cols = tl.program_id(2) * BLOCK + tl.arange(0, BLOCK)
+    low = 0
+    high = n_runs - 1
+    while low < high:
+        middle = (low + high + 1) // 2
+        if tl.load(runs + middle * 4 + 1) <= row:
+            low = middle
+        else:
+            high = middle - 1
+    ring_start = tl.load(runs + low * 4)
+    first = tl.load(runs + low * 4 + 1)
+    dest = tl.load(runs + low * 4 + 2)
+    kept = tl.load(runs + low * 4 + 3)
+    mask = (cols < width) & (slot < kept)
+    layer = tl.load(keep + low * max_layers + slot, mask=slot < kept, other=0)
+    offset = row - first
+    values = tl.load(
+        ring + (ring_start + offset) * ring_stride + layer * width + cols, mask=mask
+    )
+    tl.store(arena + dest + (offset * kept + slot) * width + cols, values, mask=mask)
 
-    def __init__(self, ring: torch.Tensor, layers: list[int], hidden: int) -> None:
+
+class _Drain:
+    """The GPU ring and the arena: after each step, one kernel on a side stream copies the
+    step's ring rows into the requests' arena chunks; a thread seals finished captures. The
+    engine takes ring rows and waits only when the ring is full."""
+
+    def __init__(
+        self,
+        ring: torch.Tensor,
+        layers: list[int],
+        hidden: int,
+        max_reqs: int,
+        arena_gib: float,
+        timeout: float,
+    ) -> None:
         self.ring = ring
         self.size = ring.shape[0] - 1
         self.layers = layers
         self.hidden = hidden
-        row_bytes = ring[0].numel() * ring.element_size()
-        self.slab_rows = max(1, min(self.size, (64 << 20) // row_bytes))
-        self.slabs = [
-            torch.empty(
-                (self.slab_rows, *ring.shape[1:]), dtype=ring.dtype
-            ).pin_memory()
+        self.arena = Arena(arena_gib, timeout)
+        # The arena as elements of the model dtype, which the kernel writes.
+        self.elements = self.arena.bytes.view(ring.dtype)
+        self.stream = torch.cuda.Stream(ring.device)
+        # Each live ring segment: its rows and the event after which it is free.
+        self.live: collections.deque[list[Any]] = collections.deque()
+        self.head = 0
+        # Two pinned copies of the run table, so a step never writes the one in use.
+        self.host_runs = [
+            torch.zeros((max_reqs, 4), dtype=torch.int64).pin_memory() for _ in range(2)
+        ]
+        self.host_keep = [
+            torch.zeros((max_reqs, len(layers)), dtype=torch.int32).pin_memory()
             for _ in range(2)
         ]
-        self.events = [torch.cuda.Event() for _ in range(2)]
-        self.stream = torch.cuda.Stream(ring.device)
-        self.queue: queue.SimpleQueue[Any] = queue.SimpleQueue()
-        self.free = threading.Condition()
-        self.live: collections.deque[tuple[int, int]] = collections.deque()
-        self.head = 0
+        self.runs = torch.zeros((max_reqs, 4), dtype=torch.int64, device=ring.device)
+        self.keep = torch.zeros(
+            (max_reqs, len(layers)), dtype=torch.int32, device=ring.device
+        )
+        self.events: list[torch.cuda.Event | None] = [None, None]
+        self.slot = 0
+        self.seals: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self.error: BaseException | None = None
         self.thread = threading.Thread(
-            target=self._run, name="vllm-lens-drain", daemon=True
+            target=self._run, name="vllm-lens-seal", daemon=True
         )
         self.thread.start()
 
     def take(self, rows: int) -> int:
-        """The first of ``rows`` free ring rows; waits for the thread to free rows."""
+        """The first of ``rows`` free ring rows; waits for the oldest copies when the ring
+        is full."""
         if rows > self.size:
             raise RuntimeError(
                 f"A step captures {rows} rows, more than the {self.size} of "
                 "capture_ring_tokens."
             )
-        with self.free:
-            while True:
-                if self.error is not None:
-                    raise RuntimeError(
-                        "The vllm-lens capture thread failed"
-                    ) from self.error
-                start = self.head if self.head + rows <= self.size else 0
-                if all(end <= start or low >= start + rows for low, end in self.live):
-                    break
-                self.free.wait()
-            self.live.append((start, start + rows))
-            self.head = start + rows
-            return start
+        while True:
+            while self.live and self.live[0][2] is not None and self.live[0][2].query():
+                self.live.popleft()
+            start = self.head if self.head + rows <= self.size else 0
+            if all(end <= start or low >= start + rows for low, end, _ in self.live):
+                break
+            oldest = self.live[0][2]
+            if oldest is None:
+                raise RuntimeError("The capture ring holds an unfinished step")
+            oldest.synchronize()
+        self.live.append([start, start + rows, None])
+        self.head = start + rows
+        return start
 
-    def release(self) -> None:
-        """Free the oldest ring segment."""
-        with self.free:
-            self.live.popleft()
-            self.free.notify_all()
+    def drop(self) -> None:
+        """Free the segment of a step that failed."""
+        self.live.pop()
 
-    def _write(self, slab: torch.Tensor, run: _Run, offset: int) -> None:
-        """Write the slab rows of ``run``, from row ``offset`` of the run, to its file."""
-        rows = slab.view(torch.uint8).numpy()
-        keep = run.capture.keep
-        if len(keep) < len(self.layers):
-            rows = rows.reshape(rows.shape[0], len(self.layers), -1)[:, keep]
-        data = memoryview(np.ascontiguousarray(rows)).cast("B")
-        row_bytes = len(keep) * self.hidden * self.ring.element_size()
-        position = HEADER_BYTES + (run.file_row + offset) * row_bytes
-        while data:
-            written = os.pwrite(run.capture.fd, data, position)
-            data = data[written:]
-            position += written
-
-    def _copy(self, event: torch.cuda.Event, runs: list[_Run]) -> None:
-        """Copy the contiguous ring rows of one step through the two pinned slabs, so one
-        slab is written to the files while the other is copied."""
-        self.stream.wait_event(event)
-        low = runs[0].start
-        total = runs[-1].start + runs[-1].rows - low
-        pending: tuple[int, int, int] | None = None
-        slot = 0
-        for chunk in range(0, total, self.slab_rows):
-            count = min(self.slab_rows, total - chunk)
-            slot ^= 1
-            with torch.cuda.stream(self.stream):
-                self.slabs[slot][:count].copy_(
-                    self.ring[low + chunk : low + chunk + count], non_blocking=True
-                )
-                self.events[slot].record(self.stream)
-            if pending is not None:
-                self._finish(*pending, runs)
-            pending = (slot, low + chunk, count)
-        if pending is not None:
-            self._finish(*pending, runs)
-
-    def _finish(self, slot: int, low: int, count: int, runs: list[_Run]) -> None:
-        """Wait for the slab copy of ring rows ``[low, low + count)``, then write the part of
-        each run inside them."""
-        self.events[slot].synchronize()
-        for run in runs:
-            first = max(run.start, low)
-            last = min(run.start + run.rows, low + count)
-            if first < last:
-                self._write(
-                    self.slabs[slot][first - low : last - low], run, first - run.start
-                )
-
-    def _seal(
-        self,
-        capture: _Capture,
-        rows: int,
-        mean: torch.Tensor | None,
-        event: torch.cuda.Event | None,
-    ) -> None:
-        """Write a mean row if any, then seal the file."""
-        if mean is not None and event is not None:
-            event.synchronize()
-            self._write(mean, _Run(capture, 0, 1, 0), 0)
-        try:
-            seal(
-                capture.fd,
-                capture.path,
-                dtype=self.ring.dtype,
-                rows=rows,
-                layers=[self.layers[k] for k in capture.keep],
-                hidden=self.hidden,
-                positions=None
-                if capture.selector is None
-                else capture.selector.tolist(),
+    def launch(self, after: torch.cuda.Event, runs: list[_Run]) -> None:
+        """Copy the runs of the last segment to their chunks once ``after`` completes."""
+        segment = self.live[-1]
+        if not runs:
+            segment[2] = after
+            return
+        slot = self.slot = self.slot ^ 1
+        previous = self.events[slot]
+        if previous is not None:
+            previous.synchronize()
+        table = self.host_runs[slot].numpy()
+        keep = self.host_keep[slot].numpy()
+        row_elements = self.hidden
+        first = 0
+        for i, run in enumerate(runs):
+            kept = len(run.capture.keep)
+            data = run.capture.chunk[2] + HEADER_BYTES
+            dest = data // self.ring.element_size() + run.file_row * kept * row_elements
+            table[i] = (run.start, first, dest, kept)
+            keep[i, :kept] = run.capture.keep
+            first += run.rows
+        n = len(runs)
+        block = 1024
+        with torch.cuda.stream(self.stream):
+            self.stream.wait_event(after)
+            self.runs[:n].copy_(self.host_runs[slot][:n], non_blocking=True)
+            self.keep[:n].copy_(self.host_keep[slot][:n], non_blocking=True)
+            _gather_kernel[(first, len(self.layers), triton.cdiv(self.hidden, block))](  # type: ignore[reportIndexIssue]
+                self.ring,
+                self.elements,
+                self.runs,
+                self.keep,
+                n,
+                self.ring.stride(0),
+                self.hidden,
+                len(self.layers),
+                BLOCK=block,
             )
-        except FileNotFoundError:
-            # The front end removed the file of an aborted request.
-            pass
+            done = torch.cuda.Event()
+            done.record(self.stream)
+        self.events[slot] = done
+        segment[2] = done
+
+    def seal(
+        self, capture: _Capture, rows: int, after: torch.cuda.Event | None
+    ) -> None:
+        """Queue the seal of a capture after its copies (and ``after``, for a mean row)."""
+        with torch.cuda.stream(self.stream):
+            if after is not None:
+                self.stream.wait_event(after)
+            done = torch.cuda.Event()
+            done.record(self.stream)
+        self.seals.put((capture, rows, done))
+
+    def _seal(self, capture: _Capture, rows: int, done: torch.cuda.Event) -> None:
+        """Write the header and the marker of one capture once its rows are copied."""
+        if capture.error is not None:
+            write_marker(capture.marker, {"error": capture.error})
+            return
+        done.synchronize()
+        address, ident, offset = capture.chunk
+        kept = len(capture.keep)
+        row_bytes = kept * self.hidden * self.ring.element_size()
+        positions = (
+            None if capture.selector is None else capture.selector[:rows].tolist()
+        )
+        positions_offset = offset + HEADER_BYTES + capture.rows_max * row_bytes
+        self.arena.seal(
+            capture.marker,
+            address,
+            ident,
+            offset,
+            {
+                "dtype": str(self.ring.dtype).removeprefix("torch."),
+                "rows": rows,
+                "layers": [self.layers[k] for k in capture.keep],
+                "hidden": self.hidden,
+                "positions": None if positions is None else len(positions),
+                "positions_offset": positions_offset,
+            },
+            positions,
+            positions_offset,
+        )
 
     def _run(self) -> None:
-        """Process the steps and seals in order."""
+        """Seal the finished captures in order."""
         torch.cuda.set_device(self.ring.device)
         try:
             while True:
-                item = self.queue.get()
+                item = self.seals.get()
                 if item is None:
                     return
-                if isinstance(item[0], _Capture):
-                    self._seal(*item)
-                    continue
-                event, runs = item
-                if runs:
-                    self._copy(event, runs)
-                else:
-                    event.synchronize()
-                self.release()
+                self._seal(*item)
         except BaseException as error:
-            logger.exception("The vllm-lens capture thread failed")
-            with self.free:
-                self.error = error
-                self.free.notify_all()
+            logger.exception("The vllm-lens seal thread failed")
+            self.error = error
 
 
 def _prepare(
@@ -494,7 +554,19 @@ class GraphWorker(Worker):
             dtype=dtype,
             device=device,
         )
-        self._drain = _Drain(ring, capture_layers, hidden) if capture_layers else None
+        self._drain = (
+            _Drain(
+                ring,
+                capture_layers,
+                hidden,
+                max_reqs,
+                config.capture_arena_gib,
+                float(os.environ.get("VLLM_LENS_CAPTURE_TIMEOUT", "120")),
+            )
+            if capture_layers
+            else None
+        )
+        self._max_model_len = runner.model_config.max_model_len
         self._sentinel = ring.shape[0] - 1
         # Row 0 holds each token's table row, row 1 its ring row.
         self._meta = torch.tensor(
@@ -540,7 +612,13 @@ class GraphWorker(Worker):
                     continue
                 extras[new.req_id] = extra
                 index = runner.req_states.req_id_to_index[new.req_id]
-                self._admit(new.req_id, index, extra, new.prompt_len)
+                self._admit(
+                    new.req_id,
+                    index,
+                    extra,
+                    new.prompt_len,
+                    getattr(new.sampling_params, "max_tokens", None),
+                )
             return out
 
         def _prepare_inputs(*args: Any, **kwargs: Any) -> Any:
@@ -562,15 +640,15 @@ class GraphWorker(Worker):
             return input_batch
 
         def _execute_model(*args: Any, **kwargs: Any) -> Any:
-            """Run V2's step, then add its prompt rows to the means and hand its ring rows
-            to the drain."""
+            """Run V2's step, then add its prompt rows to the means and copy its ring rows
+            to the arena."""
             pending["runs"], pending["pooled"] = None, []
             try:
                 out = execute_model(*args, **kwargs)
             except BaseException:
                 if pending["runs"] is not None:
                     assert self._drain is not None
-                    self._drain.release()
+                    self._drain.drop()
                 raise
             runs = pending["runs"]
             if runs is not None:
@@ -584,7 +662,7 @@ class GraphWorker(Worker):
                 self._meta[1, : self._meta_length].fill_(self._sentinel)
                 event = torch.cuda.Event()
                 event.record()
-                self._drain.queue.put((event, runs))
+                self._drain.launch(event, runs)
             return out
 
         runner.add_requests = _add_requests
@@ -613,9 +691,14 @@ class GraphWorker(Worker):
         )
 
     def _admit(
-        self, req_id: str, index: int, extra: dict[str, Any], prompt_len: int
+        self,
+        req_id: str,
+        index: int,
+        extra: dict[str, Any],
+        prompt_len: int,
+        max_tokens: int | None = None,
     ) -> None:
-        """Write a new request's table rows, and open its capture file."""
+        """Write a new request's table rows, and allocate its capture chunk."""
         prepared = None
         key = extra.get("_steering_id")
         if key is not None:
@@ -672,7 +755,8 @@ class GraphWorker(Worker):
             return
         if req_id in self._captures:
             # A resumed request computes its positions again.
-            self._captures[req_id].done = False
+            capture = self._captures[req_id]
+            capture.done = capture.error is not None
         else:
             keep = [
                 k
@@ -680,12 +764,33 @@ class GraphWorker(Worker):
                 if not isinstance(wanted, list) or layer in wanted
             ]
             # vLLM's internal id is the external id and an 8-character suffix.
-            self._captures[req_id] = _Capture(
-                capture_path(self._capture_dir, key, req_id[:-9], partial=True),
+            capture = self._captures[req_id] = _Capture(
+                capture_path(self._capture_dir, key, req_id[:-9]),
                 keep,
                 extra,
                 prompt_len,
             )
+            if capture.mean:
+                capture.rows_max = 1
+            elif capture.selector is not None:
+                capture.rows_max = len(capture.selector)
+            else:
+                generated = self._max_model_len if max_tokens is None else max_tokens
+                capture.rows_max = min(prompt_len + generated, self._max_model_len) - 1
+            row_bytes = len(keep) * self._lens_hidden * self._lens_dtype.itemsize
+            nbytes = HEADER_BYTES + capture.rows_max * row_bytes
+            if capture.selector is not None:
+                nbytes += 8 * len(capture.selector)
+            limit = min(MAX_CHUNK_BYTES, self._drain.arena.size // 4)
+            if nbytes > limit:
+                capture.error = (
+                    f"The capture of request {req_id[:-9]} needs {nbytes} bytes, more than "
+                    f"the {limit} one chunk may hold: lower max_tokens, capture fewer "
+                    "layers or raise capture_arena_gib."
+                )
+                capture.done = True
+            else:
+                capture.chunk = self._drain.arena.allocate(nbytes)
         self._mean[index].zero_()
 
     def _plan(
@@ -739,8 +844,10 @@ class GraphWorker(Worker):
                         (capture, start, None, high - first, -1, index, first == 0)
                     )
             elif capture.selector is None:
-                wanted.append((capture, start, None, count, first, 0, False))
-                capture.rows = max(capture.rows, first + count)
+                count = min(count, capture.rows_max - first)
+                if count > 0:
+                    wanted.append((capture, start, None, count, first, 0, False))
+                    capture.rows = max(capture.rows, first + count)
             else:
                 low = int(np.searchsorted(capture.selector, first))
                 high = int(np.searchsorted(capture.selector, first + count))
@@ -774,21 +881,21 @@ class GraphWorker(Worker):
 
     def _seal(self, capture: _Capture, index: int | None) -> None:
         """Queue the seal of a finished request's capture after its rows; a mean is divided
-        and copied to the host here, on the compute stream."""
+        and copied into its chunk here, on the compute stream."""
         assert self._drain is not None
-        mean = event = None
         rows = capture.rows
-        if capture.mean and index is not None:
-            # One row of every capture layer; the drain keeps the request's layers.
-            values = (self._mean[index : index + 1] / capture.prompt_len).to(
+        after = None
+        if capture.mean and index is not None and capture.error is None:
+            values = (self._mean[index, capture.keep] / capture.prompt_len).to(
                 self._lens_dtype
             )
-            mean = torch.empty(values.shape, dtype=values.dtype).pin_memory()
-            mean.copy_(values, non_blocking=True)
-            event = torch.cuda.Event()
-            event.record()
+            start = (capture.chunk[2] + HEADER_BYTES) // self._lens_dtype.itemsize
+            target = self._drain.elements[start : start + values.numel()]
+            target.copy_(values.flatten(), non_blocking=True)
+            after = torch.cuda.Event()
+            after.record()
             rows = 1
-        self._drain.queue.put((capture, rows, mean, event))
+        self._drain.seal(capture, rows, after)
 
     def _prepare_vectors(self, vectors: list[SteeringVector]) -> _Prepared:
         """Prepare one request's vectors for this worker's steer layers."""

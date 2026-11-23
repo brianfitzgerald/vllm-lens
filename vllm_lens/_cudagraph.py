@@ -26,6 +26,8 @@ class LensGraphConfig(BaseModel):
     # Rows of the GPU ring that holds captured rows until a thread writes them; 0 means
     # twice max_num_batched_tokens.
     capture_ring_tokens: Annotated[int, Field(strict=True, ge=0)] = 0
+    # GiB of the shared-memory arena that holds captures until their readers release them.
+    capture_arena_gib: Annotated[float, Field(gt=0)] = 4.0
 
     @field_validator("capture_layers", "steer_layers")
     @classmethod

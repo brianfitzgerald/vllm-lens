@@ -34,7 +34,8 @@ Settings in `additional_config["vllm_lens"]`:
 
 - `capture_layers`, `steer_layers`: the armed layers.
 - `steer_norm_match` (default `true`): `false` removes the norm table and its per-token norm; vectors with `norm_match=True` are then refused.
-- `capture_ring_tokens` (default `0`, which means twice `max_num_batched_tokens`): the rows of the GPU ring that holds captured rows until a thread writes them out.
+- `capture_ring_tokens` (default `0`, which means twice `max_num_batched_tokens`): the rows of the GPU ring that holds each step's captured rows until they are copied to the arena.
+- `capture_arena_gib` (default `4`): the shared-memory arena that holds captures until their readers release them.
 
 The plugin sets vLLM's `worker_cls` to `vllm_lens._graph_worker.GraphWorker` and `VLLM_USE_V2_MODEL_RUNNER=1`. The engine refuses to load with pipeline parallelism, micro-batching (DBO), prefill context parallelism, adaptive draft verification, sequence parallelism, Inductor graph partition or breakable CUDA graphs. `enforce_eager` is allowed and runs the same ops without graphs.
 
@@ -51,8 +52,8 @@ print(out.activations["residual_stream"].shape)  # (n_layers, n_positions, hidde
 ## How it works
 
 - Steering: the worker keeps one table of rows per request slot. When vLLM admits a request, the worker writes the request's summed vectors into its rows. Before each forward pass it fills one table row id per token. A forward hook on each steered layer adds the token's row with plain torch ops, which Inductor fuses into the compiled graph.
-- Capture: before each forward pass the worker gives each captured token a row of a GPU ring. A custom op on each captured layer writes the token's stream (`hidden + residual`) to that row inside the graph. After the pass, a thread copies the ring rows to pinned memory on its own CUDA stream and writes them to one file per request. The engine loop does no copy and no serialization.
-- Delivery: when a request finishes, the worker seals its file (a safetensors file of shape `(rows, n_layers, hidden)`). The front end maps the file and sends the activations in the response, or sends only its path.
+- Capture: before each forward pass the worker gives each captured token a row of a GPU ring. A custom op on each captured layer writes the token's stream (`hidden + residual`) to that row inside the graph. After the pass, one kernel on a side stream copies the step's ring rows into each request's chunk of a shared-memory arena that is registered with CUDA. The engine loop does no copy, no file write and no serialization.
+- Delivery: when a request finishes, a thread writes the chunk's header and a small marker file. The front end reads the chunk and sends the activations in the response, or sends only the marker path.
 
 ## Disabling the plugin
 
@@ -110,9 +111,9 @@ With async speculative decoding, a capture of generated positions (every positio
 
 - `"base64"` (default): the bytes, base64-encoded in the JSON body.
 - `"binary"`: a handle; the client fetches the bytes from `GET /v1/activations/{handle}`. The store is bounded (`VLLM_LENS_ACT_MAX_BYTES`, default 8 GiB) and per-entry TTL'd (`VLLM_LENS_ACT_TTL_S`, default 300 s), and it is per API-server process.
-- `"file"`: the path of the capture file and its row count. The response is sent without waiting for the file. The reader must be on the server's host; `decode_activations` and the client wait for the file and map it, and the caller removes it.
+- `"shm"`: the path of the capture's marker and its row count. The response is sent without waiting for the capture. The reader must be on the server's host; `decode_activations` and the client wait for the marker, copy the capture and release it. A reader of its own calls `vllm_lens._helpers._arena.read_capture(path)` (a view, valid until release) and `release_capture(path)`.
 
-The files go to `VLLM_LENS_CAPTURE_DIR` (default: a new directory in `/dev/shm`). `VLLM_LENS_CAPTURE_TIMEOUT` (default 120 s) sets how long the front end waits for a file. Activations are not compressed.
+The worker holds captures in a shared-memory arena (`capture_arena_gib`, default 4), after vLLM's IPC cache: the GPU copies each step's rows straight into the arena, and a reader releases each capture when done. A capture is never dropped: when the arena is full, the engine waits for readers. A capture that a reader leaves for longer than `VLLM_LENS_CAPTURE_TIMEOUT` (default 120 s, also how long the front end waits for a capture) is freed. The markers go to `VLLM_LENS_CAPTURE_DIR` (default: a new directory in `/dev/shm`). Activations are not compressed.
 
 ## Steering vectors
 

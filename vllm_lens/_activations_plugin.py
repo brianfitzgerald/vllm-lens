@@ -27,10 +27,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm_lens._cudagraph import LensGraphConfig
-from vllm_lens._helpers._capture_file import (
+from vllm_lens._helpers._arena import (
     CAPTURE_DIR_ENV,
     capture_path,
-    read_capture,
+    load_capture,
+    release_capture,
     wait_capture,
     wait_capture_async,
 )
@@ -55,7 +56,7 @@ if TYPE_CHECKING:
 
 # Seconds to wait for the worker to write a capture after its request finishes.
 _CAPTURE_TIMEOUT = float(os.environ.get("VLLM_LENS_CAPTURE_TIMEOUT", "120"))
-_TRANSPORTS = (None, "base64", "binary", "file")
+_TRANSPORTS = (None, "base64", "binary", "shm")
 # Keys of extra_args that only this plugin sets.
 _INTERNAL_KEYS = ("_steering_id", "_steer_rows", "_capture_key", "_lens_isolate_cache")
 
@@ -258,16 +259,13 @@ def _trim_activations(activations: dict[str, Any], expected_len: int) -> None:
         activations["residual_stream"] = rs[:, :expected_len]
 
 
-def _remove_capture(path: str) -> None:
-    """Remove the file of a capture nobody reads, once the worker writes it."""
+def _release_unread(path: str) -> None:
+    """Release a capture nobody reads, once the worker seals it."""
     try:
         wait_capture(path, _CAPTURE_TIMEOUT)
-        os.unlink(path)
-    except (TimeoutError, FileNotFoundError):
-        try:
-            os.unlink(path.removesuffix(".safetensors") + ".partial")
-        except FileNotFoundError:
-            pass
+        release_capture(path)
+    except TimeoutError:
+        pass
 
 
 def _serialize_for(
@@ -385,7 +383,7 @@ async def _patched_generate(
 
     Inline steering vectors reach the workers by RPC before generation; table rows ride in
     ``extra_args``. The worker writes the capture to a file; the final output waits for it,
-    or with ``activations_transport="file"`` carries only its path.
+    or with ``activations_transport="shm"`` carries only the path of its marker.
     """
     from vllm.v1.engine import EngineCoreRequest
 
@@ -429,14 +427,13 @@ async def _patched_generate(
                 expected = (
                     len(output.prompt_token_ids) + len(output.outputs[0].token_ids) - 1
                 )
-                if transport == "file":
-                    marker = {"transport": "file", "path": path, "rows": expected}
+                if transport == "shm":
+                    marker = {"transport": "shm", "path": path, "rows": expected}
                     output.activations = {"residual_stream": marker}
                     output._vllm_lens_serialized = {"residual_stream": marker}
                 else:
                     await wait_capture_async(path, _CAPTURE_TIMEOUT)
-                    activations = read_capture(path)
-                    os.unlink(path)
+                    activations = await asyncio.to_thread(load_capture, path)
                     _trim_activations(activations, expected)
                     output.activations = activations
                     output._vllm_lens_serialized = await asyncio.to_thread(
@@ -454,7 +451,7 @@ async def _patched_generate(
                 "clear_steering_table", args=(name, table_version)
             )
         if path is not None and not consumed:
-            threading.Thread(target=_remove_capture, args=(path,), daemon=True).start()
+            threading.Thread(target=_release_unread, args=(path,), daemon=True).start()
 
 
 def _prepare_offline_params(
@@ -505,9 +502,7 @@ def _finalize_offline_outputs(self: LLM, outputs: list, state: dict[str, Any]) -
     """Attach each output's capture, read from the file its worker wrote."""
     if not state["captures"]:
         return outputs
-    from vllm import envs
-
-    if not envs.VLLM_ENABLE_V1_MULTIPROCESSING:
+    if not int(os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1")):
         # An in-process engine stops when its requests finish; one more step passes their
         # finished ids to the workers, which seal the files.
         self.llm_engine.step()
@@ -519,8 +514,7 @@ def _finalize_offline_outputs(self: LLM, outputs: list, state: dict[str, Any]) -
             continue
         path = capture_path(directory, extra["_capture_key"], output.request_id)
         wait_capture(path, _CAPTURE_TIMEOUT)
-        activations = read_capture(path)
-        os.unlink(path)
+        activations = load_capture(path)
         n_prompt = len(output.prompt_token_ids)
         _trim_activations(activations, n_prompt + len(output.outputs[0].token_ids) - 1)
         output.activations = activations
