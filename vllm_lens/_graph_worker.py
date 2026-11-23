@@ -6,6 +6,7 @@ arena, one chunk per request."""
 from __future__ import annotations
 
 import collections
+import ctypes
 import logging
 import os
 import pickle
@@ -184,15 +185,19 @@ class _Capture:
         self.error: str | None = None
         # Whether every row this capture selects is written.
         self.done = False
+        # A capture of every position, which the per-index arrays of the worker plan.
+        self.full = not self.mean and self.selector is None
 
 
-class _Run(NamedTuple):
-    """Ring rows ``[start, start + rows)`` that go to chunk rows from ``file_row``."""
+class _Runs(NamedTuple):
+    """A step's runs: ring rows ``[start, start + rows)`` go to arena element ``dest``, with
+    ``kept`` layers of runner index ``index``."""
 
-    capture: _Capture
-    start: int
-    rows: int
-    file_row: int
+    start: np.ndarray
+    rows: np.ndarray
+    dest: np.ndarray
+    kept: np.ndarray
+    index: np.ndarray
 
 
 # The counts change every step; a specialization per value class would compile again.
@@ -243,6 +248,23 @@ def _gather_kernel(
             )
 
 
+class _Location(ctypes.Structure):
+    """The driver's ``CUmemLocation``."""
+
+    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+
+
+class _CopyAttributes(ctypes.Structure):
+    """The driver's ``CUmemcpyAttributes``."""
+
+    _fields_ = [
+        ("order", ctypes.c_int),
+        ("source", _Location),
+        ("destination", _Location),
+        ("flags", ctypes.c_uint),
+    ]
+
+
 # Programs of the gather kernel, which copies captures of a subset of the layers.
 _GATHER_PROGRAMS = int(os.environ.get("VLLM_LENS_GATHER_PROGRAMS", "132"))
 
@@ -291,6 +313,40 @@ class _Drain:
         )
         self.events: list[torch.cuda.Event | None] = [None, None]
         self.slot = 0
+        # The descriptors of one batch copy, at most one run per request.
+        self.dsts = np.zeros(max_reqs, dtype=np.uint64)
+        self.srcs = np.zeros(max_reqs, dtype=np.uint64)
+        self.sizes = np.zeros(max_reqs, dtype=np.uint64)
+        # Stream order, a device source, a host destination and overlap with compute.
+        self.attributes = _CopyAttributes(
+            1, _Location(1, ring.device.index or 0), _Location(2, 0), 1
+        )
+        self.attribute_index = np.zeros(1, dtype=np.uint64)
+        self.failed = ctypes.c_size_t()
+        self.batch: Any = None
+        self.batch_v1 = False
+        if os.environ.get("VLLM_LENS_BATCH_COPY", "1") != "0":
+            try:
+                driver: Any = ctypes.CDLL("libcuda.so.1")
+            except OSError:
+                driver = None
+            for name, v1 in (
+                ("cuMemcpyBatchAsync_v2", False),
+                ("cuMemcpyBatchAsync", True),
+            ):
+                function = getattr(driver, name, None)
+                if function is not None:
+                    function.restype = ctypes.c_int
+                    function.argtypes = [ctypes.c_void_p] * 3 + [
+                        ctypes.c_size_t,
+                        ctypes.c_void_p,
+                        ctypes.c_void_p,
+                        ctypes.c_size_t,
+                        *([ctypes.c_void_p] if v1 else []),
+                        ctypes.c_void_p,
+                    ]
+                    self.batch, self.batch_v1 = function, v1
+                    break
         self.seals: queue.SimpleQueue[Any] = queue.SimpleQueue()
         self.error: BaseException | None = None
         self.thread = threading.Thread(
@@ -324,53 +380,76 @@ class _Drain:
         """Free the segment of a step that failed."""
         self.live.pop()
 
-    def launch(self, after: torch.cuda.Event, runs: list[_Run]) -> None:
-        """Copy the runs of the last segment to their chunks once ``after`` completes. A
-        run of every capture layer is one copy on the GPU's copy engines, which leaves the
-        SMs to the forward pass; runs of fewer layers share one gather kernel."""
+    def launch(
+        self, after: torch.cuda.Event, runs: _Runs | None, keep: np.ndarray
+    ) -> None:
+        """Copy the runs of the last segment to their chunks once ``after`` completes. Runs
+        of every capture layer go to the copy engines in one batch, which leaves the SMs to
+        the forward pass; runs of fewer layers share one gather kernel."""
         segment = self.live[-1]
-        if not runs:
+        if runs is None or not len(runs.start):
             segment[2] = after
             return
-        every = len(self.layers)
-        row_elements = every * self.hidden
-        element = self.ring.element_size()
-        partial = [run for run in runs if len(run.capture.keep) < every]
+        full = runs.kept == len(self.layers)
         with torch.cuda.stream(self.stream):
             self.stream.wait_event(after)
-            for run in runs:
-                if len(run.capture.keep) < every:
-                    continue
-                start = (run.capture.chunk[2] + HEADER_BYTES) // element
-                start += run.file_row * row_elements
-                count = run.rows * row_elements
-                self.elements[start : start + count].copy_(
-                    self.ring[run.start : run.start + run.rows].view(-1),
-                    non_blocking=True,
-                )
-            if partial:
-                self._gather(partial)
+            if full.any():
+                self._copy(runs.start[full], runs.rows[full], runs.dest[full])
+            if not full.all():
+                self._gather(runs, np.flatnonzero(~full), keep)
             done = torch.cuda.Event()
             done.record(self.stream)
         segment[2] = done
 
-    def _gather(self, runs: list[_Run]) -> None:
-        """Copy runs of fewer than every capture layer with one kernel, on the side stream."""
+    def _copy(self, start: np.ndarray, rows: np.ndarray, dest: np.ndarray) -> None:
+        """Copy whole ring rows to the arena with one batch call, or one copy per run when
+        the driver has no batch call."""
+        element = self.ring.element_size()
+        row_bytes = self.ring.stride(0) * element
+        n = len(start)
+        self.dsts[:n] = self.elements.data_ptr() + dest * element
+        self.srcs[:n] = self.ring.data_ptr() + start * row_bytes
+        self.sizes[:n] = rows * row_bytes
+        if self.batch is not None:
+            code = self.batch(
+                self.dsts.ctypes.data,
+                self.srcs.ctypes.data,
+                self.sizes.ctypes.data,
+                n,
+                ctypes.byref(self.attributes),
+                self.attribute_index.ctypes.data,
+                1,
+                *([ctypes.byref(self.failed)] if self.batch_v1 else []),
+                self.stream.cuda_stream,
+            )
+            if code == 0:
+                return
+            logger.warning(
+                "cuMemcpyBatchAsync returned %d; the capture copies go one per run",
+                code,
+            )
+            self.batch = None
+        row_elements = self.ring.stride(0)
+        for first, count, target in zip(start.tolist(), rows.tolist(), dest.tolist()):
+            self.elements[target : target + count * row_elements].copy_(
+                self.ring[first : first + count].view(-1), non_blocking=True
+            )
+
+    def _gather(self, runs: _Runs, chosen: np.ndarray, keep: np.ndarray) -> None:
+        """Copy the ``chosen`` runs, of fewer than every capture layer, with one kernel."""
         slot = self.slot = self.slot ^ 1
         previous = self.events[slot]
         if previous is not None:
             previous.synchronize()
         table = self.host_runs[slot].numpy()
-        keep = self.host_keep[slot].numpy()
-        first = 0
-        for i, run in enumerate(runs):
-            kept = len(run.capture.keep)
-            data = run.capture.chunk[2] + HEADER_BYTES
-            dest = data // self.ring.element_size() + run.file_row * kept * self.hidden
-            table[i] = (run.start, first, dest, kept)
-            keep[i, :kept] = run.capture.keep
-            first += run.rows
-        n = len(runs)
+        n = len(chosen)
+        rows = runs.rows[chosen]
+        table[:n, 0] = runs.start[chosen]
+        table[:n, 1] = np.cumsum(rows) - rows
+        table[:n, 2] = runs.dest[chosen]
+        table[:n, 3] = runs.kept[chosen]
+        self.host_keep[slot].numpy()[:n] = keep[runs.index[chosen]]
+        first = int(rows.sum())
         block = 1024
         self.runs[:n].copy_(self.host_runs[slot][:n], non_blocking=True)
         self.keep[:n].copy_(self.host_keep[slot][:n], non_blocking=True)
@@ -587,6 +666,13 @@ class GraphWorker(Worker):
         )
         self._every = np.zeros(max_reqs, dtype=np.int64)
         self._positional: dict[int, np.ndarray] = {}
+        # Per runner index: the chunk rows of a capture of every position (0 for none), the
+        # rows it wrote, and each capture's arena element offset and kept layers.
+        self._full_max = np.zeros(max_reqs, dtype=np.int64)
+        self._full_rows = np.zeros(max_reqs, dtype=np.int64)
+        self._dest = np.zeros(max_reqs, dtype=np.int64)
+        self._kept = np.zeros(max_reqs, dtype=np.int64)
+        self._keep = np.zeros((max_reqs, max(1, len(capture_layers))), dtype=np.int32)
         self._mean = torch.zeros(
             (max_reqs if capture_layers else 0, len(capture_layers), hidden),
             dtype=torch.float32,
@@ -648,9 +734,13 @@ class GraphWorker(Worker):
             preempted = scheduler_output.preempted_req_ids or set()
             for req_id in scheduler_output.finished_req_ids | preempted:
                 index = runner.req_states.req_id_to_index.get(req_id)
+                capture = self._captures.get(req_id)
                 if index is not None:
                     self._every[index] = 0
                     self._positional.pop(index, None)
+                    if capture is not None and capture.full:
+                        capture.rows = max(capture.rows, int(self._full_rows[index]))
+                    self._full_max[index] = 0
                 if req_id in preempted:
                     continue
                 extras.pop(req_id, None)
@@ -718,7 +808,7 @@ class GraphWorker(Worker):
                 self._meta[1, : self._meta_length].fill_(self._sentinel)
                 event = torch.cuda.Event()
                 event.record()
-                self._drain.launch(event, runs)
+                self._drain.launch(event, runs, self._keep)
             return out
 
         runner.add_requests = _add_requests
@@ -938,28 +1028,58 @@ class GraphWorker(Worker):
                     logger.warning(capture.error)
                 else:
                     capture.chunk = chunk
+        if capture.error is None:
+            kept = len(capture.keep)
+            self._dest[index] = (
+                capture.chunk[2] + HEADER_BYTES
+            ) // self._lens_dtype.itemsize
+            self._kept[index] = kept
+            self._keep[index, :kept] = capture.keep
+            if capture.full:
+                self._full_max[index] = capture.rows_max
+                self._full_rows[index] = capture.rows
         self._mean[index].zero_()
 
     def _plan(
         self, step: _Step
-    ) -> tuple[list[_Run] | None, list[tuple[int, int, int, bool]]]:
+    ) -> tuple[_Runs | None, list[tuple[int, int, int, bool]]]:
         """Fill this step's per-token table and ring rows and copy them to the device; return
         the ring runs to write (None without capture rows) and each mean's prompt rows."""
         bounds = step.bounds
         n = int(bounds[-1])
         captured = [
-            (i, self._captures[req_id])
+            (i, capture)
             for i, req_id in enumerate(step.req_ids)
-            if req_id in self._captures and not self._captures[req_id].done
+            if (capture := self._captures.get(req_id)) is not None
+            and not capture.done
+            and not capture.full
         ]
         positional = [
             i for i, index in enumerate(step.req_idx) if int(index) in self._positional
         ]
-        signature = (tuple(step.req_ids), bounds.tobytes())
-        if not captured and not positional and signature == self._meta_signature:
-            return None, []
-        self._meta_signature = None if captured or positional else signature
         counts = np.diff(bounds)
+        # The batch rows of captures of every position, and the rows each writes this step.
+        full_max = self._full_max[step.req_idx]
+        full = np.flatnonzero(full_max)
+        full_first = step.computed[full].astype(np.int64)
+        full_count = np.minimum(counts[full], full_max[full] - full_first)
+        writes = full_count > 0
+        full, full_first, full_count = (
+            full[writes],
+            full_first[writes],
+            full_count[writes],
+        )
+        signature = (tuple(step.req_ids), bounds.tobytes())
+        if (
+            not captured
+            and not positional
+            and not len(full)
+            and signature == self._meta_signature
+        ):
+            return None, []
+        self._meta_signature = (
+            None if captured or positional or len(full) else signature
+        )
         n_reqs = len(step.req_ids)
         slot = self._meta_slot = self._meta_slot ^ 1
         self._meta_events[slot].synchronize()
@@ -981,12 +1101,11 @@ class GraphWorker(Worker):
             patches[0, 0, k : k + len(inside)] = bounds[i] + inside - first
             patches[0, 1, k : k + len(inside)] = 2 * index + 2
             patched[0] += len(inside)
-        runs: list[_Run] | None = None
+        runs: _Runs | None = None
         pooled: list[tuple[int, int, int, bool]] = []
         # Each capture's batch row, its batch rows (None for a run from the row's start, or
-        # explicit rows), count, file row (-1 for a mean), runner index and whether its mean
-        # starts again.
-        wanted: list[tuple[_Capture, int, np.ndarray | None, int, int, int, bool]] = []
+        # explicit rows), count, file row (-1 for a mean) and whether its mean starts again.
+        wanted: list[tuple[int, np.ndarray | None, int, int, bool]] = []
         for i, capture in captured:
             first = int(step.computed[i])
             count = int(counts[i])
@@ -994,29 +1113,23 @@ class GraphWorker(Worker):
                 high = min(first + count, capture.prompt_len)
                 capture.done = high >= capture.prompt_len
                 if high > first:
-                    index = int(step.req_idx[i])
-                    wanted.append(
-                        (capture, i, None, high - first, -1, index, first == 0)
-                    )
-            elif capture.selector is None:
-                count = min(count, capture.rows_max - first)
-                if count > 0:
-                    wanted.append((capture, i, None, count, first, 0, False))
-                    capture.rows = max(capture.rows, first + count)
+                    wanted.append((i, None, high - first, -1, first == 0))
             else:
+                assert capture.selector is not None
                 low = int(np.searchsorted(capture.selector, first))
                 high = int(np.searchsorted(capture.selector, first + count))
                 capture.done = high == len(capture.selector)
                 if high > low:
                     rows = int(bounds[i]) + capture.selector[low:high] - first
-                    wanted.append((capture, i, rows, high - low, low, 0, False))
+                    wanted.append((i, rows, high - low, low, False))
                     capture.rows = max(capture.rows, high)
-        total = sum(item[3] for item in wanted)
+        total = sum(item[2] for item in wanted) + int(full_count.sum())
         if total:
             assert self._drain is not None
             offset = self._drain.take(total)
-            runs = []
-            for capture, i, rows, count, file_row, index, reset in wanted:
+            # Rows of runs from the Python plan: ring start, rows, file row, batch row.
+            listed: list[tuple[int, int, int, int]] = []
+            for i, rows, count, file_row, reset in wanted:
                 if rows is None or count == 1:
                     plan[RING, i] = offset
                     plan[SKIP, i] = 0 if rows is None else rows[0] - bounds[i]
@@ -1027,10 +1140,25 @@ class GraphWorker(Worker):
                     patches[1, 1, k : k + count] = np.arange(offset, offset + count)
                     patched[1] += count
                 if file_row < 0:
-                    pooled.append((index, offset, count, reset))
+                    pooled.append((int(step.req_idx[i]), offset, count, reset))
                 else:
-                    runs.append(_Run(capture, offset, count, file_row))
+                    listed.append((offset, count, file_row, i))
                 offset += count
+            full_start = offset + np.cumsum(full_count) - full_count
+            plan[RING, full] = full_start
+            plan[COUNT, full] = full_count
+            table = np.asarray(listed, dtype=np.int64).reshape(-1, 4)
+            start = np.concatenate([table[:, 0], full_start])
+            run_rows = np.concatenate([table[:, 1], full_count])
+            file_row = np.concatenate([table[:, 2], full_first])
+            index = step.req_idx[np.concatenate([table[:, 3], full])].astype(np.int64)
+            full_index = index[len(table) :]
+            self._full_rows[full_index] = np.maximum(
+                self._full_rows[full_index], full_first + full_count
+            )
+            kept = self._kept[index]
+            dest = self._dest[index] + file_row * kept * self._lens_hidden
+            runs = _Runs(start, run_rows, dest, kept, index)
         length = max(n, self._meta_length)
         self._plan_table.copy_(self._host_plan[slot], non_blocking=True)
         route_kernel[(triton.cdiv(length, 256),)](  # type: ignore[reportIndexIssue]
