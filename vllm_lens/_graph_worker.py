@@ -669,7 +669,84 @@ class GraphWorker(Worker):
         runner.finish_requests = _finish_requests
         runner.prepare_inputs = _prepare_inputs
         runner.execute_model = _execute_model
+        from vllm.model_executor.layers.layernorm import RMSNorm
+
+        import vllm_lens._fused_norm  # noqa: F401
+
+        last = max(layer_map)
+        final_norm = None
+        for module in runner.model.modules():
+            layers: Any = getattr(module, "layers", None)
+            if isinstance(layers, torch.nn.ModuleList) and any(
+                member is layer_map[last] for member in layers
+            ):
+                final_norm = getattr(module, "norm", None)
+        fused: list[int] = []
+        dummy = torch.zeros((1, hidden), dtype=dtype, device=device)
+        for layer_idx in sorted({*steer_layers, *capture_layers}):
+            following: Any = (
+                final_norm
+                if layer_idx == last
+                else getattr(layer_map.get(layer_idx + 1), "input_layernorm", None)
+            )
+            if (
+                os.environ.get("VLLM_LENS_FUSED_NORM", "1") == "0"
+                or type(following) is not RMSNorm
+                or following.variance_size_override is not None
+                or not following.has_weight
+            ):
+                continue
+            steer = steer_layers.index(layer_idx) if layer_idx in steer_layers else None
+            capture = (
+                capture_layers.index(layer_idx) if layer_idx in capture_layers else None
+            )
+            following.register_buffer("_lens_ids", self._meta[0], persistent=False)
+            following.register_buffer("_lens_dest", self._meta[1], persistent=False)
+            following.register_buffer(
+                "_lens_add",
+                None if steer is None else self._add[:, steer],
+                persistent=False,
+            )
+            following.register_buffer(
+                "_lens_norm",
+                None if steer is None or self._norm is None else self._norm[:, steer],
+                persistent=False,
+            )
+            following.register_buffer(
+                "_lens_ring",
+                dummy if capture is None else ring[:, capture],
+                persistent=False,
+            )
+            following._lens_capture = capture is not None
+            original = following.forward
+
+            def forward(
+                x: torch.Tensor,
+                residual: torch.Tensor | None = None,
+                _module: Any = following,
+                _original: Any = original,
+            ) -> Any:
+                """The next norm, with the armed layer's steering and capture fused in."""
+                if residual is None:
+                    return _original(x)
+                return torch.ops.vllm_lens.lens_norm(
+                    x,
+                    residual,
+                    _module.weight,
+                    _module.variance_epsilon,
+                    _module._lens_add,
+                    _module._lens_norm,
+                    _module._lens_ids,
+                    _module._lens_ring,
+                    _module._lens_dest,
+                    _module._lens_capture,
+                )
+
+            following.forward = forward
+            fused.append(layer_idx)
         for k, layer_idx in enumerate(steer_layers):
+            if layer_idx in fused:
+                continue
             layer = layer_map[layer_idx]
             layer.register_buffer("_lens_ids", self._meta[0], persistent=False)
             layer.register_buffer("_lens_add", self._add[:, k], persistent=False)
@@ -678,16 +755,20 @@ class GraphWorker(Worker):
             # Registered first, so a layer steers before it captures.
             layer.register_forward_hook(_steer_hook)
         for k, layer_idx in enumerate(capture_layers):
+            if layer_idx in fused:
+                continue
             layer = layer_map[layer_idx]
             layer.register_buffer("_lens_ring", ring[:, k], persistent=False)
             layer.register_buffer("_lens_dest", self._meta[1], persistent=False)
             layer.register_forward_hook(_capture_hook)
         logger.info(
-            "vllm-lens: steer layers %s (norm_match %s), capture layers %s, ring %d rows",
+            "vllm-lens: steer layers %s (norm_match %s), capture layers %s, ring %d rows, "
+            "fused into the next norm: %s",
             steer_layers,
             config.steer_norm_match,
             capture_layers,
             self._sentinel,
+            fused,
         )
 
     def _admit(
