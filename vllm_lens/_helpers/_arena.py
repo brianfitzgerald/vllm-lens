@@ -49,6 +49,10 @@ def capture_path(
     return os.path.join(directory, f"{name}.lens{'.partial' if partial else ''}")
 
 
+# The longest an allocation waits for a reader to release the oldest chunk.
+ARENA_WAIT_S = 0.02
+
+
 class Arena:
     """The writer's arena: vLLM's single-writer shared-memory ring, registered with CUDA so
     the GPU copies rows straight into it."""
@@ -72,6 +76,8 @@ class Arena:
         if int(code) != 0:
             raise RuntimeError(f"cudaHostRegister of the capture arena failed: {code}")
         self._warned = False
+        # The oldest chunk a wait gave up on; allocations do not wait on it again.
+        self._given_up: int | None = None
         # Remove the shared memory when the process exits.
         atexit.register(self.ring.close)
 
@@ -83,10 +89,11 @@ class Arena:
 
     def allocate(self, nbytes: int) -> tuple[int, int, int] | None:
         """A chunk of at least ``nbytes`` data bytes, as its address, monotonic id and data
-        offset in the arena. Waits while the oldest chunk is sealed, for its reader to release
-        it; returns None when the oldest chunk belongs to a request still running, since
-        waiting on the engine loop would stop that request from finishing."""
+        offset in the arena, or None when it does not fit. Waits up to ``ARENA_WAIT_S`` once per
+        oldest chunk for its reader to release it, so a slow reader does not stop the engine
+        loop; does not wait on a chunk of a request still running, which could not finish."""
         size = -(-(nbytes + _CHUNK_MD) // ALIGN) * ALIGN - _CHUNK_MD
+        deadline = time.monotonic() + ARENA_WAIT_S
         while True:
             try:
                 address, ident = self.ring.allocate_buf(size)
@@ -97,15 +104,22 @@ class Arena:
                 address, ident = self.ring.allocate_buf(size)
                 break
             except MemoryError:
-                head = self.ring.metadata.get(self.ring.monotonic_id_start)
+                start = self.ring.monotonic_id_start
+                head = self.ring.metadata.get(start)
                 if head is None or not self.bytes[head % self.size + _CHUNK_MD]:
                     return None
-                if not self._warned:
-                    self._warned = True
-                    logging.getLogger("vllm.lens").warning(
-                        "vllm-lens: the capture arena is full; waiting for readers to "
-                        "release captures (capture_arena_gib sets its size)."
-                    )
+                if start == self._given_up:
+                    return None
+                if time.monotonic() > deadline:
+                    self._given_up = start
+                    if not self._warned:
+                        self._warned = True
+                        logging.getLogger("vllm.lens").warning(
+                            "vllm-lens: the capture arena is full of captures that readers "
+                            "have not released; captures that do not fit fail "
+                            "(capture_arena_gib sets its size)."
+                        )
+                    return None
                 time.sleep(0.001)
         offset = address % self.size + _CHUNK_MD
         # A reused chunk may hold an old header.

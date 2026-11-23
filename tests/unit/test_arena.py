@@ -103,3 +103,23 @@ def test_a_full_arena_of_running_captures_does_not_wait(arena):
     finishing, so allocation returns None at once."""
     assert arena.allocate(arena.size // 2) is not None
     assert arena.allocate(arena.size // 2) is None
+
+
+def test_a_full_arena_of_unreleased_captures_waits_once(arena, tmp_path):
+    """When the oldest chunk is sealed but not released, allocation waits briefly once,
+    then fails at once while that chunk stays the oldest."""
+    import time
+
+    from vllm_lens._helpers._arena import ARENA_WAIT_S
+
+    address, ident, offset = arena.allocate(arena.size // 2)
+    path = capture_path(str(tmp_path), "key", "req-full")
+    header = {"dtype": "bfloat16", "rows": 0, "layers": [0], "hidden": 4}
+    arena.seal(path, address, ident, offset, header, None, 0)
+    assert arena.allocate(arena.size // 4) is not None
+    timings = []
+    for _ in range(2):
+        start = time.monotonic()
+        assert arena.allocate(arena.size // 2) is None
+        timings.append(time.monotonic() - start)
+    assert timings[0] >= ARENA_WAIT_S and timings[1] < ARENA_WAIT_S / 2
