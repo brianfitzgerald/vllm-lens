@@ -202,9 +202,14 @@ def test_the_steer_hook_adds_table_rows(dtype, fused, matched):
         delta = delta + norm[ids[:4]] * stream.float().norm(dim=-1, keepdim=True)
     output = hidden_states if residual is None else (hidden_states, residual)
     out = _steer_hook(module, (), output)
-    steered = out if residual is None else out[0]
-    torch.testing.assert_close(steered, hidden_states + delta.to(dtype))
-    assert torch.equal(steered[1], hidden_states[1])
+    if residual is None:
+        torch.testing.assert_close(out, hidden_states + delta.to(dtype))
+        assert torch.equal(out[1], hidden_states[1])
+    else:
+        # A fused layer gets the rows on its residual, so its stream holds them.
+        assert torch.equal(out[0], hidden_states)
+        torch.testing.assert_close(out[1], residual + delta.to(dtype))
+        assert torch.equal(out[1][1], residual[1])
 
 
 def test_positional_rows_add_the_every_token_rows():
