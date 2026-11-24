@@ -34,7 +34,7 @@ from vllm_lens._helpers._positions import LAST_PROMPT_TOKEN, POSITIONS_KEY
 from vllm_lens._helpers._serialize import deserialize_tensor
 from vllm_lens._helpers.types import SteeringVector
 from vllm_lens._layers import _discover_layer_modules
-from vllm_lens._route import COUNT, PATCHES, RING, SKIP, STEER
+from vllm_lens._route import COUNT, PATCHES, RING, SKIP
 
 logger = logging.getLogger("vllm.lens")
 
@@ -143,6 +143,8 @@ def _route_hook(module: Any, args: Any, kwargs: Any) -> None:
         if isinstance(value, torch.Tensor) and value.is_floating_point():
             torch.ops.vllm_lens.route(
                 module._lens_plan,
+                module._lens_rows,
+                module._lens_batch_idx,
                 module._lens_starts,
                 module._lens_meta,
                 module._lens_patches,
@@ -723,14 +725,17 @@ class GraphWorker(Worker):
         self._meta = torch.tensor(
             [[0], [self._sentinel]], dtype=torch.int64, device=device
         ).repeat(1, max_tokens)
-        # Each step's plan, one column per batch row (see _route), and its patches: sorted
-        # tokens and values for position-list steering rows and ring rows. The route op in
-        # the graph reads them. Two pinned copies, so a step never writes the one the last
-        # copy reads.
-        self._plan_table = torch.zeros((5, max_reqs), dtype=torch.int64, device=device)
+        # The steering row of each runner index, and the runner index of each batch row.
+        self._steer_rows = torch.zeros(max_reqs, dtype=torch.int64, device=device)
+        self._batch_idx = torch.zeros(max_reqs, dtype=torch.int64, device=device)
+        # The capture plan of a step with slow rows, one column per batch row (see _route),
+        # and its patches: sorted tokens and values for position-list steering rows and
+        # ring rows. The route op in the graph reads them. Two pinned copies, so a step
+        # never writes the one the last copy reads.
+        self._plan_table = torch.zeros((4, max_reqs), dtype=torch.int64, device=device)
         self._plan_table[RING] = -1
         self._host_plan = [
-            torch.zeros((5, max_reqs), dtype=torch.int64).pin_memory() for _ in range(2)
+            torch.zeros((4, max_reqs), dtype=torch.int64).pin_memory() for _ in range(2)
         ]
         self._patches = torch.zeros(
             (2, 2, max_tokens), dtype=torch.int64, device=device
@@ -741,10 +746,9 @@ class GraphWorker(Worker):
         ]
         self._meta_events = [torch.cuda.Event() for _ in range(2)]
         self._meta_slot = 0
-        self._meta_signature: tuple | None = None
 
         extras: dict[str, dict[str, Any]] = {}
-        pending: dict[str, Any] = {"runs": None, "pooled": []}
+        pending: dict[str, Any] = {"runs": None, "pooled": [], "planned": False}
         add_requests = runner.add_requests
         finish_requests = runner.finish_requests
         prepare_inputs = runner.prepare_inputs
@@ -758,7 +762,9 @@ class GraphWorker(Worker):
                 index = runner.req_states.req_id_to_index.get(req_id)
                 capture = self._captures.get(req_id)
                 if index is not None:
-                    self._every[index] = 0
+                    if self._every[index]:
+                        self._every[index] = 0
+                        self._steer_rows[index].zero_()
                     self._slow[index] = False
                     self._positional.pop(index, None)
                     if capture is not None and capture.full:
@@ -791,11 +797,16 @@ class GraphWorker(Worker):
             return out
 
         def _prepare_inputs(*args: Any, **kwargs: Any) -> Any:
-            """Build the step from V2's input batch and plan its ids and ring rows."""
+            """Give the route op the batch's runner indices, and plan the step's ring rows and
+            patches when a batch row needs the Python path."""
             input_batch = prepare_inputs(*args, **kwargs)
             n = int(input_batch.num_reqs)
-            req_ids = list(input_batch.req_ids[:n])
+            self._batch_idx[:n].copy_(input_batch.idx_mapping[:n], non_blocking=True)
             req_idx = input_batch.idx_mapping_np[:n]
+            if not (self._slow[req_idx].any() or self._full_max[req_idx].any()):
+                return input_batch
+            req_ids = list(input_batch.req_ids[:n])
+            pending["planned"] = True
             pending["runs"], pending["pooled"] = self._plan(
                 _Step(
                     req_ids,
@@ -811,7 +822,7 @@ class GraphWorker(Worker):
         def _execute_model(*args: Any, **kwargs: Any) -> Any:
             """Run V2's step, then add its prompt rows to the means and copy its ring rows
             to the arena."""
-            pending["runs"], pending["pooled"] = None, []
+            pending["runs"], pending["pooled"], pending["planned"] = None, [], False
             try:
                 out = execute_model(*args, **kwargs)
             except BaseException:
@@ -819,6 +830,9 @@ class GraphWorker(Worker):
                     assert self._drain is not None
                     self._drain.drop()
                 raise
+            if pending["planned"]:
+                # A dummy forward pass or a step without a plan writes no ring rows.
+                self._plan_table[COUNT:].zero_()
             runs = pending["runs"]
             if runs is not None:
                 assert self._drain is not None
@@ -827,8 +841,6 @@ class GraphWorker(Worker):
                     if reset:
                         self._mean[index].zero_()
                     self._mean[index] += ring[start : start + count].float().sum(0)
-                # A dummy forward pass before the next plan writes no ring rows.
-                self._plan_table[COUNT:].zero_()
                 event = torch.cuda.Event()
                 event.record()
                 self._drain.launch(event, runs, self._keep)
@@ -930,6 +942,8 @@ class GraphWorker(Worker):
             layer.register_forward_hook(_capture_hook)
         first = layer_map[min(layer_map)]
         first.register_buffer("_lens_plan", self._plan_table, persistent=False)
+        first.register_buffer("_lens_rows", self._steer_rows, persistent=False)
+        first.register_buffer("_lens_batch_idx", self._batch_idx, persistent=False)
         first.register_buffer(
             "_lens_starts", runner.input_buffers.query_start_loc, persistent=False
         )
@@ -1004,6 +1018,7 @@ class GraphWorker(Worker):
                     else:
                         self._norm[2 * index + offset].copy_(norm)
             self._every[index] = 2 * index + 1
+            self._steer_rows[index].fill_(2 * index + 1)
             if prepared.positions is not None:
                 self._positional[index] = prepared.positions
                 self._slow[index] = True
@@ -1076,7 +1091,7 @@ class GraphWorker(Worker):
     def _plan(
         self, step: _Step
     ) -> tuple[_Runs | None, list[tuple[int, int, int, bool]]]:
-        """Fill this step's per-request plan and patches and copy them to the device, where
+        """Fill this step's capture plan and patches and copy them to the device, where
         the route op expands them; return the ring runs to write (None without capture
         rows) and each mean's prompt rows."""
         bounds = step.bounds
@@ -1101,23 +1116,11 @@ class GraphWorker(Worker):
             full_first[writes],
             full_count[writes],
         )
-        signature = (tuple(step.req_ids), bounds.tobytes())
-        if (
-            not captured
-            and not positional
-            and not len(full)
-            and signature == self._meta_signature
-        ):
-            return None, []
-        self._meta_signature = (
-            None if captured or positional or len(full) else signature
-        )
         n_reqs = len(step.req_ids)
         slot = self._meta_slot = self._meta_slot ^ 1
         self._meta_events[slot].synchronize()
         plan = self._host_plan[slot].numpy()
         patches = self._host_patches[slot].numpy()
-        plan[STEER, :n_reqs] = self._every[step.req_idx]
         plan[RING, :n_reqs] = -1
         plan[SKIP, :n_reqs] = 0
         plan[COUNT, :n_reqs] = 0

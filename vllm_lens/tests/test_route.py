@@ -8,7 +8,7 @@ import torch
 @pytest.mark.parametrize("seed", [0, 1, 2])
 @pytest.mark.parametrize("padding", [0, 9])
 def test_route_matches_the_per_token_plan(seed, padding):
-    from vllm_lens._route import COUNT, PATCHES, RING, SKIP, STEER, _route
+    from vllm_lens._route import COUNT, PATCHES, RING, SKIP, _route
 
     generator = torch.Generator().manual_seed(seed)
     n_reqs, max_reqs, max_tokens, sentinel = 6, 16, 128, 99
@@ -20,10 +20,11 @@ def test_route_matches_the_per_token_plan(seed, padding):
     # The runner's query_start_loc: rows past the batch start at the token count.
     starts = torch.full((max_reqs + 1,), n, dtype=torch.int32)
     starts[: n_reqs + 1] = torch.tensor(bounds)
-    plan = torch.zeros((5, max_reqs), dtype=torch.int64)
-    # Stale rows past the batch must not reach any token.
-    plan[STEER] = 77
-    plan[STEER, :n_reqs] = torch.randint(0, 13, (n_reqs,), generator=generator)
+    # Each runner index's steering row, and a shuffled runner index per batch row; stale
+    # rows past the batch must not reach any token.
+    rows = torch.randint(0, 13, (max_reqs,), generator=generator)
+    batch_idx = torch.randperm(max_reqs, generator=generator)
+    plan = torch.zeros((4, max_reqs), dtype=torch.int64)
     plan[RING] = 5
     plan[RING, :n_reqs] = -1
     plan[COUNT] = 50
@@ -47,14 +48,23 @@ def test_route_matches_the_per_token_plan(seed, padding):
     expected[1, :total] = sentinel
     for b in range(n_reqs):
         for t in range(bounds[b], bounds[b + 1]):
-            expected[0, t] = plan[STEER, b]
+            expected[0, t] = rows[batch_idx[b]]
             offset = t - bounds[b] - int(plan[SKIP, b])
             if plan[RING, b] >= 0 and 0 <= offset < plan[COUNT, b]:
                 expected[1, t] = plan[RING, b] + offset
     expected[0, steered] = 40
     expected[1, rowed] = torch.arange(60, 60 + len(rowed))
     meta = torch.full((2, total + 5), -7, dtype=torch.int64, device="cuda")
-    _route(plan.cuda(), starts.cuda(), meta, patches.cuda(), total, sentinel)
+    _route(
+        plan.cuda(),
+        rows.cuda(),
+        batch_idx.cuda(),
+        starts.cuda(),
+        meta,
+        patches.cuda(),
+        total,
+        sentinel,
+    )
     assert torch.equal(meta.cpu(), expected)
 
 
@@ -65,14 +75,15 @@ def test_route_does_not_compile_again_for_new_counts():
 
     from vllm_lens._route import _route
 
-    plan = torch.zeros((5, 64), dtype=torch.int64, device="cuda")
+    plan = torch.zeros((4, 64), dtype=torch.int64, device="cuda")
+    rows = torch.zeros(64, dtype=torch.int64, device="cuda")
     starts = torch.zeros(65, dtype=torch.int32, device="cuda")
     meta = torch.zeros((2, 512), dtype=torch.int64, device="cuda")
     patches = torch.zeros((2, 2, 512), dtype=torch.int64, device="cuda")
 
     def launch(n_tokens: int) -> float:
         start = time.perf_counter()
-        _route(plan, starts, meta, patches, n_tokens, 99)
+        _route(plan, rows, rows, starts, meta, patches, n_tokens, 99)
         torch.cuda.synchronize()
         return time.perf_counter() - start
 
