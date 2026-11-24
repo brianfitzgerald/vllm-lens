@@ -211,13 +211,13 @@ class _Capture:
 
 class _Runs(NamedTuple):
     """A step's runs: ring rows ``[start, start + rows)`` go to arena element ``dest``, with
-    ``kept`` layers of runner index ``index``."""
+    ``kept`` layers of runner index ``owner``."""
 
     start: np.ndarray
     rows: np.ndarray
     dest: np.ndarray
     kept: np.ndarray
-    index: np.ndarray
+    owner: np.ndarray
 
 
 # The counts change every step; a specialization per value class would compile again.
@@ -468,7 +468,7 @@ class _Drain:
         table[:n, 1] = np.cumsum(rows) - rows
         table[:n, 2] = runs.dest[chosen]
         table[:n, 3] = runs.kept[chosen]
-        self.host_keep[slot].numpy()[:n] = keep[runs.index[chosen]]
+        self.host_keep[slot].numpy()[:n] = keep[runs.owner[chosen]]
         first = int(rows.sum())
         block = 1024
         self.runs[:n].copy_(self.host_runs[slot][:n], non_blocking=True)
@@ -897,7 +897,7 @@ class GraphWorker(Worker):
                 dummy if capture is None else ring[:, capture],
                 persistent=False,
             )
-            following._lens_capture = capture is not None
+            following._lens_capture = capture is not None  # type: ignore
             original = following.forward
 
             def forward(
@@ -949,7 +949,7 @@ class GraphWorker(Worker):
         )
         first.register_buffer("_lens_meta", self._meta, persistent=False)
         first.register_buffer("_lens_patches", self._patches, persistent=False)
-        first._lens_sentinel = self._sentinel
+        first._lens_sentinel = self._sentinel  # type: ignore
         first.register_forward_pre_hook(_route_hook, with_kwargs=True)
         logger.info(
             "vllm-lens: steer layers %s (norm_match %s), capture layers %s, ring %d rows, "

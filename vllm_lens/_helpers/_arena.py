@@ -72,7 +72,9 @@ class Arena:
         self.bytes = torch.frombuffer(
             self.ring.shared_memory.buf, dtype=torch.uint8, count=size
         )
-        code = torch.cuda.cudart().cudaHostRegister(self.bytes.data_ptr(), size, 0)
+        code = torch.cuda.cudart().cudaHostRegister(  # type: ignore
+            self.bytes.data_ptr(), size, 0
+        )
         if int(code) != 0:
             raise RuntimeError(f"cudaHostRegister of the capture arena failed: {code}")
         self._warned = False
@@ -157,7 +159,9 @@ class Arena:
 
     def close(self) -> None:
         """Unregister and remove the arena."""
-        torch.cuda.cudart().cudaHostUnregister(self.bytes.data_ptr())
+        torch.cuda.cudart().cudaHostUnregister(  # type: ignore
+            self.bytes.data_ptr()
+        )
         self.ring.close()
 
 
