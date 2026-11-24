@@ -50,8 +50,8 @@ def test_the_capture_op_writes_ring_rows(fused):
     hidden = torch.randn(4, 8, generator=generator)
     residual = torch.randn(4, 8, generator=generator) if fused else None
     ring = torch.zeros(6, 8)
-    dest = torch.tensor([3, 0, 5, 5, 5, 5])
-    _capture_op(hidden, residual, ring, dest)
+    meta = torch.tensor([[0] * 6, [3, 0, 5, 5, 5, 5]])
+    _capture_op(hidden, residual, ring, meta)
     expected = hidden if residual is None else hidden + residual
     assert torch.equal(ring[3], expected[0]) and torch.equal(ring[0], expected[1])
     assert not ring[[1, 2, 4]].any()

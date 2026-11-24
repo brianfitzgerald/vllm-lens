@@ -34,7 +34,7 @@ from vllm_lens._helpers._positions import LAST_PROMPT_TOKEN, POSITIONS_KEY
 from vllm_lens._helpers._serialize import deserialize_tensor
 from vllm_lens._helpers.types import SteeringVector
 from vllm_lens._layers import _discover_layer_modules
-from vllm_lens._route import COUNT, RING, SKIP, START, STEER, route_kernel
+from vllm_lens._route import COUNT, PATCHES, RING, SKIP, STEER
 
 logger = logging.getLogger("vllm.lens")
 
@@ -74,11 +74,12 @@ def _capture_op(
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
     ring: torch.Tensor,
-    dest: torch.Tensor,
+    meta: torch.Tensor,
 ) -> None:
-    """Write each token's stream (``hidden + residual``) to its ring row in ``dest``; rows
-    at the sentinel (the last ring row) are not read or written."""
+    """Write each token's stream (``hidden + residual``) to its ring row in ``meta[1]``;
+    rows at the sentinel (the last ring row) are not read or written."""
     n, width = hidden_states.shape
+    dest = meta[1]
     other = hidden_states if residual is None else residual
     if n == 0:
         return
@@ -115,7 +116,7 @@ def _steer_hook(module: Any, args: Any, output: Any) -> Any:
     """Add each token's table row to the layer output with plain torch ops, which Inductor
     fuses; row 0 is zero. A norm table row is scaled by the unsteered stream norm."""
     hidden, residual = output if isinstance(output, tuple) else (output, None)
-    ids = module._lens_ids[: hidden.shape[0]]
+    ids = module._lens_meta[0, : hidden.shape[0]]
     delta = module._lens_add.index_select(0, ids)
     if module._lens_norm is not None:
         stream = hidden if residual is None else hidden + residual
@@ -132,7 +133,24 @@ def _steer_hook(module: Any, args: Any, output: Any) -> Any:
 def _capture_hook(module: Any, args: Any, output: Any) -> None:
     """Call the capture op on the layer output; Dynamo traces this body into the graph."""
     hidden, residual = output if isinstance(output, tuple) else (output, None)
-    torch.ops.vllm_lens.capture(hidden, residual, module._lens_ring, module._lens_dest)
+    torch.ops.vllm_lens.capture(hidden, residual, module._lens_ring, module._lens_meta)
+
+
+def _route_hook(module: Any, args: Any, kwargs: Any) -> None:
+    """Expand the step's plan to per-token rows before the first layer; Dynamo traces this
+    body into the graph."""
+    for value in (*args, *kwargs.values()):
+        if isinstance(value, torch.Tensor) and value.is_floating_point():
+            torch.ops.vllm_lens.route(
+                module._lens_plan,
+                module._lens_starts,
+                module._lens_meta,
+                module._lens_patches,
+                value.shape[0],
+                module._lens_sentinel,
+            )
+            return
+    raise RuntimeError("vllm-lens found no hidden states in the first layer's inputs.")
 
 
 class _Step(NamedTuple):
@@ -666,6 +684,9 @@ class GraphWorker(Worker):
         )
         self._every = np.zeros(max_reqs, dtype=np.int64)
         self._positional: dict[int, np.ndarray] = {}
+        # Per runner index: whether the plan needs the Python path (a mean, a position-list
+        # capture or position-list steering).
+        self._slow = np.zeros(max_reqs, dtype=bool)
         # Per runner index: the chunk rows of a capture of every position (0 for none), the
         # rows it wrote, and each capture's arena element offset and kept layers.
         self._full_max = np.zeros(max_reqs, dtype=np.int64)
@@ -702,10 +723,12 @@ class GraphWorker(Worker):
         self._meta = torch.tensor(
             [[0], [self._sentinel]], dtype=torch.int64, device=device
         ).repeat(1, max_tokens)
-        # Each step's plan, one column per request (see _route), and its patches: tokens
-        # and values for position-list steering rows and ring rows. Two pinned copies, so a
-        # step never writes the one the last copy reads.
+        # Each step's plan, one column per batch row (see _route), and its patches: sorted
+        # tokens and values for position-list steering rows and ring rows. The route op in
+        # the graph reads them. Two pinned copies, so a step never writes the one the last
+        # copy reads.
         self._plan_table = torch.zeros((5, max_reqs), dtype=torch.int64, device=device)
+        self._plan_table[RING] = -1
         self._host_plan = [
             torch.zeros((5, max_reqs), dtype=torch.int64).pin_memory() for _ in range(2)
         ]
@@ -718,7 +741,6 @@ class GraphWorker(Worker):
         ]
         self._meta_events = [torch.cuda.Event() for _ in range(2)]
         self._meta_slot = 0
-        self._meta_length = 0
         self._meta_signature: tuple | None = None
 
         extras: dict[str, dict[str, Any]] = {}
@@ -737,6 +759,7 @@ class GraphWorker(Worker):
                 capture = self._captures.get(req_id)
                 if index is not None:
                     self._every[index] = 0
+                    self._slow[index] = False
                     self._positional.pop(index, None)
                     if capture is not None and capture.full:
                         capture.rows = max(capture.rows, int(self._full_rows[index]))
@@ -805,7 +828,7 @@ class GraphWorker(Worker):
                         self._mean[index].zero_()
                     self._mean[index] += ring[start : start + count].float().sum(0)
                 # A dummy forward pass before the next plan writes no ring rows.
-                self._meta[1, : self._meta_length].fill_(self._sentinel)
+                self._plan_table[COUNT:].zero_()
                 event = torch.cuda.Event()
                 event.record()
                 self._drain.launch(event, runs, self._keep)
@@ -846,8 +869,7 @@ class GraphWorker(Worker):
             capture = (
                 capture_layers.index(layer_idx) if layer_idx in capture_layers else None
             )
-            following.register_buffer("_lens_ids", self._meta[0], persistent=False)
-            following.register_buffer("_lens_dest", self._meta[1], persistent=False)
+            following.register_buffer("_lens_meta", self._meta, persistent=False)
             following.register_buffer(
                 "_lens_add",
                 None if steer is None else self._add[:, steer],
@@ -882,9 +904,8 @@ class GraphWorker(Worker):
                     _module.variance_epsilon,
                     _module._lens_add,
                     _module._lens_norm,
-                    _module._lens_ids,
+                    _module._lens_meta,
                     _module._lens_ring,
-                    _module._lens_dest,
                     _module._lens_capture,
                 )
 
@@ -894,7 +915,7 @@ class GraphWorker(Worker):
             if layer_idx in fused:
                 continue
             layer = layer_map[layer_idx]
-            layer.register_buffer("_lens_ids", self._meta[0], persistent=False)
+            layer.register_buffer("_lens_meta", self._meta, persistent=False)
             layer.register_buffer("_lens_add", self._add[:, k], persistent=False)
             norm = None if self._norm is None else self._norm[:, k]
             layer.register_buffer("_lens_norm", norm, persistent=False)
@@ -905,8 +926,17 @@ class GraphWorker(Worker):
                 continue
             layer = layer_map[layer_idx]
             layer.register_buffer("_lens_ring", ring[:, k], persistent=False)
-            layer.register_buffer("_lens_dest", self._meta[1], persistent=False)
+            layer.register_buffer("_lens_meta", self._meta, persistent=False)
             layer.register_forward_hook(_capture_hook)
+        first = layer_map[min(layer_map)]
+        first.register_buffer("_lens_plan", self._plan_table, persistent=False)
+        first.register_buffer(
+            "_lens_starts", runner.input_buffers.query_start_loc, persistent=False
+        )
+        first.register_buffer("_lens_meta", self._meta, persistent=False)
+        first.register_buffer("_lens_patches", self._patches, persistent=False)
+        first._lens_sentinel = self._sentinel
+        first.register_forward_pre_hook(_route_hook, with_kwargs=True)
         logger.info(
             "vllm-lens: steer layers %s (norm_match %s), capture layers %s, ring %d rows, "
             "fused into the next norm: %s",
@@ -976,6 +1006,7 @@ class GraphWorker(Worker):
             self._every[index] = 2 * index + 1
             if prepared.positions is not None:
                 self._positional[index] = prepared.positions
+                self._slow[index] = True
         wanted = extra.get("output_residual_stream")
         key = extra.get("_capture_key")
         if wanted is None or key is None or self._drain is None:
@@ -1038,25 +1069,26 @@ class GraphWorker(Worker):
             if capture.full:
                 self._full_max[index] = capture.rows_max
                 self._full_rows[index] = capture.rows
+            elif not capture.done:
+                self._slow[index] = True
         self._mean[index].zero_()
 
     def _plan(
         self, step: _Step
     ) -> tuple[_Runs | None, list[tuple[int, int, int, bool]]]:
-        """Fill this step's per-token table and ring rows and copy them to the device; return
-        the ring runs to write (None without capture rows) and each mean's prompt rows."""
+        """Fill this step's per-request plan and patches and copy them to the device, where
+        the route op expands them; return the ring runs to write (None without capture
+        rows) and each mean's prompt rows."""
         bounds = step.bounds
-        n = int(bounds[-1])
+        slow = np.flatnonzero(self._slow[step.req_idx])
         captured = [
-            (i, capture)
-            for i, req_id in enumerate(step.req_ids)
-            if (capture := self._captures.get(req_id)) is not None
+            (int(i), capture)
+            for i in slow
+            if (capture := self._captures.get(step.req_ids[i])) is not None
             and not capture.done
             and not capture.full
         ]
-        positional = [
-            i for i, index in enumerate(step.req_idx) if int(index) in self._positional
-        ]
+        positional = [int(i) for i in slow if int(step.req_idx[i]) in self._positional]
         counts = np.diff(bounds)
         # The batch rows of captures of every position, and the rows each writes this step.
         full_max = self._full_max[step.req_idx]
@@ -1089,7 +1121,6 @@ class GraphWorker(Worker):
         plan[RING, :n_reqs] = -1
         plan[SKIP, :n_reqs] = 0
         plan[COUNT, :n_reqs] = 0
-        plan[START, :n_reqs] = bounds[:-1]
         # The number of steering-row and ring-row patches.
         patched = [0, 0]
         for i in positional:
@@ -1123,6 +1154,8 @@ class GraphWorker(Worker):
                     rows = int(bounds[i]) + capture.selector[low:high] - first
                     wanted.append((i, rows, high - low, low, False))
                     capture.rows = max(capture.rows, high)
+            if capture.done and int(step.req_idx[i]) not in self._positional:
+                self._slow[step.req_idx[i]] = False
         total = sum(item[2] for item in wanted) + int(full_count.sum())
         if total:
             assert self._drain is not None
@@ -1159,30 +1192,14 @@ class GraphWorker(Worker):
             kept = self._kept[index]
             dest = self._dest[index] + file_row * kept * self._lens_hidden
             runs = _Runs(start, run_rows, dest, kept, index)
-        length = max(n, self._meta_length)
+        plan[PATCHES, :2] = patched
         self._plan_table.copy_(self._host_plan[slot], non_blocking=True)
-        route_kernel[(triton.cdiv(length, 256),)](  # type: ignore[reportIndexIssue]
-            self._plan_table,
-            self._meta,
-            self._plan_table.stride(0),
-            self._meta.stride(0),
-            n_reqs,
-            n,
-            length,
-            self._sentinel,
-            STEPS=max(1, self._plan_table.shape[1].bit_length()),
-            BLOCK=256,
-        )
         for kind, count in enumerate(patched):
             if count:
                 self._patches[kind, :, :count].copy_(
                     self._host_patches[slot][kind, :, :count], non_blocking=True
                 )
-                self._meta[kind].index_put_(
-                    (self._patches[kind, 0, :count],), self._patches[kind, 1, :count]
-                )
         self._meta_events[slot].record()
-        self._meta_length = n
         return runs, pooled
 
     def _seal(self, capture: _Capture, index: int | None) -> None:

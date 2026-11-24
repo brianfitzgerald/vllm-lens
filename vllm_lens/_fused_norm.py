@@ -82,13 +82,12 @@ def _lens_norm(
     eps: float,
     add: torch.Tensor | None,
     norm_table: torch.Tensor | None,
-    ids: torch.Tensor,
+    meta: torch.Tensor,
     ring: torch.Tensor,
-    dest: torch.Tensor,
     capture: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return the RMSNorm of the steered stream and the stream; with ``capture``, write the
-    stream to its ring rows."""
+    stream to its ring rows. ``meta`` holds each token's table row and ring row."""
     n, width = x.shape
     out = torch.empty((n, width), dtype=x.dtype, device=x.device)
     residual_out = torch.empty((n, width), dtype=x.dtype, device=x.device)
@@ -102,9 +101,9 @@ def _lens_norm(
         residual_out,
         x if add is None else add,
         x if norm_table is None else norm_table,
-        ids,
+        meta[0],
         ring,
-        dest,
+        meta[1],
         ring.shape[0] - 1,
         width,
         x.stride(0),
@@ -129,9 +128,8 @@ def _lens_norm_fake(
     eps: float,
     add: torch.Tensor | None,
     norm_table: torch.Tensor | None,
-    ids: torch.Tensor,
+    meta: torch.Tensor,
     ring: torch.Tensor,
-    dest: torch.Tensor,
     capture: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The output shapes of ``lens_norm``, for tracing."""

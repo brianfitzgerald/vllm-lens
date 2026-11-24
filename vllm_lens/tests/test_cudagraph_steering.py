@@ -196,7 +196,9 @@ def test_the_steer_hook_adds_table_rows(dtype, fused, matched):
     if norm is not None:
         norm[0] = 0
     ids = torch.tensor([2, 0, 1, 2, 0, 0])
-    module = SimpleNamespace(_lens_ids=ids, _lens_add=add, _lens_norm=norm)
+    module = SimpleNamespace(
+        _lens_meta=torch.stack([ids, ids]), _lens_add=add, _lens_norm=norm
+    )
     delta = add[ids[:4]]
     if norm is not None:
         stream = hidden_states + (0 if residual is None else residual)

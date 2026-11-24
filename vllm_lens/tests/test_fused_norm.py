@@ -39,9 +39,8 @@ def test_lens_norm_matches_the_unfused_path(dtype, steer, matched, capture):
         eps,
         add if steer else None,
         norm_table,
-        ids,
+        torch.stack([ids, dest]),
         ring,
-        dest,
         capture,
     )
 
