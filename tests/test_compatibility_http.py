@@ -62,7 +62,8 @@ def test_capture_and_interventions(client, endpoint, transport):
 
 @pytest.mark.parametrize("endpoint", ["generate", "chat"])
 def test_intervention_cache_isolation(client, endpoint):
-    """HTTP interventions isolate writes without requesting activation capture."""
+    """A steered HTTP request reads only the KV of the same steering, without requesting
+    activation capture."""
     prompt = uuid.uuid4().hex + " The quick brown fox jumps over the lazy dog." * 20
     inputs = prompt if endpoint == "generate" else [{"role": "user", "content": prompt}]
     run = getattr(client, endpoint)
@@ -79,9 +80,10 @@ def test_intervention_cache_isolation(client, endpoint):
             activations=torch.ones(1, hidden_dim), layer_indices=[LAYER], scale=10.0
         )
     ]
-    for _ in range(2):
+    for repeated in (False, True):
         result = run(inputs, **options, steering_vectors=vectors)
-        assert result.raw["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+        cached = result.raw["usage"]["prompt_tokens_details"]["cached_tokens"]
+        assert (cached > 0) == repeated
     first = run(inputs, **options)
     assert first.raw["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
     repeat = run(inputs, **options)

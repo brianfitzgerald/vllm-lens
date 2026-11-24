@@ -16,8 +16,9 @@ MODES = {
         {"output_residual_stream_pool": "mean"},
         lambda rows, n_prompt: rows[:, :n_prompt].mean(1, keepdim=True),
     ),
+    # A last-token capture reads the cache, and a cache hit is not bitwise equal to a prefill.
     "last-prompt-token": (
-        {POSITIONS_KEY: "last_prompt_token"},
+        {POSITIONS_KEY: "last_prompt_token", "skip_reading_prefix_cache": True},
         lambda rows, n_prompt: rows[:, n_prompt - 1 : n_prompt],
     ),
     "positions": (

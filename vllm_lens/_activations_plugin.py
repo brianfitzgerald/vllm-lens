@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -59,7 +60,7 @@ if TYPE_CHECKING:
 _CAPTURE_TIMEOUT = float(os.environ.get("VLLM_LENS_CAPTURE_TIMEOUT", "120"))
 _TRANSPORTS = (None, "base64", "binary", "shm")
 # Keys of extra_args that only this plugin sets.
-_INTERNAL_KEYS = ("_steering_id", "_steer_rows", "_capture_key", "_lens_isolate_cache")
+_INTERNAL_KEYS = ("_steering_id", "_steer_rows", "_capture_key", "_lens_cache_salt")
 
 # Populated by register() with the original unpatched methods.
 _original_create_engine_config: Callable | None = None
@@ -139,7 +140,9 @@ def _replace_table(engine: Any, name: str, rows: int) -> tuple[int, int | None]:
     """Register ``rows`` rows as a new version of table ``name``; return that version and
     the old version to drop now, if no request uses it."""
     old = engine._lens_steering_tables.get(name)
-    new_version = 0 if old is None else old[1] + 1
+    # A table registered again after its removal gets a new version, so a version names
+    # one set of contents and can key the steering's cache namespace.
+    new_version = time.time_ns() if old is None else old[1] + 1
     engine._lens_steering_tables = {
         **engine._lens_steering_tables,
         name: (rows, new_version),
@@ -321,22 +324,22 @@ def _patched_create_engine_config(self, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-def _isolate_prefix_cache(request: Any) -> None:
-    """Add a unique salt to the request's cache namespace."""
-    salt = f"lens-request:{uuid.uuid4().hex}"
+def _salt_prefix_cache(request: Any, salt: str) -> None:
+    """Add ``salt`` to the request's cache namespace."""
     request.cache_salt = f"{request.cache_salt}|{salt}" if request.cache_salt else salt
 
 
 def _patched_process_inputs(
     self: Any, request_id: str, prompt: Any, params: Any, *args, **kwargs
 ) -> Any:
-    """Build the request, then isolate intervention cache entries."""
+    """Build the request, then put a steered request in its steering's cache namespace."""
     assert _original_process_inputs is not None
     request = _original_process_inputs(
         self, request_id, prompt, params, *args, **kwargs
     )
-    if (getattr(params, "extra_args", None) or {}).get("_lens_isolate_cache"):
-        _isolate_prefix_cache(request)
+    salt = (getattr(params, "extra_args", None) or {}).get("_lens_cache_salt")
+    if salt:
+        _salt_prefix_cache(request, salt)
     return request
 
 
@@ -344,8 +347,9 @@ def _prepare_request(
     engine: Any, vllm_config: Any, params: Any, extra: dict[str, Any], key: str
 ) -> tuple[list[SteeringVector] | None, bool]:
     """Check one request's options and set its internal keys; return its steering vectors
-    and whether it captures. Steering and capture read every position, so the request
-    skips the prefix cache, and a steered request writes under its own salt."""
+    and whether it captures. A steered request reads and writes the prefix cache under a
+    salt of its steering. A capture of more than the last prompt token skips the read,
+    because a cached position is not computed."""
     _check_capture_options(extra)
     for name in _INTERNAL_KEYS:
         extra.pop(name, None)
@@ -365,10 +369,30 @@ def _prepare_request(
         extra["_steer_rows"] = rows
     elif vectors is not None:
         extra["_steering_id"] = key
-    if extra.pop("skip_reading_prefix_cache", None) or captures or vectors:
+    partial = captures and extra.get(POSITIONS_KEY) != LAST_PROMPT_TOKEN
+    if extra.pop("skip_reading_prefix_cache", None) or partial:
         params.skip_reading_prefix_cache = True
     if vectors:
-        extra["_lens_isolate_cache"] = True
+        digest = hashlib.sha1()
+        for vector in vectors:
+            digest.update(
+                json.dumps(
+                    [
+                        vector.table,
+                        vector.version,
+                        vector.row,
+                        vector.scale,
+                        list(vector.layer_indices),
+                        vector.norm_match,
+                        vector.position_indices,
+                    ]
+                ).encode()
+            )
+            if vector.activations is not None:
+                digest.update(
+                    vector.activations.detach().float().cpu().numpy().tobytes()
+                )
+        extra["_lens_cache_salt"] = f"lens-steer:{digest.hexdigest()[:32]}"
     _hold_tables(engine, vectors)
     return vectors, captures
 
@@ -407,7 +431,7 @@ async def _patched_generate(
     )
     extra.pop("activations_transport", None)
     if vectors and built:
-        _isolate_prefix_cache(prompt)
+        _salt_prefix_cache(prompt, extra["_lens_cache_salt"])
     path = (
         capture_path(os.environ[CAPTURE_DIR_ENV], extra["_capture_key"], request_id)
         if captures

@@ -200,7 +200,8 @@ class TestOfflineSteeringEntryPoints:
 
 @pytest.mark.parametrize("endpoint", ["generate", "chat"])
 def test_intervention_cache_isolation(llm_model, endpoint):
-    """Interventions isolate cache writes for both offline entry points."""
+    """A steered request reads only the KV of the same steering, for both offline entry
+    points."""
     llm_model.reset_prefix_cache()
     prompt = uuid.uuid4().hex + " The quick brown fox jumps over the lazy dog." * 20
     inputs = (
@@ -217,8 +218,8 @@ def test_intervention_cache_isolation(llm_model, endpoint):
         ]
     }
     params = SamplingParams(temperature=0.0, max_tokens=1, extra_args=extra)
-    for _ in range(2):
-        assert run(inputs, params)[0].num_cached_tokens == 0
+    for repeated in (False, True):
+        assert (run(inputs, params)[0].num_cached_tokens > 0) == repeated
     params = SamplingParams(temperature=0.0, max_tokens=20)
     first = run(inputs, params)[0]
     assert first.num_cached_tokens == 0

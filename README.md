@@ -137,7 +137,7 @@ llm.generate(["I think the best dessert is"], sp)
 
 Via the client (or `vllm_xargs` over HTTP): `client.generate("...", steering_vectors=[sv])`. `llm.chat(...)` accepts the same `extra_args`, and both offline entry points accept the JSON wire form (`json.dumps([sv.model_dump(mode="json")])`).
 
-Steered requests skip prefix-cache reads and write under a unique cache salt, so other requests cannot reuse their KV blocks. Capture requests also skip prefix-cache reads. Steering supports `n > 1`; capture requires `n = 1`.
+Steered requests read and write the prefix cache under a salt of their steering (the vectors or table rows, scale, layers, positions and `norm_match`), added to the request's `cache_salt`. A request reads only KV blocks of the same steering, and other requests cannot read them. A capture of the last prompt token reads the cache, because vLLM always computes the last token. Other captures skip prefix-cache reads, because a cached position is not computed. `skip_reading_prefix_cache=True` in `extra_args` skips the read for any request. Steering supports `n > 1`; capture requires `n = 1`.
 
 ### Steering tables
 
