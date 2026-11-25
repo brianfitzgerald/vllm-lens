@@ -21,15 +21,19 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import requests
 
 from vllm_lens._helpers._positions import POSITIONS_KEY
 from vllm_lens._helpers._serialize import (
     decode_activations,
+    serialize_tensor,
 )
 from vllm_lens._helpers.types import SteeringVector
+
+if TYPE_CHECKING:
+    import torch
 
 
 @dataclass
@@ -165,16 +169,17 @@ class VLLMLensClient:
         ``activations_transport="binary"`` returns captured activations as a
         handle fetched from ``GET /v1/activations/{handle}`` (no base64); the
         default inlines them as base64 in the JSON response.
-        ``activations_transport="file"`` returns the path of the capture file the
-        server wrote, which works only on the server's host; the client maps it
-        and the caller removes it. Decoding is transparent in every case.
+        ``activations_transport="shm"`` returns the marker of the capture in the
+        server's shared-memory arena, which works only on the server's host; the
+        client copies and releases it. Decoding is transparent in every case.
 
         ``capture_positions`` narrows the residual-stream capture to
         ``"last_prompt_token"`` or to a list of absolute token positions;
         the response then carries ``residual_stream_positions`` with the
         position of each captured row. Omit it to capture every position.
 
-        ``capture_pool="mean"`` returns the prompt mean as one row per layer.
+        ``capture_pool="mean"`` returns the prompt mean as one row per layer;
+        ``steering_vectors`` adds rows from :meth:`set_steering_table`.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -249,3 +254,26 @@ class VLLMLensClient:
             f"{self.base_url}/v1/chat/completions", json=body, timeout=self._timeout
         ).json()
         return self._parse_response(resp)
+
+    # ------------------------------------------------------------------
+    # Steering tables
+    # ------------------------------------------------------------------
+
+    def set_steering_table(self, name: str, vectors: torch.Tensor) -> None:
+        """Hold ``(N, hidden)`` steering vectors on the server under ``name``, for
+        ``SteeringVector(table=name, row=0, ...)``."""
+        resp = self._session.post(
+            f"{self.base_url}/v1/steering_tables",
+            json={"name": name, "vectors": serialize_tensor(vectors.float())},
+            timeout=self._timeout,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Failed to set steering table {name!r}: {resp.text}")
+
+    def clear_steering_table(self, name: str) -> None:
+        """Drop the steering table under ``name``."""
+        resp = self._session.delete(
+            f"{self.base_url}/v1/steering_tables/{name}", timeout=self._timeout
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"Failed to clear steering table {name!r}: {resp.text}")

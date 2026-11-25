@@ -152,9 +152,9 @@ def decode_activations(
       from ``GET /v1/activations/{handle}``. :class:`VLLMLensClient` wires this
       automatically; a bare call without ``fetch_bytes`` raises a clear error
       rather than silently dropping the tensor.
-    - **file** (``transport="file"``): the entry carries the ``path`` of the capture
-      file the server wrote; this waits up to ``timeout`` seconds for it and maps it.
-      The caller removes the file.
+    - **shm** (``transport="shm"``): the entry carries the ``path`` of the marker of a
+      capture in the server's shared-memory arena; this waits up to ``timeout`` seconds
+      for it, copies the capture and releases it. The reader must be on the server's host.
 
     If no ``activations`` key is present, returns an empty dict.
     """
@@ -168,11 +168,11 @@ def decode_activations(
             out[name] = encoded["__json__"]
         elif "data" in encoded:
             out[name] = deserialize_tensor(encoded)
-        elif encoded.get("transport") == "file":
-            from vllm_lens._helpers._capture_file import read_capture, wait_capture
+        elif encoded.get("transport") == "shm":
+            from vllm_lens._helpers._arena import load_capture, wait_capture
 
             wait_capture(encoded["path"], timeout)
-            capture = read_capture(encoded["path"])
+            capture = load_capture(encoded["path"])
             rows = encoded["rows"]
             positions = capture.get("residual_stream_positions")
             if positions is not None:

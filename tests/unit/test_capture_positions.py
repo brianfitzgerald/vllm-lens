@@ -1,11 +1,10 @@
 """Position-selective residual-stream capture (issue #40), CPU only: the selector rules,
-the plugin's read and trim of a capture file, the wire round trip and the client encoding.
+the plugin's read and trim of a capture, the wire round trip and the client encoding.
 The value-level checks against a live engine are the GPU suites."""
 
 from __future__ import annotations
 
 import json
-import os
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -14,12 +13,7 @@ import torch
 
 import vllm_lens._activations_plugin as plugin
 from vllm_lens._helpers._activation_store import ActivationStore
-from vllm_lens._helpers._capture_file import (
-    CAPTURE_DIR_ENV,
-    HEADER_BYTES,
-    capture_path,
-    seal,
-)
+from vllm_lens._helpers._arena import CAPTURE_DIR_ENV, HEADER_BYTES, capture_path
 from vllm_lens._helpers._positions import (
     LAST_PROMPT_TOKEN,
     POSITIONS_KEY,
@@ -132,34 +126,43 @@ def test_offline_entry_point_validates_before_any_rpc(stub_engine):
 
 
 async def test_async_entry_point_attaches_trimmed_selection(
-    monkeypatch, tmp_path, stub_engine
+    monkeypatch, tmp_path, stub_engine, arena
 ):
-    """The final output gets the capture file the worker wrote, trimmed to the positions
-    the request computed, and the file is removed."""
+    """The final output gets the capture the worker sealed, trimmed to the positions the
+    request computed; the capture is released and its marker removed."""
     monkeypatch.setenv(CAPTURE_DIR_ENV, str(tmp_path))
     module = ModuleType("vllm.v1.engine")
     module.EngineCoreRequest = type("EngineCoreRequest", (), {})  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "vllm.v1.engine", module)
     calls: list[str] = []
+    released: list[int] = []
 
     async def collective_rpc(name, args=()):
         calls.append(name)
 
     async def original_generate(self, prompt, sampling_params, request_id, **kwargs):
         key = sampling_params.extra_args["_capture_key"]
-        path = capture_path(str(tmp_path), key, request_id, partial=True)
-        fd = os.open(path, os.O_RDWR | os.O_CREAT)
         rows = torch.arange(3.0).view(3, 1, 1).to(torch.bfloat16)
-        os.pwrite(fd, rows.view(torch.int16).numpy().tobytes(), HEADER_BYTES)
-        seal(
-            fd,
-            path,
-            dtype=torch.bfloat16,
-            rows=3,
-            layers=[2],
-            hidden=1,
-            positions=[0, 9, 12],
+        address, ident, offset = arena.allocate(HEADER_BYTES + 6 + 24)
+        start = offset + HEADER_BYTES
+        arena.bytes[start : start + 6] = rows.view(torch.uint8).flatten()
+        arena.seal(
+            capture_path(str(tmp_path), key, request_id),
+            address,
+            ident,
+            offset,
+            {
+                "dtype": "bfloat16",
+                "rows": 3,
+                "layers": [2],
+                "hidden": 1,
+                "positions": 3,
+                "positions_offset": start + 6,
+            },
+            [0, 9, 12],
+            start + 6,
         )
+        released.append(offset)
         yield SimpleNamespace(
             finished=True,
             prompt_token_ids=[0] * 10,
@@ -180,6 +183,8 @@ async def test_async_entry_point_attaches_trimmed_selection(
     assert acts["residual_stream"].flatten().tolist() == [0.0, 1.0]
     assert acts[POSITIONS_META_KEY] == [0, 9]
     assert calls == [] and not list(tmp_path.iterdir())
+    # The reader set the chunk's released byte.
+    assert int(arena.bytes[released[0] + 1]) == 1
 
     bad = SimpleNamespace(
         extra_args={POSITIONS_KEY: LAST_PROMPT_TOKEN}, skip_reading_prefix_cache=False

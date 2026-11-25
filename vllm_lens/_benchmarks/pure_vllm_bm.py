@@ -7,8 +7,9 @@ from typing import Annotated, Any
 import typer
 from datasets import load_dataset
 from dotenv import load_dotenv
-from utils.types import BenchmarkConfig, BenchmarkResult
 from vllm import LLM, SamplingParams
+
+from utils.types import BenchmarkConfig, BenchmarkResult
 
 LIB_NAME = "pure-vllm"
 

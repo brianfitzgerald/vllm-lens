@@ -94,7 +94,7 @@ def serving_surface(monkeypatch):
             "routes",
             None,
             "register_vllm_serve_api_routers",
-            "activation routes",
+            "activation and steering table routes",
         ),
     ],
 )

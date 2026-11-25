@@ -29,6 +29,8 @@ ARMED = {
     "vllm_lens": {
         "capture_layers": list(range(NUM_LAYERS)),
         "steer_layers": list(range(NUM_LAYERS)),
+        # Small, since several test engines can be alive at once.
+        "capture_arena_gib": 1,
     }
 }
 PROMPTS = [

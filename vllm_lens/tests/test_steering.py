@@ -201,24 +201,33 @@ class TestSteering:
         )
         assert steered.outputs[0].text == baseline_text
 
-    async def test_intervention_prefix_is_not_reused(self, vllm_model):
-        """Interventions isolate writes; ordinary requests still reuse the cache."""
+    async def test_steering_reads_only_its_own_namespace(self, vllm_model):
+        """A steered request reads the KV of the same steering and no other; ordinary
+        requests do not read steered KV."""
         prompt = uuid.uuid4().hex + " The quick brown fox jumps over the lazy dog." * 20
         hidden_dim = vllm_model.model_config.get_hidden_size()
-        extra = {
-            "apply_steering_vectors": _make_steering_vector(
-                hidden_dim, [LAYER_IDX], scale=10.0
+        vectors = [
+            _make_steering_vector(hidden_dim, [LAYER_IDX], scale=10.0) for _ in range(2)
+        ]
+        first, repeat, other = [
+            await _generate(
+                vllm_model,
+                prompt,
+                f"steered-{index}",
+                max_tokens=20,
+                extra_args={"apply_steering_vectors": vectors[k]},
             )
-        }
-        for index in range(2):
-            result = await _generate(
-                vllm_model, prompt, f"isolated-{index}", max_tokens=1, extra_args=extra
-            )
-            assert result.num_cached_tokens == 0
-        first = await _generate(vllm_model, prompt, "ordinary-first", max_tokens=20)
-        assert first.num_cached_tokens == 0
-        repeat = await _generate(vllm_model, prompt, "ordinary-repeat", max_tokens=20)
+            for index, k in enumerate((0, 0, 1))
+        ]
+        assert first.num_cached_tokens == 0 and other.num_cached_tokens == 0
         assert repeat.num_cached_tokens > 0
+        plain = await _generate(vllm_model, prompt, "ordinary-first", max_tokens=20)
+        assert plain.num_cached_tokens == 0
+        # A cache hit is not bitwise equal to a prefill, so the tokens agree only at first.
+        assert first.outputs[0].token_ids[0] == repeat.outputs[0].token_ids[0]
+        assert repeat.outputs[0].token_ids != plain.outputs[0].token_ids
+        again = await _generate(vllm_model, prompt, "ordinary-repeat", max_tokens=20)
+        assert again.num_cached_tokens > 0
         fresh = await _generate(
             vllm_model,
             prompt,
@@ -226,11 +235,44 @@ class TestSteering:
             max_tokens=20,
             extra_args={"skip_reading_prefix_cache": True},
         )
+        assert fresh.num_cached_tokens == 0
         assert (
-            first.outputs[0].token_ids
-            == repeat.outputs[0].token_ids
+            plain.outputs[0].token_ids
+            == again.outputs[0].token_ids
             == fresh.outputs[0].token_ids
         )
+
+    @pytest.mark.parametrize(
+        "selector", ["last_prompt_token", None], ids=["last-token", "every-position"]
+    )
+    async def test_a_capture_reads_the_cache_only_for_the_last_token(
+        self, vllm_model, selector
+    ):
+        """A last-token capture reads the cache and gets the row of a capture that does
+        not; a capture of every position reads nothing."""
+        prompt = uuid.uuid4().hex + " The quick brown fox jumps over the lazy dog." * 20
+        await _generate(vllm_model, prompt, f"warm-{selector}", max_tokens=1)
+        extra = {"output_residual_stream": [LAYER_IDX]}
+        if selector is not None:
+            extra["output_residual_stream_positions"] = selector
+        cached = await _generate(
+            vllm_model, prompt, f"cached-{selector}", max_tokens=1, extra_args=extra
+        )
+        fresh = await _generate(
+            vllm_model,
+            prompt,
+            f"fresh-{selector}",
+            max_tokens=1,
+            extra_args={**extra, "skip_reading_prefix_cache": True},
+        )
+        assert fresh.num_cached_tokens == 0
+        assert (cached.num_cached_tokens > 0) == (selector is not None)
+        rows = [
+            result.activations["residual_stream"][..., -1, :].float()  # type: ignore[reportAttributeAccessIssue]
+            for result in (cached, fresh)
+        ]
+        error = ((rows[0] - rows[1]).norm() / rows[1].norm()).item()
+        assert error < 2e-2, error
 
     async def test_steering_with_capture(self, vllm_model):
         """Steering + capture: captured activations should reflect the

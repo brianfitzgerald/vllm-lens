@@ -90,12 +90,13 @@ VECTOR_CASES = {
 def test_one_armed_layer_steers_as_every_armed_layer(
     eager_llm, op_eager_llm, hidden, case
 ):
-    """With the same kernels, an engine arming one layer steers as one arming them all."""
+    """An engine arming one layer steers as one arming them all. Each armed layer's next
+    norm is the fused lens norm, and the other layers keep vLLM's kernel, whose rounding
+    differs, so the limit is 3% per row."""
     eager = _run(eager_llm, [VECTOR_CASES[case](hidden)])[0]
     op = _run(op_eager_llm, [VECTOR_CASES[case](hidden)])[0]
     error = row_error(prompt_rows(op), prompt_rows(eager))
-    # Both paths run the same float32 steering math on the same kernels.
-    assert error < 1e-3, f"largest row error {error:.4f}"
+    assert error < 3e-2, f"largest row error {error:.4f}"
 
 
 @pytest.mark.parametrize("case", VECTOR_CASES)
@@ -195,16 +196,23 @@ def test_the_steer_hook_adds_table_rows(dtype, fused, matched):
     if norm is not None:
         norm[0] = 0
     ids = torch.tensor([2, 0, 1, 2, 0, 0])
-    module = SimpleNamespace(_lens_ids=ids, _lens_add=add, _lens_norm=norm)
+    module = SimpleNamespace(
+        _lens_meta=torch.stack([ids, ids]), _lens_add=add, _lens_norm=norm
+    )
     delta = add[ids[:4]]
     if norm is not None:
         stream = hidden_states + (0 if residual is None else residual)
         delta = delta + norm[ids[:4]] * stream.float().norm(dim=-1, keepdim=True)
     output = hidden_states if residual is None else (hidden_states, residual)
     out = _steer_hook(module, (), output)
-    steered = out if residual is None else out[0]
-    torch.testing.assert_close(steered, hidden_states + delta.to(dtype))
-    assert torch.equal(steered[1], hidden_states[1])
+    if residual is None:
+        torch.testing.assert_close(out, hidden_states + delta.to(dtype))
+        assert torch.equal(out[1], hidden_states[1])
+    else:
+        # A fused layer gets the rows on its residual, so its stream holds them.
+        assert torch.equal(out[0], hidden_states)
+        torch.testing.assert_close(out[1], residual + delta.to(dtype))
+        assert torch.equal(out[1][1], residual[1])
 
 
 def test_positional_rows_add_the_every_token_rows():
@@ -216,7 +224,7 @@ def test_positional_rows_add_the_every_token_rows():
     at = SteeringVector(
         activations=torch.full((1, 4), 3.0), layer_indices=[3], position_indices=[5, 1]
     )
-    prepared = _prepare([add, at], [1, 3], 4, torch.device("cpu"), torch.float32)
+    prepared = _prepare([add, at], {}, [1, 3], 4, torch.device("cpu"), torch.float32)
     assert torch.equal(prepared.add, torch.tensor([[0.0] * 4, [2.0] * 4]))
     assert prepared.pos_add is not None and prepared.norm is None
     assert torch.equal(prepared.pos_add, torch.tensor([[0.0] * 4, [5.0] * 4]))

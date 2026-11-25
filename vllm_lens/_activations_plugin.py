@@ -11,13 +11,16 @@ vllm-lens worker on vLLM's V2 model runner, and patches ``AsyncLLM.generate``,
 from __future__ import annotations
 
 import asyncio
+import collections
 import copy
+import hashlib
 import json
 import logging
 import os
 import pickle
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Sequence
 from importlib.metadata import PackageNotFoundError, version
@@ -26,10 +29,11 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 from vllm_lens._cudagraph import LensGraphConfig
-from vllm_lens._helpers._capture_file import (
+from vllm_lens._helpers._arena import (
     CAPTURE_DIR_ENV,
     capture_path,
-    read_capture,
+    load_capture,
+    release_capture,
     wait_capture,
     wait_capture_async,
 )
@@ -42,6 +46,7 @@ from vllm_lens._helpers._positions import (
 from vllm_lens._helpers._serialize import (
     serialize_activations,
     serialize_activations_binary,
+    serialize_tensor,
 )
 from vllm_lens._helpers.types import SteeringVector
 
@@ -53,9 +58,9 @@ if TYPE_CHECKING:
 
 # Seconds to wait for the worker to write a capture after its request finishes.
 _CAPTURE_TIMEOUT = float(os.environ.get("VLLM_LENS_CAPTURE_TIMEOUT", "120"))
-_TRANSPORTS = (None, "base64", "binary", "file")
+_TRANSPORTS = (None, "base64", "binary", "shm")
 # Keys of extra_args that only this plugin sets.
-_INTERNAL_KEYS = ("_steering_id", "_capture_key", "_lens_isolate_cache")
+_INTERNAL_KEYS = ("_steering_id", "_steer_rows", "_capture_key", "_lens_cache_salt")
 
 # Populated by register() with the original unpatched methods.
 _original_create_engine_config: Callable | None = None
@@ -69,17 +74,95 @@ _original_register_routers: Callable | None = None
 _original_process_inputs: Callable | None = None
 
 
-def _decode_steering_vectors(value: Any) -> list[SteeringVector] | None:
-    """Normalise an ``apply_steering_vectors`` value: vectors, dicts or the JSON string of
-    ``vllm_xargs``."""
+def _decode_steering_vectors(
+    value: Any, tables: dict[str, tuple[int, int]] | None = None
+) -> list[SteeringVector] | None:
+    """Normalise an ``apply_steering_vectors`` value (vectors, dicts or the JSON string of
+    ``vllm_xargs``), check its table rows and stamp each with the table's current version."""
     if value is None:
         return None
     if isinstance(value, str):
         value = json.loads(value)
-    return [
+    vectors = [
         v if isinstance(v, SteeringVector) else SteeringVector.model_validate(v)
         for v in value
     ]
+    for vector in vectors:
+        if vector.table is not None:
+            if tables is None or vector.table not in tables:
+                raise ValueError(f"Steering table {vector.table!r} is not registered")
+            rows, table_version = tables[vector.table]
+            if vector.row is None or vector.row >= rows:
+                raise ValueError("Steering row is out of range")
+            vector.version = table_version
+    return vectors
+
+
+def _table_rows(vectors: list[SteeringVector] | None) -> list[list[Any]] | None:
+    """The ``[table, version, row, scale, layers, norm_match]`` of each vector, which the
+    worker reads at admission with no RPC; None unless every vector is a table row."""
+    if not vectors or any(v.activations is not None for v in vectors):
+        return None
+    return [
+        [v.table, v.version, v.row, v.scale, list(v.layer_indices), v.norm_match]
+        for v in vectors
+    ]
+
+
+def _hold_tables(engine: Any, vectors: list[SteeringVector] | None) -> None:
+    """Count a request's use of each table version it names."""
+    for vector in vectors or ():
+        if vector.table is not None:
+            engine._lens_table_users[(vector.table, vector.version)] += 1
+
+
+def _release_tables(
+    engine: Any, vectors: list[SteeringVector] | None
+) -> list[tuple[str, int]]:
+    """End a request's use of its table versions; return the replaced versions no request
+    uses any more, for the caller to drop on the workers."""
+    drop = []
+    for vector in vectors or ():
+        if vector.table is None:
+            continue
+        key = (vector.table, vector.version)
+        users = engine._lens_table_users
+        users[key] -= 1
+        current = engine._lens_steering_tables.get(vector.table)
+        if users[key] <= 0:
+            del users[key]
+            if current is None or current[1] != vector.version:
+                drop.append(key)
+    return drop
+
+
+def _replace_table(engine: Any, name: str, rows: int) -> tuple[int, int | None]:
+    """Register ``rows`` rows as a new version of table ``name``; return that version and
+    the old version to drop now, if no request uses it."""
+    old = engine._lens_steering_tables.get(name)
+    # A table registered again after its removal gets a new version, so a version names
+    # one set of contents and can key the steering's cache namespace.
+    new_version = time.time_ns() if old is None else old[1] + 1
+    engine._lens_steering_tables = {
+        **engine._lens_steering_tables,
+        name: (rows, new_version),
+    }
+    if old is None or engine._lens_table_users[(name, old[1])] > 0:
+        return new_version, None
+    return new_version, old[1]
+
+
+def _remove_table(engine: Any, name: str | None) -> list[tuple[str, int | None]]:
+    """Unregister ``name`` (or every table); return the versions to drop now."""
+    names = list(engine._lens_steering_tables) if name is None else [name]
+    tables = dict(engine._lens_steering_tables)
+    drop: list[tuple[str, int | None]] = []
+    for key in names:
+        entry = tables.pop(key, None)
+        if entry is not None and engine._lens_table_users[(key, entry[1])] <= 0:
+            drop.append((key, entry[1]))
+    engine._lens_steering_tables = tables
+    return drop
 
 
 def _reject_parallel_capture(params: SamplingParams, extra: dict[str, Any]) -> None:
@@ -119,6 +202,18 @@ def _reject_async_spec_positions(
             "decoding: their positions are not known before the forward pass. Use "
             f"{POSITIONS_KEY}={LAST_PROMPT_TOKEN!r} or a mean, or disable async scheduling "
             "or speculative decoding."
+        )
+
+
+def _check_steering_vectors(directions: torch.Tensor, hidden: int) -> None:
+    """Validate finite steering vectors with shape ``(N, hidden)``."""
+    if (
+        directions.ndim != 2
+        or directions.shape[1] != hidden
+        or not torch.isfinite(directions).all()
+    ):
+        raise ValueError(
+            f"directions must be finite (N, {hidden}), got {tuple(directions.shape)}"
         )
 
 
@@ -168,16 +263,13 @@ def _trim_activations(activations: dict[str, Any], expected_len: int) -> None:
         activations["residual_stream"] = rs[:, :expected_len]
 
 
-def _remove_capture(path: str) -> None:
-    """Remove the file of a capture nobody reads, once the worker writes it."""
+def _release_unread(path: str) -> None:
+    """Release a capture nobody reads, once the worker seals it."""
     try:
         wait_capture(path, _CAPTURE_TIMEOUT)
-        os.unlink(path)
-    except (TimeoutError, FileNotFoundError):
-        try:
-            os.unlink(path.removesuffix(".safetensors") + ".partial")
-        except FileNotFoundError:
-            pass
+        release_capture(path)
+    except TimeoutError:
+        pass
 
 
 def _serialize_for(
@@ -232,35 +324,38 @@ def _patched_create_engine_config(self, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 
-def _isolate_prefix_cache(request: Any) -> None:
-    """Add a unique salt to the request's cache namespace."""
-    salt = f"lens-request:{uuid.uuid4().hex}"
+def _salt_prefix_cache(request: Any, salt: str) -> None:
+    """Add ``salt`` to the request's cache namespace."""
     request.cache_salt = f"{request.cache_salt}|{salt}" if request.cache_salt else salt
 
 
 def _patched_process_inputs(
     self: Any, request_id: str, prompt: Any, params: Any, *args, **kwargs
 ) -> Any:
-    """Build the request, then isolate intervention cache entries."""
+    """Build the request, then put a steered request in its steering's cache namespace."""
     assert _original_process_inputs is not None
     request = _original_process_inputs(
         self, request_id, prompt, params, *args, **kwargs
     )
-    if (getattr(params, "extra_args", None) or {}).get("_lens_isolate_cache"):
-        _isolate_prefix_cache(request)
+    salt = (getattr(params, "extra_args", None) or {}).get("_lens_cache_salt")
+    if salt:
+        _salt_prefix_cache(request, salt)
     return request
 
 
 def _prepare_request(
-    vllm_config: Any, params: Any, extra: dict[str, Any], key: str
+    engine: Any, vllm_config: Any, params: Any, extra: dict[str, Any], key: str
 ) -> tuple[list[SteeringVector] | None, bool]:
     """Check one request's options and set its internal keys; return its steering vectors
-    and whether it captures. Steering and capture read every position, so the request
-    skips the prefix cache, and a steered request writes under its own salt."""
+    and whether it captures. A steered request reads and writes the prefix cache under a
+    salt of its steering. A capture of more than the last prompt token skips the read,
+    because a cached position is not computed."""
     _check_capture_options(extra)
     for name in _INTERNAL_KEYS:
         extra.pop(name, None)
-    vectors = _decode_steering_vectors(extra.pop("apply_steering_vectors", None))
+    vectors = _decode_steering_vectors(
+        extra.pop("apply_steering_vectors", None), engine._lens_steering_tables
+    )
     _reject_async_spec_positions(vllm_config, vectors, extra)
     _reject_parallel_capture(params, extra)
     LensGraphConfig.from_vllm_config(vllm_config).reject(
@@ -269,12 +364,36 @@ def _prepare_request(
     captures = extra.get("output_residual_stream") is not None
     if captures:
         extra["_capture_key"] = key
-    if vectors is not None:
+    rows = _table_rows(vectors)
+    if rows is not None:
+        extra["_steer_rows"] = rows
+    elif vectors is not None:
         extra["_steering_id"] = key
-    if extra.pop("skip_reading_prefix_cache", None) or captures or vectors:
+    partial = captures and extra.get(POSITIONS_KEY) != LAST_PROMPT_TOKEN
+    if extra.pop("skip_reading_prefix_cache", None) or partial:
         params.skip_reading_prefix_cache = True
     if vectors:
-        extra["_lens_isolate_cache"] = True
+        digest = hashlib.sha1()
+        for vector in vectors:
+            digest.update(
+                json.dumps(
+                    [
+                        vector.table,
+                        vector.version,
+                        vector.row,
+                        vector.scale,
+                        list(vector.layer_indices),
+                        vector.norm_match,
+                        vector.position_indices,
+                    ]
+                ).encode()
+            )
+            if vector.activations is not None:
+                digest.update(
+                    vector.activations.detach().float().cpu().numpy().tobytes()
+                )
+        extra["_lens_cache_salt"] = f"lens-steer:{digest.hexdigest()[:32]}"
+    _hold_tables(engine, vectors)
     return vectors, captures
 
 
@@ -289,7 +408,7 @@ async def _patched_generate(
 
     Inline steering vectors reach the workers by RPC before generation; table rows ride in
     ``extra_args``. The worker writes the capture to a file; the final output waits for it,
-    or with ``activations_transport="file"`` carries only its path.
+    or with ``activations_transport="shm"`` carries only the path of its marker.
     """
     from vllm.v1.engine import EngineCoreRequest
 
@@ -308,11 +427,11 @@ async def _patched_generate(
     if transport == "binary":
         _warn_if_multi_api_server(self)
     vectors, captures = _prepare_request(
-        self.vllm_config, params, extra, uuid.uuid4().hex
+        self, self.vllm_config, params, extra, uuid.uuid4().hex
     )
     extra.pop("activations_transport", None)
     if vectors and built:
-        _isolate_prefix_cache(prompt)
+        _salt_prefix_cache(prompt, extra["_lens_cache_salt"])
     path = (
         capture_path(os.environ[CAPTURE_DIR_ENV], extra["_capture_key"], request_id)
         if captures
@@ -333,14 +452,13 @@ async def _patched_generate(
                 expected = (
                     len(output.prompt_token_ids) + len(output.outputs[0].token_ids) - 1
                 )
-                if transport == "file":
-                    marker = {"transport": "file", "path": path, "rows": expected}
+                if transport == "shm":
+                    marker = {"transport": "shm", "path": path, "rows": expected}
                     output.activations = {"residual_stream": marker}
                     output._vllm_lens_serialized = {"residual_stream": marker}
                 else:
                     await wait_capture_async(path, _CAPTURE_TIMEOUT)
-                    activations = read_capture(path)
-                    os.unlink(path)
+                    activations = await asyncio.to_thread(load_capture, path)
                     _trim_activations(activations, expected)
                     output.activations = activations
                     output._vllm_lens_serialized = await asyncio.to_thread(
@@ -353,8 +471,57 @@ async def _patched_generate(
             await self.collective_rpc(
                 "clear_steering_data", args=(extra["_steering_id"],)
             )
+        for name, table_version in _release_tables(self, vectors):
+            await self.collective_rpc(
+                "clear_steering_table", args=(name, table_version)
+            )
         if path is not None and not consumed:
-            threading.Thread(target=_remove_capture, args=(path,), daemon=True).start()
+            threading.Thread(target=_release_unread, args=(path,), daemon=True).start()
+
+
+class _Collector(threading.Thread):
+    """Copy and release the captures of one offline call as the worker seals them, so the
+    arena never has to hold the whole call."""
+
+    def __init__(self, directory: str, prefix: str) -> None:
+        super().__init__(daemon=True, name="vllm-lens-collect")
+        self.directory = directory
+        self.prefix = prefix
+        self.loaded: dict[str, Any] = {}
+        self.changed = threading.Condition()
+        self.stopped = False
+
+    def run(self) -> None:
+        """Load each sealed capture of this call until stopped; the scans back off to 10 ms
+        while no capture is sealed."""
+        pause = 0.001
+        while not self.stopped:
+            found = False
+            for entry in os.scandir(self.directory):
+                name = entry.name
+                if not name.startswith(self.prefix) or not name.endswith(".lens"):
+                    continue
+                try:
+                    value: Any = load_capture(entry.path)
+                except (OSError, RuntimeError, ValueError) as error:
+                    value = error
+                with self.changed:
+                    self.loaded[entry.path] = value
+                    self.changed.notify_all()
+                found = True
+            pause = 0.001 if found else min(2 * pause, 0.01)
+            if not found:
+                time.sleep(pause)
+
+    def take(self, path: str, timeout: float) -> dict[str, Any]:
+        """The capture of one marker, once loaded."""
+        with self.changed:
+            if not self.changed.wait_for(lambda: path in self.loaded, timeout):
+                raise TimeoutError(f"The capture {path} was not written in {timeout} s")
+            value = self.loaded.pop(path)
+        if isinstance(value, Exception):
+            raise value
+        return value
 
 
 def _prepare_offline_params(
@@ -372,34 +539,48 @@ def _prepare_offline_params(
     else:
         params_list = []
     vllm_config = self.llm_engine.vllm_config
+    vectors_list: list[list[SteeringVector] | None] = []
     key = uuid.uuid4().hex
     steering: dict[str, bytes] = {}
     captures = False
     for idx, sp in enumerate(params_list):
         sp.extra_args = extra = dict(sp.extra_args or {})
-        vectors, captured = _prepare_request(vllm_config, sp, extra, f"{key}{idx}")
+        vectors, captured = _prepare_request(
+            self, vllm_config, sp, extra, f"{key}{idx}"
+        )
         extra.pop("activations_transport", None)
         captures |= captured
+        vectors_list.append(vectors)
         if "_steering_id" in extra:
             steering[extra["_steering_id"]] = pickle.dumps(vectors)
-    try:
-        for steering_id, payload in steering.items():
-            self.collective_rpc("set_steering_data", args=(steering_id, payload))
-    except BaseException:
-        _end_offline(self, {"steering": steering})
-        raise
-    return {
+    state: dict[str, Any] = {
         "params": sampling_params,
         "params_list": params_list,
         "captures": captures,
         "steering": steering,
+        "vectors": vectors_list,
+        "collector": None,
     }
+    try:
+        for steering_id, payload in steering.items():
+            self.collective_rpc("set_steering_data", args=(steering_id, payload))
+    except BaseException:
+        _end_offline(self, state)
+        raise
+    if captures and os.environ.get(CAPTURE_DIR_ENV):
+        state["collector"] = _Collector(os.environ[CAPTURE_DIR_ENV], key)
+        state["collector"].start()
+    return state
 
 
 def _finalize_offline_outputs(self: LLM, outputs: list, state: dict[str, Any]) -> list:
-    """Attach each output's capture, read from the file its worker wrote."""
+    """Attach each output's capture, which the call's collector read from the arena."""
     if not state["captures"]:
         return outputs
+    if not int(os.environ.get("VLLM_ENABLE_V1_MULTIPROCESSING", "1")):
+        # An in-process engine stops when its requests finish; one more step passes their
+        # finished ids to the workers, which seal the captures.
+        self.llm_engine.step()
     params_list = state["params_list"]
     directory = os.environ[CAPTURE_DIR_ENV]
     for idx, output in enumerate(outputs):
@@ -407,9 +588,11 @@ def _finalize_offline_outputs(self: LLM, outputs: list, state: dict[str, Any]) -
         if "_capture_key" not in extra:
             continue
         path = capture_path(directory, extra["_capture_key"], output.request_id)
-        wait_capture(path, _CAPTURE_TIMEOUT)
-        activations = read_capture(path)
-        os.unlink(path)
+        if state["collector"] is None:
+            wait_capture(path, _CAPTURE_TIMEOUT)
+            activations = load_capture(path)
+        else:
+            activations = state["collector"].take(path, _CAPTURE_TIMEOUT)
         n_prompt = len(output.prompt_token_ids)
         _trim_activations(activations, n_prompt + len(output.outputs[0].token_ids) - 1)
         output.activations = activations
@@ -417,9 +600,15 @@ def _finalize_offline_outputs(self: LLM, outputs: list, state: dict[str, Any]) -
 
 
 def _end_offline(self: LLM, state: dict[str, Any]) -> None:
-    """Drop the prepared steering of the call's requests."""
+    """Stop the call's collector, and drop the inline steering data and the table versions
+    nothing uses any more."""
+    if state.get("collector") is not None:
+        state["collector"].stopped = True
     for steering_id in state["steering"]:
         self.collective_rpc("clear_steering_data", args=(steering_id,))
+    for vectors in state["vectors"]:
+        for name, table_version in _release_tables(self, vectors):
+            self.collective_rpc("clear_steering_table", args=(name, table_version))
 
 
 def _patched_llm_generate(
@@ -556,9 +745,36 @@ def _patched_register_routers(app):
     """Add the vllm-lens routes after vLLM registers its own."""
     assert _original_register_routers is not None
     _original_register_routers(app)
-    from vllm_lens._routes import activations_router
+    from vllm_lens._routes import activations_router, steering_tables_router
 
     app.include_router(activations_router)
+    app.include_router(steering_tables_router)
+
+
+# ---------------------------------------------------------------------------
+# Steering tables on the offline LLM
+# ---------------------------------------------------------------------------
+
+
+def _llm_set_steering_table(self: LLM, name: str, vectors: torch.Tensor) -> None:
+    """Hold ``(N, hidden)`` steering vectors on the workers under ``name``, for requests
+    that name a row in ``apply_steering_vectors``."""
+    hidden = self.llm_engine.model_config.get_hidden_size()
+    _check_steering_vectors(vectors, hidden)
+    table_version, drop = _replace_table(self, name, vectors.shape[0])
+    self.collective_rpc(
+        "set_steering_table",
+        args=(name, serialize_tensor(vectors.float()), table_version),
+    )
+    if drop is not None:
+        self.collective_rpc("clear_steering_table", args=(name, drop))
+
+
+def _llm_clear_steering_table(self: LLM, name: str | None = None) -> None:
+    """Drop the steering table under ``name``; None drops every table. Requests in flight
+    keep the versions they use."""
+    for key, table_version in _remove_table(self, name):
+        self.collective_rpc("clear_steering_table", args=(key, table_version))
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +850,14 @@ def register() -> None:
     _original_llm_chat = LLM.chat
     LLM.chat = _patched_llm_chat
 
+    LLM.set_steering_table = _llm_set_steering_table  # type: ignore[reportAttributeAccessIssue]
+    LLM.clear_steering_table = _llm_clear_steering_table  # type: ignore[reportAttributeAccessIssue]
+    # Each registered table's row count and version, replaced and never mutated in place,
+    # and the requests in flight per table version.
+    for cls in (LLM, AsyncLLM):
+        cls._lens_steering_tables = {}  # type: ignore[reportAttributeAccessIssue]
+        cls._lens_table_users = collections.Counter()  # type: ignore[reportAttributeAccessIssue]
+
     try:
         from vllm.entrypoints.openai.completion.serving import (
             OpenAIServingCompletion,
@@ -670,4 +894,4 @@ def register() -> None:
         _original_register_routers = _serve_mod.register_vllm_serve_api_routers
         _serve_mod.register_vllm_serve_api_routers = _patched_register_routers
     except Exception as error:
-        _report_integration_failure("activation routes", error)
+        _report_integration_failure("activation and steering table routes", error)
