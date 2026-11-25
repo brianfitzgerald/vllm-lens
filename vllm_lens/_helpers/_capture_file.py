@@ -38,9 +38,10 @@ def seal(
     rows: int,
     layers: list[int],
     hidden: int,
+    positions: list[int] | None,
 ) -> None:
-    """Write the header of ``rows`` rows of ``[layers, hidden]``, cut the file there, close
-    it and rename it from its partial name."""
+    """Write the header and the positions after ``rows`` rows of ``[layers, hidden]``, cut
+    the file there, close it and rename it from its partial name."""
     data = rows * len(layers) * hidden * dtype.itemsize
     tensors: dict[str, Any] = {
         "__metadata__": {"layers": json.dumps(layers)},
@@ -50,19 +51,29 @@ def seal(
             "data_offsets": [0, data],
         },
     }
+    tail = b""
+    if positions is not None:
+        tail = torch.tensor(positions[:rows], dtype=torch.int64).numpy().tobytes()
+        tensors["positions"] = {
+            "dtype": "I64",
+            "shape": [len(tail) // 8],
+            "data_offsets": [data, data + len(tail)],
+        }
     header = json.dumps(tensors).encode()
     if len(header) > HEADER_BYTES - 8:
         raise ValueError("The capture header does not fit its area")
     header = header.ljust(HEADER_BYTES - 8, b" ")
     os.pwrite(fd, len(header).to_bytes(8, "little") + header, 0)
-    os.ftruncate(fd, HEADER_BYTES + data)
+    if tail:
+        os.pwrite(fd, tail, HEADER_BYTES + data)
+    os.ftruncate(fd, HEADER_BYTES + data + len(tail))
     os.close(fd)
     os.rename(path, path.removesuffix(".partial") + ".safetensors")
 
 
 def read_capture(path: str) -> dict[str, Any]:
-    """Map a sealed capture as ``residual_stream`` ``[layers, rows, hidden]``, a view of the
-    file."""
+    """Map a sealed capture as ``residual_stream`` ``[layers, rows, hidden]`` (a view of the
+    file) and, for a position selector, ``residual_stream_positions``."""
     with open(path, "rb") as file:
         size = os.fstat(file.fileno()).st_size
         mapped = mmap.mmap(
@@ -73,13 +84,24 @@ def read_capture(path: str) -> dict[str, Any]:
         )
     length = int.from_bytes(mapped[:8], "little")
     header = json.loads(mapped[8 : 8 + length])
-    entry = header["residual_stream"]
-    low, high = entry["data_offsets"]
-    values = torch.frombuffer(
-        mapped, dtype=torch.uint8, count=high - low, offset=HEADER_BYTES + low
-    )
-    rows = values.view(_TORCH_DTYPES[entry["dtype"]]).view(entry["shape"])
-    return {"residual_stream": rows.permute(1, 0, 2)}
+    out: dict[str, Any] = {}
+    for name, entry in header.items():
+        if name == "__metadata__":
+            continue
+        low, high = entry["data_offsets"]
+        dtype = (
+            torch.int64 if entry["dtype"] == "I64" else _TORCH_DTYPES[entry["dtype"]]
+        )
+        values = torch.frombuffer(
+            mapped, dtype=torch.uint8, count=high - low, offset=HEADER_BYTES + low
+        )
+        out[name] = values.view(dtype).view(entry["shape"])
+    activations: dict[str, Any] = {
+        "residual_stream": out["residual_stream"].permute(1, 0, 2)
+    }
+    if "positions" in out:
+        activations["residual_stream_positions"] = out["positions"].tolist()
+    return activations
 
 
 def wait_capture(path: str, timeout: float) -> None:

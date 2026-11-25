@@ -3,7 +3,7 @@
 vLLM-lens captures residual-stream activations and steers them inside vLLM's compiled forward pass, with CUDA graphs on. Requests in the same dynamic batch can capture and steer different layers, vectors and positions.
 
 Features:
-- Activation capture: the residual stream at every position, at the layers a server arms.
+- Activation capture: every position, the last prompt token, a list of positions, or the prompt mean, at the layers a server arms.
 - Steering vectors: add vectors to the residual stream, at every position or at chosen positions, optionally scaled to the residual norm.
 
 The package registers as a [vLLM general plugin](https://docs.vllm.ai/en/latest/design/plugin_system.html) and an [Inspect](https://inspect.aisi.org.uk/) model provider on install. Requests set options in `SamplingParams.extra_args` (offline), `vllm_xargs` (HTTP) or `GenerateConfig.extra_body` (Inspect).
@@ -83,7 +83,25 @@ acts = out[0].activations["residual_stream"]  # (n_layers, n_positions, hidden_d
 
 Layers are stacked in ascending order along dim 0. Capture runs on tensor-parallel rank 0 only, because the residual stream is the same on every rank.
 
-Prompt tokens are positions `0 .. n_prompt - 1`, and `n_prompt + k` is the state computed when generated token `k` is fed back. The final generated token is never processed, so a capture has `n_prompt + n_gen - 1` rows. A position computed twice (after a preemption) keeps its latest row. With async speculative decoding, a capture fails at submission.
+To get the mean over the prompt positions as one row per layer, pass `output_residual_stream_pool="mean"` (the client's `capture_pool`). The result has shape `(n_layers, 1, hidden_dim)`.
+
+### Selecting positions
+
+`output_residual_stream_positions` limits the capture to `"last_prompt_token"` or to a list of absolute positions. The worker writes only those rows, so a last-token capture does not grow with the prompt:
+
+```python
+sp = SamplingParams(
+    max_tokens=8,
+    extra_args={
+        "output_residual_stream": [15],
+        "output_residual_stream_positions": [0, 3, 12],
+    },
+)
+```
+
+The response carries `residual_stream_positions` with the position of each row. Prompt tokens are positions `0 .. n_prompt - 1`, and `n_prompt + k` is the state computed when generated token `k` is fed back. The final generated token is never processed, so a capture of every position has `n_prompt + n_gen - 1` rows. Positions that are never computed are absent. A position computed twice (after a preemption) keeps its latest row. `output_residual_stream_pool` and `output_residual_stream_positions` cannot be combined.
+
+With async speculative decoding, a capture of generated positions (every position, or a list) fails at submission; `"last_prompt_token"` and the mean work.
 
 ### Transports
 

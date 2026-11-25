@@ -25,6 +25,7 @@ from vllm_lens._helpers._capture_file import (
     capture_path,
     seal,
 )
+from vllm_lens._helpers._positions import LAST_PROMPT_TOKEN, POSITIONS_KEY
 from vllm_lens._helpers.types import SteeringVector
 from vllm_lens._layers import _discover_layer_modules
 
@@ -74,13 +75,14 @@ def _capture_hook(module: Any, args: Any, output: Any) -> None:
 
 
 class _Step(NamedTuple):
-    """One forward step: each request's id, runner index, ``extra_args`` and positions
-    computed before the step; request i has batch rows ``bounds[i]:bounds[i + 1]``."""
+    """One forward step: each request's id, runner index, ``extra_args``, positions computed
+    before the step and prompt length; request i has batch rows ``bounds[i]:bounds[i + 1]``."""
 
     req_ids: list[str]
     req_idx: np.ndarray
     extras: list[dict[str, Any] | None]
     computed: np.ndarray
+    prompt_len: np.ndarray
     bounds: np.ndarray
 
 
@@ -96,12 +98,24 @@ class _Prepared(NamedTuple):
 
 
 class _Capture:
-    """One request's capture: its partial file and its capture-layer indices."""
+    """One request's capture: its partial file, its capture-layer indices, and its mode:
+    every position, a sorted position list, or the mean over the prompt."""
 
-    def __init__(self, path: str, keep: list[int]) -> None:
+    def __init__(
+        self, path: str, keep: list[int], extra: dict[str, Any], prompt_len: int
+    ) -> None:
         self.path = path
         self.fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
         self.keep = keep
+        self.prompt_len = prompt_len
+        self.mean = extra.get("output_residual_stream_pool") == "mean"
+        selector = extra.get(POSITIONS_KEY)
+        self.selector: np.ndarray | None = None
+        if selector is not None:
+            self.selector = np.asarray(
+                [prompt_len - 1] if selector == LAST_PROMPT_TOKEN else selector,
+                dtype=np.int64,
+            )
         # One past the last file row written so far.
         self.rows = 0
 
@@ -212,8 +226,17 @@ class _Drain:
         self.events[slot].synchronize()
         self._write(self.slabs[slot][:count], run, offset)
 
-    def _seal(self, capture: _Capture, rows: int) -> None:
-        """Seal a file after its rows."""
+    def _seal(
+        self,
+        capture: _Capture,
+        rows: int,
+        mean: torch.Tensor | None,
+        event: torch.cuda.Event | None,
+    ) -> None:
+        """Write a mean row if any, then seal the file."""
+        if mean is not None and event is not None:
+            event.synchronize()
+            self._write(mean, _Run(capture, 0, 1, 0), 0)
         try:
             seal(
                 capture.fd,
@@ -222,6 +245,9 @@ class _Drain:
                 rows=rows,
                 layers=[self.layers[k] for k in capture.keep],
                 hidden=self.hidden,
+                positions=None
+                if capture.selector is None
+                else capture.selector.tolist(),
             )
         except FileNotFoundError:
             # The front end removed the file of an aborted request.
@@ -380,6 +406,11 @@ class GraphWorker(Worker):
         )
         self._every = np.zeros(max_reqs, dtype=np.int64)
         self._positional: dict[int, np.ndarray] = {}
+        self._mean = torch.zeros(
+            (max_reqs if capture_layers else 0, len(capture_layers), hidden),
+            dtype=torch.float32,
+            device=device,
+        )
         ring_rows = config.capture_ring_tokens or 2 * max_tokens
         ring = torch.zeros(
             (ring_rows + 1 if capture_layers else 1, len(capture_layers), hidden),
@@ -400,7 +431,7 @@ class GraphWorker(Worker):
         self._meta_signature: tuple | None = None
 
         extras: dict[str, dict[str, Any]] = {}
-        pending: dict[str, Any] = {"runs": None}
+        pending: dict[str, Any] = {"runs": None, "pooled": []}
         add_requests = runner.add_requests
         finish_requests = runner.finish_requests
         prepare_inputs = runner.prepare_inputs
@@ -420,7 +451,7 @@ class GraphWorker(Worker):
                 extras.pop(req_id, None)
                 capture = self._captures.pop(req_id, None)
                 if capture is not None:
-                    self._seal(capture)
+                    self._seal(capture, index)
             return finish_requests(scheduler_output)
 
         def _add_requests(scheduler_output: Any) -> Any:
@@ -432,7 +463,7 @@ class GraphWorker(Worker):
                     continue
                 extras[new.req_id] = extra
                 index = runner.req_states.req_id_to_index[new.req_id]
-                self._admit(new.req_id, index, extra)
+                self._admit(new.req_id, index, extra, new.prompt_len)
             return out
 
         def _prepare_inputs(*args: Any, **kwargs: Any) -> Any:
@@ -441,20 +472,22 @@ class GraphWorker(Worker):
             n = int(input_batch.num_reqs)
             req_ids = list(input_batch.req_ids[:n])
             req_idx = input_batch.idx_mapping_np[:n]
-            pending["runs"] = self._plan(
+            pending["runs"], pending["pooled"] = self._plan(
                 _Step(
                     req_ids,
                     req_idx,
                     [extras.get(req_id) for req_id in req_ids],
                     input_batch.num_computed_tokens_np[:n],
+                    runner.req_states.prompt_len.np[req_idx],
                     input_batch.query_start_loc_np[: n + 1],
                 )
             )
             return input_batch
 
         def _execute_model(*args: Any, **kwargs: Any) -> Any:
-            """Run V2's step, then hand its ring rows to the drain."""
-            pending["runs"] = None
+            """Run V2's step, then add its prompt rows to the means and hand its ring rows
+            to the drain."""
+            pending["runs"], pending["pooled"] = None, []
             try:
                 out = execute_model(*args, **kwargs)
             except BaseException:
@@ -465,6 +498,11 @@ class GraphWorker(Worker):
             runs = pending["runs"]
             if runs is not None:
                 assert self._drain is not None
+                ring = self._drain.ring
+                for index, start, count, reset in pending["pooled"]:
+                    if reset:
+                        self._mean[index].zero_()
+                    self._mean[index] += ring[start : start + count].float().sum(0)
                 # A dummy forward pass before the next plan writes no ring rows.
                 self._meta[1, : self._meta_length].fill_(self._sentinel)
                 event = torch.cuda.Event()
@@ -497,7 +535,9 @@ class GraphWorker(Worker):
             self._sentinel,
         )
 
-    def _admit(self, req_id: str, index: int, extra: dict[str, Any]) -> None:
+    def _admit(
+        self, req_id: str, index: int, extra: dict[str, Any], prompt_len: int
+    ) -> None:
         """Write a new request's table rows, and open its capture file."""
         prepared = None
         key = extra.get("_steering_id")
@@ -535,12 +575,18 @@ class GraphWorker(Worker):
             ]
             # vLLM's internal id is the external id and an 8-character suffix.
             self._captures[req_id] = _Capture(
-                capture_path(self._capture_dir, key, req_id[:-9], partial=True), keep
+                capture_path(self._capture_dir, key, req_id[:-9], partial=True),
+                keep,
+                extra,
+                prompt_len,
             )
+        self._mean[index].zero_()
 
-    def _plan(self, step: _Step) -> list[_Run] | None:
+    def _plan(
+        self, step: _Step
+    ) -> tuple[list[_Run] | None, list[tuple[int, int, int, bool]]]:
         """Fill this step's per-token table and ring rows and copy them to the device; return
-        the ring runs to write, or None without capture rows."""
+        the ring runs to write (None without capture rows) and each mean's prompt rows."""
         bounds = step.bounds
         n = int(bounds[-1])
         captured = [
@@ -553,7 +599,7 @@ class GraphWorker(Worker):
         ]
         signature = (tuple(step.req_ids), bounds.tobytes())
         if not captured and not positional and signature == self._meta_signature:
-            return None
+            return None, []
         self._meta_signature = None if captured or positional else signature
         counts = np.diff(bounds)
         slot = self._meta_slot = self._meta_slot ^ 1
@@ -570,30 +616,71 @@ class GraphWorker(Worker):
             inside = positions[(positions >= first) & (positions < first + counts[i])]
             host[0, bounds[i] + inside - first] = 2 * index + 2
         runs: list[_Run] | None = None
-        total = int(sum(counts[i] for i, _ in captured))
+        pooled: list[tuple[int, int, int, bool]] = []
+        # Each capture's batch rows (a start, or explicit rows), count, file row (-1 for a
+        # mean), runner index and whether its mean starts again.
+        wanted: list[tuple[_Capture, int, np.ndarray | None, int, int, int, bool]] = []
+        for i, capture in captured:
+            first = int(step.computed[i])
+            count = int(counts[i])
+            start = int(bounds[i])
+            if capture.mean:
+                high = min(first + count, capture.prompt_len)
+                if high > first:
+                    index = int(step.req_idx[i])
+                    wanted.append(
+                        (capture, start, None, high - first, -1, index, first == 0)
+                    )
+            elif capture.selector is None:
+                wanted.append((capture, start, None, count, first, 0, False))
+                capture.rows = max(capture.rows, first + count)
+            else:
+                low = int(np.searchsorted(capture.selector, first))
+                high = int(np.searchsorted(capture.selector, first + count))
+                if high > low:
+                    rows = start + capture.selector[low:high] - first
+                    wanted.append((capture, start, rows, high - low, low, 0, False))
+                    capture.rows = max(capture.rows, high)
+        total = sum(item[3] for item in wanted)
         if total:
             assert self._drain is not None
             offset = self._drain.take(total)
             runs = []
-            for i, capture in captured:
-                first = int(step.computed[i])
-                count = int(counts[i])
-                start = int(bounds[i])
-                host[1, start : start + count] = np.arange(offset, offset + count)
-                runs.append(_Run(capture, offset, count, first))
-                capture.rows = max(capture.rows, first + count)
+            for capture, start, rows, count, file_row, index, reset in wanted:
+                ring_rows = np.arange(offset, offset + count)
+                if rows is None:
+                    host[1, start : start + count] = ring_rows
+                else:
+                    host[1, rows] = ring_rows
+                if file_row < 0:
+                    pooled.append((index, offset, count, reset))
+                else:
+                    runs.append(_Run(capture, offset, count, file_row))
                 offset += count
         self._meta[:, :length].copy_(
             self._host_meta[slot][:, :length], non_blocking=True
         )
         self._meta_events[slot].record()
         self._meta_length = n
-        return runs
+        return runs, pooled
 
-    def _seal(self, capture: _Capture) -> None:
-        """Queue the seal of a finished request's capture after its rows."""
+    def _seal(self, capture: _Capture, index: int | None) -> None:
+        """Queue the seal of a finished request's capture after its rows; a mean is divided
+        and copied to the host here, on the compute stream."""
         assert self._drain is not None
-        self._drain.queue.put((capture, capture.rows))
+        mean = event = None
+        rows = capture.rows
+        if capture.mean and index is not None:
+            # One row of every capture layer; the drain keeps the request's layers.
+            values = (self._mean[index : index + 1] / capture.prompt_len).to(
+                self._lens_dtype
+            )
+            mean = torch.empty(values.shape, dtype=values.dtype).pin_memory()
+            mean.copy_(values, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+            rows = 1
+        self._drain.queue.put((capture, rows, mean, event))
 
     def set_steering_data(self, key: str, pickled_data: bytes) -> None:
         """Prepare the steering vectors of one request."""

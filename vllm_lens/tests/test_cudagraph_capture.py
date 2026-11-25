@@ -57,8 +57,12 @@ def test_the_capture_op_writes_ring_rows(fused):
     assert not ring[[1, 2, 4]].any()
 
 
-def test_a_sealed_capture_reads_back(tmp_path):
-    """Rows written at their file rows read back as ``[layers, rows, hidden]``. No GPU."""
+@pytest.mark.parametrize(
+    "positions", [None, [2, 5]], ids=["every-position", "selected"]
+)
+def test_a_sealed_capture_reads_back(tmp_path, positions):
+    """Rows written at their file rows read back as ``[layers, rows, hidden]``, with the
+    positions of a selector. No GPU."""
     import os
 
     from vllm_lens._helpers._capture_file import (
@@ -72,6 +76,15 @@ def test_a_sealed_capture_reads_back(tmp_path):
     path = capture_path(str(tmp_path), "key", "req-1", partial=True)
     fd = os.open(path, os.O_RDWR | os.O_CREAT)
     os.pwrite(fd, rows.view(torch.int16).numpy().tobytes(), HEADER_BYTES)
-    seal(fd, path, dtype=torch.bfloat16, rows=3, layers=[1, 4], hidden=4)
+    seal(
+        fd,
+        path,
+        dtype=torch.bfloat16,
+        rows=3,
+        layers=[1, 4],
+        hidden=4,
+        positions=positions,
+    )
     capture = read_capture(capture_path(str(tmp_path), "key", "req-1"))
     assert torch.equal(capture["residual_stream"], rows.permute(1, 0, 2))
+    assert capture.get("residual_stream_positions") == positions

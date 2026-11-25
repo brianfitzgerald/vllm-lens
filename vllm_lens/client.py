@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import requests
 
+from vllm_lens._helpers._positions import POSITIONS_KEY
 from vllm_lens._helpers._serialize import (
     decode_activations,
 )
@@ -85,12 +86,22 @@ class VLLMLensClient:
         capture_layers: list[int] | None,
         steering_vectors: list[SteeringVector] | None,
         activations_transport: str | None = None,
+        capture_positions: str | list[int] | None = None,
+        capture_pool: Literal["mean"] | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
             xargs["output_residual_stream"] = json.dumps(capture_layers)
+        if capture_positions is not None:
+            xargs[POSITIONS_KEY] = (
+                capture_positions
+                if isinstance(capture_positions, str)
+                else json.dumps(list(capture_positions))
+            )
         if activations_transport is not None:
             xargs["activations_transport"] = activations_transport
+        if capture_pool is not None:
+            xargs["output_residual_stream_pool"] = capture_pool
         if steering_vectors is not None:
             xargs["apply_steering_vectors"] = json.dumps(
                 [sv.model_dump() for sv in steering_vectors]
@@ -139,8 +150,10 @@ class VLLMLensClient:
         max_tokens: int = 16,
         temperature: float = 0.0,
         capture_layers: list[int] | None = None,
+        capture_positions: str | list[int] | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
+        capture_pool: Literal["mean"] | None = None,
         logprobs: int | None = None,
         echo: bool = False,
         **kwargs: Any,
@@ -155,6 +168,13 @@ class VLLMLensClient:
         ``activations_transport="file"`` returns the path of the capture file the
         server wrote, which works only on the server's host; the client maps it
         and the caller removes it. Decoding is transparent in every case.
+
+        ``capture_positions`` narrows the residual-stream capture to
+        ``"last_prompt_token"`` or to a list of absolute token positions;
+        the response then carries ``residual_stream_positions`` with the
+        position of each captured row. Omit it to capture every position.
+
+        ``capture_pool="mean"`` returns the prompt mean as one row per layer.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -172,6 +192,8 @@ class VLLMLensClient:
             capture_layers,
             steering_vectors,
             activations_transport,
+            capture_positions,
+            capture_pool=capture_pool,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -188,14 +210,16 @@ class VLLMLensClient:
         max_tokens: int = 16,
         temperature: float = 0.0,
         capture_layers: list[int] | None = None,
+        capture_positions: str | list[int] | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
+        capture_pool: Literal["mean"] | None = None,
         **kwargs: Any,
     ) -> GenerateOutput:
         """Generate a chat completion from a list of messages.
 
         Uses ``/v1/chat/completions``. See :meth:`generate` for
-        ``activations_transport``.
+        ``activations_transport`` and ``capture_positions``.
 
         Example::
 
@@ -215,6 +239,8 @@ class VLLMLensClient:
             capture_layers,
             steering_vectors,
             activations_transport,
+            capture_positions,
+            capture_pool=capture_pool,
         )
         if xargs:
             body["vllm_xargs"] = xargs
