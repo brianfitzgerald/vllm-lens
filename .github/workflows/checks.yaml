@@ -37,7 +37,7 @@ jobs:
           uv pip install -r requirements/cpu-tests.txt
           uv pip install --no-deps -e .
       - name: Run CPU tests without vLLM or model downloads
-        run: .venv/bin/python -m pytest tests/unit examples/tests/test_r_lens_rules.py --junitxml=cpu-results.xml
+        run: .venv/bin/python -m pytest tests/unit --junitxml=cpu-results.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:

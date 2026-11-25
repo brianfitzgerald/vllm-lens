@@ -7,9 +7,8 @@ from typing import Annotated, Any
 import typer
 from datasets import load_dataset
 from dotenv import load_dotenv
-from vllm import LLM, SamplingParams
-
 from utils.types import BenchmarkConfig, BenchmarkResult
+from vllm import LLM, SamplingParams
 
 LIB_NAME = "vllm-lens"
 
@@ -18,6 +17,7 @@ app = typer.Typer()
 
 def load_model(
     model: str,
+    layer: int,
     tensor_parallelism: int,
     pipeline_parallelism: int = 1,
     distributed_executor_backend: str | None = None,
@@ -30,6 +30,7 @@ def load_model(
         tensor_parallel_size=tensor_parallelism,
         pipeline_parallel_size=pipeline_parallelism,
         gpu_memory_utilization=0.90,
+        additional_config={"vllm_lens": {"capture_layers": [layer]}},
     )
     if distributed_executor_backend:
         kwargs["distributed_executor_backend"] = distributed_executor_backend
@@ -63,6 +64,7 @@ def main(
     t0 = time.perf_counter()
     llm = load_model(
         cfg.model,
+        cfg.layer,
         cfg.tensor_parallelism,
         cfg.pipeline_parallelism,
         cfg.distributed_executor_backend,

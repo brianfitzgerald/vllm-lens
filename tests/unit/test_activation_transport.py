@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import vllm_lens._helpers._activation_store as store_mod
-import vllm_lens._hooks_router as hooks_router
+import vllm_lens._routes as hooks_router
 from vllm_lens._helpers._activation_store import ActivationStore
 from vllm_lens._helpers._serialize import (
     decode_activations,

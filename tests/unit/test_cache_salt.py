@@ -7,7 +7,12 @@ import pytest
 import torch
 
 import vllm_lens._activations_plugin as plugin
-from vllm_lens import Hook, SteeringVector
+from vllm_lens import SteeringVector
+
+# A config that arms layer 0 for capture and steering.
+ARMED = SimpleNamespace(
+    additional_config={"vllm_lens": {"capture_layers": [0], "steer_layers": [0]}}
+)
 
 
 @pytest.mark.parametrize("existing", [None, "user"])
@@ -33,11 +38,10 @@ def test_process_inputs_isolates_each_request(monkeypatch, existing, isolated):
 
 
 @pytest.mark.parametrize("built", [False, True])
-@pytest.mark.parametrize(
-    "kind", ["ordinary", "steering", "hooks", "persistent", "capture"]
-)
-async def test_async_intervention_params(monkeypatch, built, kind):
+@pytest.mark.parametrize("kind", ["ordinary", "steering", "capture"])
+async def test_async_intervention_params(monkeypatch, tmp_path, built, kind):
     """Assert isolation and cache bypass without changing caller parameters."""
+    monkeypatch.setenv(plugin.CAPTURE_DIR_ENV, str(tmp_path))
     module = ModuleType("vllm.v1.engine")
     request_type = type("EngineCoreRequest", (), {})
     module.EngineCoreRequest = request_type
@@ -49,8 +53,6 @@ async def test_async_intervention_params(monkeypatch, built, kind):
                 SteeringVector(activations=torch.ones(1, 4), layer_indices=[0])
             ]
         },
-        "hooks": {"apply_hooks": [Hook(fn=torch.zeros_like, layer_indices=[0])]},
-        "persistent": {},
         "capture": {"output_residual_stream": [0]},
     }
     params = SimpleNamespace(extra_args=extras[kind], skip_reading_prefix_cache=False)
@@ -73,14 +75,12 @@ async def test_async_intervention_params(monkeypatch, built, kind):
     monkeypatch.setattr(plugin, "_original_generate", original)
     engine = SimpleNamespace(
         collective_rpc=rpc,
-        vllm_config=SimpleNamespace(additional_config=None),
-        _hooks_installed=True,
-        _has_persistent_hooks=kind == "persistent",
+        vllm_config=ARMED,
     )
     async for _ in plugin._patched_generate(engine, prompt, params, "r"):
         pass
     sent = received[0]
-    isolated = kind in ("steering", "hooks", "persistent")
+    isolated = kind == "steering"
     assert bool(sent.extra_args.get("_lens_isolate_cache")) == isolated
     assert sent.skip_reading_prefix_cache == (kind != "ordinary")
     assert params.extra_args == original_extra
@@ -93,9 +93,7 @@ async def test_async_intervention_params(monkeypatch, built, kind):
         )
 
 
-@pytest.mark.parametrize(
-    "kind", ["ordinary", "steering", "hooks", "persistent", "capture"]
-)
+@pytest.mark.parametrize("kind", ["ordinary", "steering", "capture"])
 @pytest.mark.parametrize("many", [False, True])
 def test_offline_intervention_params(kind, many):
     """Assert that copied offline parameters carry the isolation flag."""
@@ -106,43 +104,19 @@ def test_offline_intervention_params(kind, many):
                 SteeringVector(activations=torch.ones(1, 4), layer_indices=[0])
             ]
         },
-        "hooks": {"apply_hooks": [Hook(fn=torch.zeros_like, layer_indices=[0])]},
-        "persistent": {},
         "capture": {"output_residual_stream": [0]},
     }
     params = SimpleNamespace(extra_args=extras[kind], skip_reading_prefix_cache=False)
     original_extra = dict(params.extra_args)
     engine = SimpleNamespace(
         collective_rpc=lambda *a, **k: [],
-        llm_engine=SimpleNamespace(vllm_config=SimpleNamespace(additional_config=None)),
-        _hooks_installed=True,
-        _has_persistent_hooks=kind == "persistent",
+        llm_engine=SimpleNamespace(vllm_config=ARMED),
     )
     state = plugin._prepare_offline_params(engine, [params, params] if many else params)
     sent = state["params"] if many else [state["params"]]
     for item in sent:
         assert item is not params
-        assert bool(item.extra_args.get("_lens_isolate_cache")) == (
-            kind in ("steering", "hooks", "persistent")
-        )
+        assert bool(item.extra_args.get("_lens_isolate_cache")) == (kind == "steering")
         assert item.skip_reading_prefix_cache == (kind != "ordinary")
     assert params.extra_args == original_extra
     assert not params.skip_reading_prefix_cache
-
-
-def test_offline_persistent_hooks_use_model_defaults():
-    """Assert that omitted parameters retain model defaults and get isolation."""
-    defaults = SimpleNamespace(
-        extra_args=None, skip_reading_prefix_cache=False, temperature=0.7
-    )
-    engine = SimpleNamespace(
-        _has_persistent_hooks=True,
-        _hooks_installed=True,
-        get_default_sampling_params=lambda: defaults,
-        llm_engine=SimpleNamespace(vllm_config=SimpleNamespace(additional_config=None)),
-    )
-    sent = plugin._prepare_offline_params(engine, None)["params"]
-    assert sent is not defaults and sent.temperature == 0.7
-    assert sent.extra_args == {"_lens_isolate_cache": True}
-    assert sent.skip_reading_prefix_cache
-    assert defaults.extra_args is None and not defaults.skip_reading_prefix_cache

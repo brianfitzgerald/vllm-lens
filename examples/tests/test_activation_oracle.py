@@ -15,6 +15,7 @@ from vllm import AsyncEngineArgs, AsyncLLMEngine
 
 from activation_oracle import (
     LAYER,
+    LENS_CONFIG,
     TARGET_MESSAGES,
     AOConfig,
     collect_activations,
@@ -81,6 +82,7 @@ def tokenizer() -> PreTrainedTokenizerBase:
 async def engine():
     engine_args = AsyncEngineArgs(
         model=MODEL_NAME,
+        additional_config=LENS_CONFIG,
         enable_lora=True,
         max_lora_rank=64,
         max_model_len=4096,

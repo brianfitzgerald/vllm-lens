@@ -1,25 +1,13 @@
 """HTTP client for vllm-lens, mirroring the LLM interface.
 
-Wraps the vLLM OpenAI-compatible API and vllm-lens hook endpoints,
-handling serialization of hooks, steering vectors, and activations.
+Wraps the vLLM OpenAI-compatible API and the vllm-lens endpoints,
+handling serialization of steering vectors and activations.
 
 Usage::
 
     from vllm_lens.client import VLLMLensClient
-    from vllm_lens import Hook
 
     client = VLLMLensClient("http://localhost:8000")
-
-    # Per-request hooks
-    output = client.generate("Hello", max_tokens=10, hooks=[hook])
-    print(output.hook_results)
-
-    # Persistent hooks
-    client.register_hooks([hook])
-    client.generate("Hello", max_tokens=10)
-    client.generate("World", max_tokens=10)
-    results = client.collect_hook_results()
-    client.clear_hooks()
 
     # Activation capture
     output = client.generate("Hello", max_tokens=10, capture_layers=[15])
@@ -39,9 +27,8 @@ import requests
 
 from vllm_lens._helpers._serialize import (
     decode_activations,
-    deserialize_hook_results,
 )
-from vllm_lens._helpers.types import Hook, SteeringVector
+from vllm_lens._helpers.types import SteeringVector
 
 
 @dataclass
@@ -52,10 +39,8 @@ class GenerateOutput:
     """Generated text."""
 
     activations: dict[str, Any] | None = None
-    """Captured activations (residual stream and/or attention Q/K), if requested."""
-
-    hook_results: dict[str, dict[str, Any]] | None = None
-    """Per-request hook results (ctx.saved dicts), if hooks were passed."""
+    """Captured activations (residual stream, and its position metadata under a
+    position selector), if requested."""
 
     logprobs: dict[str, Any] | None = None
     """Log-probabilities, if requested."""
@@ -97,21 +82,15 @@ class VLLMLensClient:
 
     def _build_xargs(
         self,
-        hooks: list[Hook] | None,
         capture_layers: list[int] | None,
         steering_vectors: list[SteeringVector] | None,
         activations_transport: str | None = None,
-        capture_qk: list[int] | bool | None = None,
     ) -> dict[str, str]:
         xargs: dict[str, str] = {}
         if capture_layers is not None:
             xargs["output_residual_stream"] = json.dumps(capture_layers)
         if activations_transport is not None:
             xargs["activations_transport"] = activations_transport
-        if capture_qk is not None:
-            xargs["output_qk"] = json.dumps(capture_qk)
-        if hooks is not None:
-            xargs["apply_hooks"] = json.dumps([h.model_dump() for h in hooks])
         if steering_vectors is not None:
             xargs["apply_steering_vectors"] = json.dumps(
                 [sv.model_dump() for sv in steering_vectors]
@@ -144,16 +123,11 @@ class VLLMLensClient:
             decode_activations(resp, fetch_bytes=self._fetch_activation_bytes) or None
         )
 
-        hook_results = None
-        if "hook_results" in resp:
-            hook_results = deserialize_hook_results(resp["hook_results"])
-
         lp = choice.get("logprobs")
 
         return GenerateOutput(
             text=text,
             activations=activations,
-            hook_results=hook_results,
             logprobs=lp,
             raw=resp,
         )
@@ -164,9 +138,7 @@ class VLLMLensClient:
         *,
         max_tokens: int = 16,
         temperature: float = 0.0,
-        hooks: list[Hook] | None = None,
         capture_layers: list[int] | None = None,
-        capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         logprobs: int | None = None,
@@ -179,12 +151,10 @@ class VLLMLensClient:
 
         ``activations_transport="binary"`` returns captured activations as a
         handle fetched from ``GET /v1/activations/{handle}`` (no base64); the
-        default inlines them as base64 in the JSON response. Decoding is
-        transparent either way.
-
-        ``capture_qk`` captures post-RoPE attention Q/K for the given
-        layers (or all layers with ``True``); reconstruct patterns with
-        :func:`vllm_lens.attention.attention_patterns`.
+        default inlines them as base64 in the JSON response.
+        ``activations_transport="file"`` returns the path of the capture file the
+        server wrote, which works only on the server's host; the client maps it
+        and the caller removes it. Decoding is transparent in every case.
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -199,7 +169,9 @@ class VLLMLensClient:
             body["echo"] = True
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
+            capture_layers,
+            steering_vectors,
+            activations_transport,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -215,9 +187,7 @@ class VLLMLensClient:
         *,
         max_tokens: int = 16,
         temperature: float = 0.0,
-        hooks: list[Hook] | None = None,
         capture_layers: list[int] | None = None,
-        capture_qk: list[int] | bool | None = None,
         steering_vectors: list[SteeringVector] | None = None,
         activations_transport: str | None = None,
         **kwargs: Any,
@@ -231,7 +201,7 @@ class VLLMLensClient:
 
             output = client.chat([
                 {"role": "user", "content": "What is the capital of France?"}
-            ], hooks=[hook])
+            ], capture_layers=[15])
         """
         body: dict[str, Any] = {
             "model": self.model,
@@ -242,7 +212,9 @@ class VLLMLensClient:
         }
 
         xargs = self._build_xargs(
-            hooks, capture_layers, steering_vectors, activations_transport, capture_qk
+            capture_layers,
+            steering_vectors,
+            activations_transport,
         )
         if xargs:
             body["vllm_xargs"] = xargs
@@ -251,85 +223,3 @@ class VLLMLensClient:
             f"{self.base_url}/v1/chat/completions", json=body, timeout=self._timeout
         ).json()
         return self._parse_response(resp)
-
-    # ------------------------------------------------------------------
-    # Persistent hooks
-    # ------------------------------------------------------------------
-
-    def register_hooks(
-        self,
-        hooks: list[Hook],
-        prefetch_params: list[str] | None = None,
-    ) -> None:
-        """Register persistent hooks (appends to existing).
-
-        Args:
-            hooks: Hooks to register.
-            prefetch_params: Parameter names to pre-fetch across all ranks
-                (TP + PP).  Needed for ``ctx.get_parameter()`` with PP.
-        """
-        body: dict[str, Any] = {"hooks": [h.model_dump() for h in hooks]}
-        if prefetch_params:
-            body["prefetch_params"] = prefetch_params
-        resp = self._session.post(
-            f"{self.base_url}/v1/hooks/register",
-            json=body,
-            timeout=self._timeout,
-        ).json()
-        if resp.get("status") != "ok":
-            raise RuntimeError(f"Failed to register hooks: {resp}")
-
-    def collect_hook_results(self) -> dict[str, dict[str, dict[str, Any]]]:
-        """Collect all accumulated persistent hook results.
-
-        Returns ``{request_id: {hook_index: ctx.saved}}``.
-        Non-destructive — call :meth:`clear_hooks` to clean up.
-        """
-        resp = self._session.post(
-            f"{self.base_url}/v1/hooks/collect", timeout=self._timeout
-        ).json()
-        results = resp.get("results", {})
-        return {
-            req_id: deserialize_hook_results(hook_data)
-            for req_id, hook_data in results.items()
-        }
-
-    def clear_hooks(self) -> None:
-        """Remove all persistent hooks and accumulated results."""
-        self._session.post(f"{self.base_url}/v1/hooks/clear", timeout=self._timeout)
-
-    def clear_hook_results(self) -> None:
-        """Drop accumulated results but keep the hooks registered.
-
-        :meth:`collect_hook_results` never drains, so results accumulate
-        across requests. Call this to bound accumulation (e.g. between chat
-        turns) without re-uploading the hooks.
-        """
-        self._session.post(
-            f"{self.base_url}/v1/hooks/clear_results", timeout=self._timeout
-        )
-
-    # ------------------------------------------------------------------
-    # Parameter prefetch
-    # ------------------------------------------------------------------
-
-    def prefetch_params(self, names: list[str]) -> None:
-        """Pre-fetch model parameters across all TP/PP ranks.
-
-        Makes the parameters available to ``ctx.get_parameter()`` in
-        hooks on any layer, even with pipeline parallelism.  Parameters
-        persist until :meth:`clear_prefetched` is called.
-        """
-        resp = self._session.post(
-            f"{self.base_url}/v1/hooks/prefetch",
-            json={"params": names},
-            timeout=self._timeout,
-        ).json()
-        if resp.get("status") != "ok":
-            raise RuntimeError(f"Failed to prefetch parameters: {resp}")
-
-    def clear_prefetched(self) -> None:
-        """Remove all pre-fetched parameters."""
-        self._session.post(
-            f"{self.base_url}/v1/hooks/clear_prefetched", timeout=self._timeout
-        )

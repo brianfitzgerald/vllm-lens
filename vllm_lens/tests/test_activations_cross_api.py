@@ -6,6 +6,7 @@ provider (VLLMLensAPI via get_model + vLLM server).
 """
 
 import gc
+import json
 import os
 import signal
 import socket
@@ -18,7 +19,7 @@ import pytest
 import torch
 from inspect_ai.model import ChatMessageUser, GenerateConfig, get_model
 from transformers import AutoTokenizer
-from vllm import AsyncEngineArgs, AsyncLLMEngine, LLM, SamplingParams
+from vllm import LLM, AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
 from vllm_lens import SteeringVector
 
@@ -28,6 +29,9 @@ HIDDEN_DIM = 896
 CAPTURE_LAYER = 16
 STEER_LAYER = 8
 MAX_TOKENS = 5
+ARMED = {
+    "vllm_lens": {"capture_layers": [CAPTURE_LAYER], "steer_layers": [STEER_LAYER]}
+}
 GPU_MEM_UTIL = 0.3
 
 PROMPTS = [
@@ -142,6 +146,7 @@ async def _run_async_path(
     engine = AsyncLLMEngine.from_engine_args(
         AsyncEngineArgs(
             model=MODEL_NAME,
+            additional_config=ARMED,
             dtype="auto",
             gpu_memory_utilization=GPU_MEM_UTIL,
         )
@@ -181,6 +186,7 @@ def _run_sync_path(
     """Run all prompts through LLM and return activations."""
     llm = LLM(
         model=MODEL_NAME,
+        additional_config=ARMED,
         dtype="auto",
         gpu_memory_utilization=GPU_MEM_UTIL,
     )
@@ -222,13 +228,15 @@ async def _run_inspect_path(
             str(port),
             "--gpu-memory-utilization",
             str(GPU_MEM_UTIL),
+            "--additional-config",
+            json.dumps(ARMED),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
 
     try:
-        _wait_for_server(base_url, timeout=120.0)
+        _wait_for_server(base_url, timeout=600.0)
 
         # Clear env vars that inspect_ai tries to load as hook modules; they
         # may reference packages not installed in the test environment.

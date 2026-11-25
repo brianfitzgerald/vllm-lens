@@ -103,7 +103,7 @@ def main() -> int:
         "platform": platform.platform(),
         "expected_vllm": args.expected_vllm,
         "suite": args.suite,
-        "runner": "V1, eager, prefix caching enabled",
+        "runner": "V2, armed layers, prefix caching enabled",
         "model": "Qwen/Qwen2.5-0.5B-Instruct",
         "reference_dtype": "float32",
         "functional_dtype": "auto (bfloat16 for Qwen/Qwen2.5-0.5B-Instruct)",
@@ -161,7 +161,7 @@ def main() -> int:
         env.update(
             {
                 "VLLM_LENS_STRICT_COMPATIBILITY": "1",
-                "VLLM_USE_V2_MODEL_RUNNER": "0",
+                "VLLM_USE_V2_MODEL_RUNNER": "1",
                 "VLLM_TEST_MODEL": report["model"],
                 "VLLM_TEST_TP_SIZE": "1",
                 "VLLM_TEST_PP_SIZE": "1",

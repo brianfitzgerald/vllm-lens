@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from dotenv import load_dotenv
 from datasets import load_dataset
+from dotenv import load_dotenv
 from huggingface_hub import snapshot_download
 from utils.types import BenchmarkConfig, BenchmarkRun
 

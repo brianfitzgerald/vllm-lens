@@ -1,4 +1,4 @@
-"""CPU tests for the rejection of position-specific steering under async speculative decoding."""
+"""CPU tests for the rejection of positions and capture under async speculative decoding."""
 
 from types import SimpleNamespace
 
@@ -10,32 +10,39 @@ from vllm_lens._helpers.types import SteeringVector
 
 PLAIN = SteeringVector(activations=torch.zeros(1, 4), layer_indices=[0])
 INDEXED = SteeringVector(
-    activations=torch.zeros(1, 1, 4), layer_indices=[0], position_indices=[5]
+    activations=torch.zeros(1, 4), layer_indices=[0], position_indices=[5]
 )
-SEQUENTIAL = SteeringVector(activations=torch.zeros(1, 2, 4), layer_indices=[0])
 
 
 @pytest.mark.parametrize(
-    ("speculative", "async_scheduling", "vectors", "rejected"),
+    ("speculative", "async_scheduling", "vectors", "capture", "rejected"),
     [
-        (True, True, [INDEXED], True),
-        (True, True, [PLAIN, SEQUENTIAL], True),
-        (True, True, [PLAIN], False),
-        (True, True, None, False),
-        (True, False, [INDEXED], False),
-        (False, True, [INDEXED], False),
+        (True, True, [INDEXED], None, True),
+        (True, True, [PLAIN], None, False),
+        (True, True, None, None, False),
+        (True, True, None, {}, True),
+        (True, False, [INDEXED], {}, False),
+        (False, True, [INDEXED], {}, False),
     ],
-    ids=["indexed", "sequential", "plain", "none", "sync", "no-spec"],
+    ids=[
+        "indexed",
+        "plain",
+        "none",
+        "capture",
+        "sync",
+        "no-spec",
+    ],
 )
-def test_position_vectors_under_async_spec_decode(
-    speculative, async_scheduling, vectors, rejected
+def test_positions_under_async_spec_decode(
+    speculative, async_scheduling, vectors, capture, rejected
 ):
     config = SimpleNamespace(
         speculative_config=object() if speculative else None,
         scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
     )
+    extra = {} if capture is None else {"output_residual_stream": [0], **capture}
     if rejected:
         with pytest.raises(ValueError, match="async speculative decoding"):
-            plugin._reject_async_spec_positions(config, vectors)
+            plugin._reject_async_spec_positions(config, vectors, extra)
     else:
-        plugin._reject_async_spec_positions(config, vectors)
+        plugin._reject_async_spec_positions(config, vectors, extra)

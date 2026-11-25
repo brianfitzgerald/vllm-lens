@@ -17,6 +17,7 @@ TEST_PROMPTS = PROMPTS[:5]
 async def vllm_model():
     engine_args = AsyncEngineArgs(
         model="RedHatAI/Llama-3.3-70B-Instruct-FP8-dynamic",
+        additional_config={"vllm_lens": {"capture_layers": [LAYER_IDX]}},
         dtype="auto",
         gpu_memory_utilization=0.9,
         tensor_parallel_size=1,
