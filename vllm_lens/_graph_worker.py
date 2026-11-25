@@ -315,7 +315,7 @@ class GraphWorker(Worker):
         """Load the model, then set up the layers this engine's config names."""
         super().load_model(load_dummy_weights=load_dummy_weights)
         config = LensGraphConfig.from_vllm_config(self.vllm_config)
-        runner = self.model_runner
+        runner: Any = self.model_runner
         compilation = self.vllm_config.compilation_config
         parallel = self.parallel_config
         # Each of these splits or reorders a forward pass in a way the step view does not follow.
@@ -601,7 +601,7 @@ class GraphWorker(Worker):
             pickle.loads(pickled_data),
             self._steer_layers,
             self._lens_hidden,
-            self.device,
+            self.device,  # type: ignore
             self._lens_dtype,
         )
 
